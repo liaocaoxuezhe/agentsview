@@ -818,6 +818,7 @@
   "usage_summary_total_tokens": "Total Tokens",
   "usage_summary_copilot_ai_credits": "Copilot AI Credits",
   "usage_summary_unsupported_copilot_no_token_data": "Copilot sessions matched this range, but Copilot does not record per-message token usage.",
+  "usage_summary_unsupported_cursor_admin_usage_required": "Cursor local sessions do not include cost or token usage. Configure the Cursor Admin API, then run agentsview usage cursor to import it.",
   "usage_summary_unsupported_generic": "Matching sessions do not expose token usage data.",
   "usage_summary_input_tokens": "Input Tokens",
   "usage_summary_daily_burn": "Daily Burn",

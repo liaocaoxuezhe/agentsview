@@ -295,6 +295,67 @@ func TestUsageSummarySetsUnsupportedUsageForCopilotNoTokenData(t *testing.T) {
 	assertUsageQueryCalls(t, spy, 1, 0, 1)
 }
 
+func TestUsageSummaryExplainsMissingCursorAdminUsage(t *testing.T) {
+	spy := &usageSummaryCountsSpy{
+		matchingSessionCount: 2,
+		result: db.DailyUsageResult{
+			Daily:  []db.DailyUsageEntry{{Date: "2024-06-01"}},
+			Totals: db.UsageTotals{},
+			SessionCounts: db.UsageSessionCounts{
+				Total:     0,
+				ByProject: map[string]int{},
+				ByAgent:   map[string]int{},
+			},
+		},
+	}
+	s := newRoutedTestServerWithStore(t, spy)
+
+	w := serveGet(t, s,
+		"/api/v1/usage/summary?"+oneDayUsageRange+"&agent=cursor")
+	assertRecorderStatus(t, w, http.StatusOK)
+
+	var resp UsageSummaryResponse
+	require.NoError(t, json.Unmarshal(w.Body.Bytes(), &resp))
+	require.NotNil(t, resp.UnsupportedUsage)
+	assert.Equal(t,
+		service.UnsupportedUsageKindCursorAdminUsageRequired,
+		resp.UnsupportedUsage.Kind,
+	)
+	assertUsageQueryCalls(t, spy, 1, 0, 1)
+}
+
+func TestUsageSummaryUsesImportedCursorAdminUsage(t *testing.T) {
+	spy := &usageSummaryCountsSpy{
+		matchingSessionCount: 2,
+		result: db.DailyUsageResult{
+			Daily: []db.DailyUsageEntry{{
+				Date:         "2024-06-01",
+				InputTokens:  1200,
+				OutputTokens: 300,
+				TotalCost:    0.42,
+			}},
+			Totals: db.UsageTotals{
+				InputTokens:  1200,
+				OutputTokens: 300,
+				TotalCost:    0.42,
+			},
+		},
+	}
+	s := newRoutedTestServerWithStore(t, spy)
+
+	w := serveGet(t, s,
+		"/api/v1/usage/summary?"+oneDayUsageRange+"&agent=cursor")
+	assertRecorderStatus(t, w, http.StatusOK)
+
+	var resp UsageSummaryResponse
+	require.NoError(t, json.Unmarshal(w.Body.Bytes(), &resp))
+	assert.Nil(t, resp.UnsupportedUsage)
+	assert.Equal(t, 1200, resp.Totals.InputTokens)
+	assert.Equal(t, 300, resp.Totals.OutputTokens)
+	assert.InDelta(t, 0.42, resp.Totals.TotalCost, 1e-9)
+	assertUsageQueryCalls(t, spy, 1, 0, 0)
+}
+
 func TestUsageSummarySetsUnsupportedUsageFromAgentCapability(t *testing.T) {
 	parsertest.StubAgentDefs(t, parser.AgentDef{
 		Type:        parser.AgentType("no-token-agent"),

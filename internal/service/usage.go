@@ -277,17 +277,20 @@ type CacheStats struct {
 
 const UnsupportedUsageKindNoTokenData = "no-token-data"
 const UnsupportedUsageKindCopilotNoTokenData = "copilot-no-token-data"
+const UnsupportedUsageKindCursorAdminUsageRequired = "cursor-admin-usage-required"
 
 // UnsupportedUsageKindForAgentFilter returns the unsupported-usage
-// kind for an agent filter whose agents record no per-message token
-// data: the Copilot-specific kind when the filter selects only
-// Copilot-family agents, and the generic kind otherwise. Copilot
-// branding keys on agent identity, not on the AI-credits capability,
-// so another credits-denominated agent degrades to the generic kind
-// instead of being described as Copilot.
+// kind for an agent filter whose agents record no per-message token data:
+// source-specific guidance for a Cursor-only or Copilot-family-only filter,
+// and the generic kind otherwise. Wording keys on agent identity, not on the
+// AI-credits capability, so another credits-denominated agent degrades to the
+// generic kind instead of inheriting unrelated guidance.
 func UnsupportedUsageKindForAgentFilter(agentFilter string) string {
 	if parser.AgentFilterIsCopilot(agentFilter) {
 		return UnsupportedUsageKindCopilotNoTokenData
+	}
+	if parser.AgentFilterIsCursor(agentFilter) {
+		return UnsupportedUsageKindCursorAdminUsageRequired
 	}
 	return UnsupportedUsageKindNoTokenData
 }

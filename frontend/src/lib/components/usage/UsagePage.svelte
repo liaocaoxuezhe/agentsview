@@ -135,6 +135,9 @@
     if (kind === "copilot-no-token-data") {
       return m.usage_summary_unsupported_copilot_no_token_data();
     }
+    if (kind === "cursor-admin-usage-required") {
+      return m.usage_summary_unsupported_cursor_admin_usage_required();
+    }
     if (kind) {
       return m.usage_summary_unsupported_generic();
     }

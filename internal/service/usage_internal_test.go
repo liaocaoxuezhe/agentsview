@@ -103,6 +103,11 @@ func TestUnsupportedUsageKindForAgentFilter(t *testing.T) {
 			want:   UnsupportedUsageKindCopilotNoTokenData,
 		},
 		{
+			name:   "cursor filter",
+			filter: "cursor",
+			want:   UnsupportedUsageKindCursorAdminUsageRequired,
+		},
+		{
 			name:   "non-copilot agent with copilot capabilities",
 			filter: "credit-note-agent",
 			want:   UnsupportedUsageKindNoTokenData,
