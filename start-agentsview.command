@@ -1,58 +1,55 @@
 #!/bin/bash
-# AgentsView 启动脚本（生产模式）
-# 双击此文件即可启动 AgentsView 服务器并在浏览器中打开
-# 访问地址: http://localhost:8080
+# AgentsView 本地启动（内嵌前端的构建产物）
+#
+# 等价于官方流程:
+#   make build          # 若二进制不存在时
+#   ./agentsview serve  # 前台服务，默认 http://127.0.0.1:8080
+#
+# 双击或在终端执行本脚本均可。按 Ctrl+C 停止服务。
+# 更完整的说明见仓库根目录「本地构建说明.md」。
 
-set -e
+set -euo pipefail
 
 PROJECT_DIR="$(cd "$(dirname "$0")" && pwd)"
+cd "$PROJECT_DIR"
+
 BINARY="$PROJECT_DIR/agentsview"
-PID_FILE="$PROJECT_DIR/.agentsview.pid"
-LOG_FILE="/tmp/agentsview.log"
+URL="http://127.0.0.1:8080"
 
-# 检查二进制文件是否存在
-if [ ! -f "$BINARY" ]; then
-    osascript -e 'display dialog "agentsview 二进制文件不存在，请先运行 make build" buttons {"确定"} default button 1 with icon stop' > /dev/null 2>&1 || true
-    exit 1
+notify() {
+  if command -v osascript >/dev/null 2>&1; then
+    osascript -e "display notification \"$1\" with title \"AgentsView\"" >/dev/null 2>&1 || true
+  fi
+}
+
+die() {
+  echo "错误: $1" >&2
+  if command -v osascript >/dev/null 2>&1; then
+    osascript -e "display dialog \"$1\" buttons {\"确定\"} default button 1 with icon stop" >/dev/null 2>&1 || true
+  fi
+  exit 1
+}
+
+command -v make >/dev/null 2>&1 || die "未找到 make，请先安装 Xcode Command Line Tools 或 GNU make"
+command -v go >/dev/null 2>&1 || die "未找到 go，需要 Go 1.26+（并启用 CGO）"
+command -v node >/dev/null 2>&1 || die "未找到 node，需要 Node.js 22+"
+
+if [ ! -x "$BINARY" ]; then
+  echo "未找到可执行文件 agentsview，正在执行 make build ..."
+  make build || die "make build 失败，请查看上方日志"
 fi
 
-# 如果已经有实例在运行，先停止
-if [ -f "$PID_FILE" ]; then
-    OLD_PID=$(cat "$PID_FILE" 2>/dev/null) || true
-    if kill -0 "$OLD_PID" 2>/dev/null; then
-        kill "$OLD_PID" 2>/dev/null || true
-        sleep 1
-    fi
-    rm -f "$PID_FILE"
+# 若已有本仓库二进制在跑，先让官方 stop 收口（忽略未运行的情况）
+if [ -x "$BINARY" ]; then
+  "$BINARY" serve stop >/dev/null 2>&1 || true
+  "$BINARY" daemon stop >/dev/null 2>&1 || true
 fi
 
-# 启动服务器（后台运行）
-nohup "$BINARY" serve > "$LOG_FILE" 2>&1 &
-PID=$!
-echo "$PID" > "$PID_FILE"
+echo "启动 AgentsView: $URL"
+echo "日志在本终端输出；按 Ctrl+C 停止。"
+echo ""
 
-# 等待服务器启动（最多 10 秒）
-echo "正在启动 AgentsView 服务器..."
-for i in {1..10}; do
-    if curl -s "http://localhost:8080/api/health" > /dev/null 2>&1; then
-        break
-    fi
-    sleep 1
-done
+notify "正在启动: $URL"
 
-# 检查服务器是否真的在运行
-if ! curl -s "http://localhost:8080/api/health" > /dev/null 2>&1; then
-    osascript -e 'display dialog "AgentsView 服务器启动失败，请检查日志: /tmp/agentsview.log" buttons {"确定"} default button 1 with icon stop' > /dev/null 2>&1 || true
-    rm -f "$PID_FILE"
-    exit 1
-fi
-
-# 在浏览器中打开
-open "http://localhost:8080"
-
-# 显示通知
-osascript -e 'display notification "生产模式已启动: http://localhost:8080" with title "AgentsView"' > /dev/null 2>&1 || true
-
-echo "AgentsView 已启动: http://localhost:8080"
-echo "PID: $PID"
-echo "日志: $LOG_FILE"
+# serve 默认会尝试打开浏览器；失败也不阻断
+exec "$BINARY" serve
