@@ -268,6 +268,9 @@ var Registry = []AgentDef{
 		DefaultDirs: []string{".cursor/projects"},
 		IDPrefix:    "cursor:",
 		FileBased:   true,
+		Usage: UsageCapabilities{
+			NoPerMessageTokenData: true,
+		},
 	},
 	{
 		Type:        AgentAmp,
@@ -907,6 +910,14 @@ func AgentNameIsCopilot(agent string) bool {
 // entry.
 func AgentFilterIsCopilot(agentFilter string) bool {
 	return agentFilterMatches(agentFilter, AgentNameIsCopilot)
+}
+
+// AgentFilterIsCursor reports whether a (possibly comma-separated) agent
+// filter selects only Cursor, with at least one entry.
+func AgentFilterIsCursor(agentFilter string) bool {
+	return agentFilterMatches(agentFilter, func(agent string) bool {
+		return AgentType(agent) == AgentCursor
+	})
 }
 
 // StripHostPrefix splits a remote session ID into its host

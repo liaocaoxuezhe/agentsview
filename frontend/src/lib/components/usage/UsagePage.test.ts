@@ -322,6 +322,31 @@ describe("UsagePage refresh behavior", () => {
     );
   });
 
+  it("explains how to import Cursor cost and token usage", async () => {
+    vi.stubGlobal(
+      "ResizeObserver",
+      class {
+        observe() {}
+        disconnect() {}
+      },
+    );
+    vi.spyOn(usage, "fetchAll").mockResolvedValue();
+
+    router.route = "token-usage";
+    router.params = {};
+    usage.summary = usageSummaryWithUnsupported(
+      "cursor-admin-usage-required",
+    );
+
+    component = mount(UsagePage, { target: document.body });
+    await flushEffects();
+
+    expect(document.body.textContent).toContain(
+      "Cursor local sessions do not include cost or token usage",
+    );
+    expect(document.body.textContent).toContain("agentsview usage cursor");
+  });
+
   it("does not auto-refresh usage scans from SSE updates", () => {
     expect(source).not.toContain("subscribeDebounced");
     expect(source).not.toContain("REFRESH_MS");

@@ -565,12 +565,38 @@ Grok section and remove the explicit registry exception in the coverage test.
     [Kimi provider usage mapping](https://github.com/MoonshotAI/kimi-cli/blob/4a550effdfcb29a25a5d325bf935296cc50cd417/packages/kosong/src/kosong/chat_provider/kimi.py).
 
 - **Usage and cost:** Native usage distinguishes uncached/other input, output,
-  cache read, and cache creation. The aggregate fallback exposes only output
-  and is therefore a lower bound. Agentsview catalog-prices usage with a
-  model.
+  cache read, and cache creation. `step.end` emits usage after the turn's text
+  and tool calls have already been flushed (by `tool.result`), so Agentsview
+  back-fills that usage onto the assistant message that owns the turn;
+  without the back-fill every tool-using step would lose its input/cache
+  tokens. The `StatusUpdate` aggregate fallback exposes only output and is
+  therefore a lower bound. Agentsview catalog-prices usage with a model.
 
 - **Agentsview:** `internal/parser/kimi.go` and
   `internal/parser/kimi_provider.go`.
+
+## Kimi Work (`kimi-work`)
+
+- **Format:** `wire.jsonl` transcripts byte-identical to the Kimi CLI format,
+  written by the kimi-desktop "daimon" runtime into `conv-*` session
+  directories.
+
+- **Evidence:** `source`.
+
+- **Upstream:** Clone `https://github.com/MoonshotAI/kimi-cli.git` at
+  `4a550effdfcb29a25a5d325bf935296cc50cd417`; see
+  [session.py](https://github.com/MoonshotAI/kimi-cli/blob/4a550effdfcb29a25a5d325bf935296cc50cd417/src/kimi_cli/session.py)
+  and
+  [wire-mode.md](https://github.com/MoonshotAI/kimi-cli/blob/4a550effdfcb29a25a5d325bf935296cc50cd417/docs/en/customization/wire-mode.md).
+  Kimi Work reuses this wire protocol byte-for-byte; the `conv-*`
+  session-directory layout and the daimon runtime that emits it are not
+  published, so Agentsview narrows discovery to those directories.
+
+- **Usage and cost:** Same as the Kimi CLI entry, including the `step.end`
+  usage back-fill onto the owning assistant message.
+
+- **Agentsview:** `internal/parser/kimi_work_provider.go` delegates parsing to
+  `internal/parser/kimi.go`.
 
 ## Claude.ai Export (`claude-ai`)
 

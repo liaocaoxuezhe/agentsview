@@ -55,10 +55,10 @@ future agents can opt into either behavior independently.
 
 ### Cursor Admin Usage Events
 
-Cursor has two usage sources in AgentsView:
+Cursor sessions and usage come from separate sources in AgentsView:
 
-- local Cursor transcripts, when `~/.cursor/projects` contains usable token
-  metadata
+- local Cursor transcripts for session browsing; current Cursor transcript
+  exports do not include per-message token or billed-cost metadata
 - Cursor Admin API usage events, imported on demand with
   `agentsview usage cursor`
 

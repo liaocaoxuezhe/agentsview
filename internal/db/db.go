@@ -318,7 +318,12 @@ const projectIdentityRemoteScrubCompletedKey = "project_identity_remote_scrub_v1
 // and model replaces the single last-payload event per session, with
 // occurred_at from each turn's timestamp. Existing Grok rows undercount
 // multi-turn sessions and need re-parsing.)
-const dataVersion = 70
+// (71: Kimi step.end usage reparse. step.end emits usage after tool.result
+// has already flushed the assistant turn's text and tool calls; the parser
+// now back-fills that usage onto the owning assistant message instead of
+// dropping it. Existing Kimi rows lose nearly all input/cache tokens and
+// need re-parsing.)
+const dataVersion = 71
 
 const tokenCoverageRepairStatsKey = "token_coverage_repair_v1"
 

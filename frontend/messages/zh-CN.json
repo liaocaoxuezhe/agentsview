@@ -1766,6 +1766,7 @@
   "usage_vs_prior": "{pct}% 较上期",
   "usage_total_cost": "总成本",
   "usage_summary_unsupported_copilot_no_token_data": "此范围内匹配到了 Copilot 会话，但 Copilot 不会记录每条消息的 token 用量。",
+  "usage_summary_unsupported_cursor_admin_usage_required": "Cursor 本地会话不包含成本或 Token 用量。请配置 Cursor Admin API，然后运行 agentsview usage cursor 导入数据。",
   "usage_pairwise_title": "对比成本分析",
   "usage_pairwise_subtitle": "比较两个模型或项目切片，使用后端计算的会话和 token 指标。",
   "usage_pairwise_tokens_title": "对比 Token 分析",
