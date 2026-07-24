@@ -327,6 +327,102 @@ func TestParseKimiSession_StepEndModelOverridesDefault(t *testing.T) {
 	assert.Equal(t, "moonshot/kimi-k2", msgs[1].Model)
 }
 
+func TestParseKimiSession_StepEndUsageBackFilledAfterToolResult(t *testing.T) {
+	// Kimi emits step.end usage AFTER tool.result has already flushed
+	// the assistant turn's text and tool calls into a message. The
+	// usage — including input and cache tokens, which dominate a
+	// coding agent's bill — must back-fill onto that assistant message
+	// instead of being dropped when the empty pending turn is reset.
+	path := writeKimiWireJSONL(t,
+		"proj-tool-step", "sess-tool-step",
+		[]string{
+			`{"type": "metadata", "protocol_version": "1.3"}`,
+			`{"type": "turn.prompt", "timestamp": 1704067200.0, "input": [{"type": "text", "text": "list go files"}]}`,
+			`{"type": "context.append_loop_event", "timestamp": 1704067201.0, "event": {"type": "content.part", "part": {"type": "text", "text": "Let me look."}}}`,
+			`{"type": "context.append_loop_event", "timestamp": 1704067202.0, "event": {"type": "tool.call", "name": "Glob", "args": {"pattern": "*.go"}, "toolCallId": "tool_1"}}`,
+			`{"type": "context.append_loop_event", "timestamp": 1704067203.0, "event": {"type": "tool.result", "toolCallId": "tool_1", "result": {"output": "main.go"}}}`,
+			`{"type": "context.append_loop_event", "timestamp": 1704067204.0, "event": {"type": "step.end", "model": "kimi-code/kimi-for-coding", "finishReason": "stop", "usage": {"output": 544, "inputOther": 455, "inputCacheRead": 36864, "inputCacheCreation": 0}}}`,
+			`{"type": "usage.record", "timestamp": 1704067204.5, "model": "kimi-code/kimi-for-coding", "usage": {"output": 544, "inputOther": 455, "inputCacheRead": 36864, "inputCacheCreation": 0}}`,
+		},
+	)
+
+	sess, msgs, err := parseKimiSession(path, "testproj", "local")
+	require.NoError(t, err)
+	require.NotNil(t, sess)
+
+	// user, assistant(text+tool call), tool result(user)
+	require.Len(t, msgs, 3)
+
+	assistant := msgs[1]
+	assert.Equal(t, RoleAssistant, assistant.Role)
+	require.NotEmpty(t, assistant.TokenUsage,
+		"step.end usage must back-fill onto the assistant message")
+
+	// Output and context (input + cache read + cache create) survive.
+	assert.Equal(t, 544, assistant.OutputTokens)
+	assert.True(t, assistant.HasOutputTokens)
+	assert.Equal(t, 455+36864, assistant.ContextTokens)
+	assert.True(t, assistant.HasContextTokens)
+	assert.Equal(t, "kimi-code/kimi-for-coding", assistant.Model)
+
+	// The JSON blob carries the cache_read field, not just output.
+	assert.Contains(t, string(assistant.TokenUsage),
+		"cache_read_input_tokens")
+
+	// Session-level output accumulation still works.
+	assert.Equal(t, 544, sess.TotalOutputTokens)
+	assert.True(t, sess.HasTotalOutputTokens)
+
+	// Per-message tokens price the session, so no session-level event.
+	assert.Empty(t, sess.UsageEvents)
+}
+
+func TestParseKimiSession_StepEndUsageBackFilledAcrossSteps(t *testing.T) {
+	// Two consecutive tool-using steps: each step.end must back-fill to
+	// its own assistant message, never the previous step's, and the
+	// usage.record that follows must not double-count.
+	path := writeKimiWireJSONL(t,
+		"proj-multi-step", "sess-multi-step",
+		[]string{
+			`{"type": "metadata", "protocol_version": "1.3"}`,
+			`{"type": "turn.prompt", "timestamp": 1704067200.0, "input": [{"type": "text", "text": "go"}]}`,
+			`{"type": "context.append_loop_event", "timestamp": 1704067201.0, "event": {"type": "content.part", "part": {"type": "text", "text": "one"}}}`,
+			`{"type": "context.append_loop_event", "timestamp": 1704067202.0, "event": {"type": "tool.call", "name": "Glob", "args": {"pattern": "a"}, "toolCallId": "t1"}}`,
+			`{"type": "context.append_loop_event", "timestamp": 1704067203.0, "event": {"type": "tool.result", "toolCallId": "t1", "result": {"output": "a.go"}}}`,
+			`{"type": "context.append_loop_event", "timestamp": 1704067204.0, "event": {"type": "step.end", "model": "kimi-code/k3", "finishReason": "stop", "usage": {"output": 100, "inputOther": 10, "inputCacheRead": 1000, "inputCacheCreation": 0}}}`,
+			`{"type": "usage.record", "timestamp": 1704067204.5, "model": "kimi-code/k3", "usage": {"output": 100, "inputOther": 10, "inputCacheRead": 1000, "inputCacheCreation": 0}}`,
+			`{"type": "context.append_loop_event", "timestamp": 1704067205.0, "event": {"type": "content.part", "part": {"type": "text", "text": "two"}}}`,
+			`{"type": "context.append_loop_event", "timestamp": 1704067206.0, "event": {"type": "tool.call", "name": "Glob", "args": {"pattern": "b"}, "toolCallId": "t2"}}`,
+			`{"type": "context.append_loop_event", "timestamp": 1704067207.0, "event": {"type": "tool.result", "toolCallId": "t2", "result": {"output": "b.go"}}}`,
+			`{"type": "context.append_loop_event", "timestamp": 1704067208.0, "event": {"type": "step.end", "model": "kimi-code/k3", "finishReason": "stop", "usage": {"output": 200, "inputOther": 20, "inputCacheRead": 2000, "inputCacheCreation": 0}}}`,
+			`{"type": "usage.record", "timestamp": 1704067208.5, "model": "kimi-code/k3", "usage": {"output": 200, "inputOther": 20, "inputCacheRead": 2000, "inputCacheCreation": 0}}`,
+		},
+	)
+
+	sess, msgs, err := parseKimiSession(path, "testproj", "local")
+	require.NoError(t, err)
+	require.NotNil(t, sess)
+
+	// Collect assistant messages with usage.
+	var assistants []ParsedMessage
+	for _, m := range msgs {
+		if m.Role == RoleAssistant {
+			assistants = append(assistants, m)
+		}
+	}
+	require.Len(t, assistants, 2)
+
+	// First step -> first assistant; second step -> second assistant.
+	assert.Equal(t, 100, assistants[0].OutputTokens)
+	assert.Equal(t, 10+1000, assistants[0].ContextTokens)
+	assert.Equal(t, 200, assistants[1].OutputTokens)
+	assert.Equal(t, 20+2000, assistants[1].ContextTokens)
+
+	// Session totals sum both steps, counted once each.
+	assert.Equal(t, 300, sess.TotalOutputTokens)
+	assert.Empty(t, sess.UsageEvents)
+}
+
 func TestParseKimiSession_ZeroValuedStatusUpdatePreservesCoverage(t *testing.T) {
 	path := writeKimiWireJSONL(t,
 		"proj-zero", "sess-zero",

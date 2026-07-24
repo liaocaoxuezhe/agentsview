@@ -203,10 +203,48 @@ func parseKimiSession(
 		hasToolUse = false
 	}
 
+	// attachPendingUsageToLastAssistant back-fills token usage captured
+	// at step.end onto the assistant message that owns the turn. Kimi
+	// emits step.end usage AFTER tool.result has already flushed the
+	// assistant's text and tool calls, so by then the pending turn is
+	// empty and flushAssistantTurn would otherwise drop the usage.
+	// Without this back-fill every tool-using step loses its input and
+	// cache tokens (the dominant component for a coding agent), leaving
+	// only the rare tool-free text steps priced.
+	attachPendingUsageToLastAssistant := func() {
+		if len(pendingTokenUsage) == 0 {
+			return
+		}
+		for i := len(messages) - 1; i >= 0; i-- {
+			if messages[i].Role != RoleAssistant {
+				continue
+			}
+			if len(messages[i].TokenUsage) != 0 {
+				return
+			}
+			turnModel := pendingModel
+			if turnModel == "" {
+				turnModel = currentModel
+			}
+			messages[i].Model = turnModel
+			messages[i].TokenUsage = pendingTokenUsage
+			messages[i].OutputTokens = pendingOutputTokens
+			messages[i].ContextTokens = pendingContextTokens
+			messages[i].HasOutputTokens = pendingHasOutputTokens
+			messages[i].HasContextTokens = pendingHasContextTokens
+			return
+		}
+	}
+
 	flushAssistantTurn := func() {
 		content := strings.Join(pendingText, "\n")
 		if strings.TrimSpace(content) == "" &&
 			len(pendingToolCall) == 0 {
+			// The turn's text and tool calls were already flushed by an
+			// earlier event (typically tool.result). If step.end recorded
+			// usage for this turn, back-fill it before resetting so the
+			// turn's input/cache tokens are not lost.
+			attachPendingUsageToLastAssistant()
 			resetAssistantTurn()
 			return
 		}
