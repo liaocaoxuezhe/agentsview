@@ -248,6 +248,12 @@ func (spec openCodeProviderSpec) resolve(root string) OpenCodeSource {
 	return resolveOpenCodeFormatSource(spec.format, root)
 }
 
+// dbSources returns one OpenCodeSource per existing SQLite DB file for
+// this agent under root (primary plus alternate names like opencode-next.db).
+func (spec openCodeProviderSpec) dbSources(root string) []OpenCodeSource {
+	return resolveOpenCodeFormatDBSources(spec.format, root)
+}
+
 // discover lists file-backed storage session JSON files under a root.
 func (spec openCodeProviderSpec) discover(root string) []DiscoveredFile {
 	return discoverOpenCodeFormatSessions(spec.format, root)
@@ -276,7 +282,9 @@ func (spec openCodeProviderSpec) storageIDs(root string) map[string]struct{} {
 func (spec openCodeProviderSpec) parseVirtual(
 	sourcePath string,
 ) (dbPath, sessionID string, ok bool) {
-	return parseOpenCodeFormatVirtualPath(spec.dbName, sourcePath)
+	return parseOpenCodeFormatVirtualPath(
+		spec.dbName, sourcePath, spec.format.altDBNames...,
+	)
 }
 
 // parseFile parses a file-backed storage session and relabels it onto
@@ -354,28 +362,30 @@ func (s openCodeFormatSourceSet) Discover(ctx context.Context) ([]SourceRef, err
 			}
 			storageIDs = s.spec.storageIDs(root)
 		}
-		if src.DBPath == "" || !IsRegularFile(src.DBPath) {
-			continue
-		}
-		dbSources, err := s.sqliteSources(ctx, root, src.DBPath, storageIDs)
-		if err != nil {
-			if ctx.Err() != nil {
-				return nil, err
-			}
-			// The SQLite DB is optional alongside filesystem storage. A
-			// corrupt or unreadable DB must not abort discovery of the valid
-			// storage-backed sessions in this root; scope the failure to the DB
-			// portion, matching the legacy independent discovery paths. A
-			// SQLite-only root has nothing to fall back to, so keep failing.
-			if src.Mode == OpenCodeSourceStorage {
-				log.Printf("sync %s: skipping unreadable %s: %v",
-					s.spec.agent, src.DBPath, err)
+		for _, dbSrc := range s.spec.dbSources(root) {
+			if dbSrc.DBPath == "" || !IsRegularFile(dbSrc.DBPath) {
 				continue
 			}
-			return nil, err
-		}
-		for _, source := range dbSources {
-			addJSONLSource(source, &sources, seen)
+			dbSources, err := s.sqliteSources(ctx, root, dbSrc.DBPath, storageIDs)
+			if err != nil {
+				if ctx.Err() != nil {
+					return nil, err
+				}
+				// The SQLite DB is optional alongside filesystem storage. A
+				// corrupt or unreadable DB must not abort discovery of the valid
+				// storage-backed sessions in this root; scope the failure to the DB
+				// portion, matching the legacy independent discovery paths. A
+				// SQLite-only root has nothing to fall back to, so keep failing.
+				if src.Mode == OpenCodeSourceStorage {
+					log.Printf("sync %s: skipping unreadable %s: %v",
+						s.spec.agent, dbSrc.DBPath, err)
+					continue
+				}
+				return nil, err
+			}
+			for _, source := range dbSources {
+				addJSONLSource(source, &sources, seen)
+			}
 		}
 	}
 	sortJSONLSources(sources)
@@ -427,7 +437,8 @@ func (s openCodeFormatSourceSet) discoverRootEach(
 	ctx context.Context, root string, yield func(SourceRef) error,
 ) (continuable bool, retErr error) {
 	src := s.spec.resolve(root)
-	hasSQLite := src.DBPath != "" && IsRegularFile(src.DBPath)
+	dbSources := s.spec.dbSources(root)
+	hasSQLite := len(dbSources) > 0
 	var storageIDs *discoveryDiskMap
 	if src.Mode == OpenCodeSourceStorage && hasSQLite {
 		var err error
@@ -458,43 +469,47 @@ func (s openCodeFormatSourceSet) discoverRootEach(
 	}
 	var callbackErr error
 	var membershipErr error
-	err := s.spec.streamSQLite(ctx, src.DBPath, func(meta OpenCodeSessionMeta) error {
-		if storageIDs != nil {
-			_, exists, err := storageIDs.get(ctx, meta.SessionID)
-			if err != nil {
-				membershipErr = err
-				return err
+	var sqliteErr error
+	for _, dbSrc := range dbSources {
+		if dbSrc.DBPath == "" || !IsRegularFile(dbSrc.DBPath) {
+			continue
+		}
+		err := s.spec.streamSQLite(ctx, dbSrc.DBPath, func(meta OpenCodeSessionMeta) error {
+			if storageIDs != nil {
+				_, exists, err := storageIDs.get(ctx, meta.SessionID)
+				if err != nil {
+					membershipErr = err
+					return err
+				}
+				if exists {
+					return nil
+				}
 			}
-			if exists {
+			source, ok := s.sqliteSourceRefFromMeta(root, meta)
+			if !ok {
 				return nil
 			}
+			callbackErr = yield(source)
+			return callbackErr
+		})
+		if callbackErr != nil {
+			return false, callbackErr
 		}
-		source, ok := s.sqliteSourceRefFromMeta(root, meta)
-		if !ok {
-			return nil
+		if membershipErr != nil {
+			return false, membershipErr
 		}
-		callbackErr = yield(source)
-		return callbackErr
-	})
-	if callbackErr != nil {
-		return false, callbackErr
+		if err != nil {
+			sqliteErr = errors.Join(sqliteErr, err)
+		}
 	}
-	if membershipErr != nil {
-		return false, membershipErr
-	}
-	if err == nil {
+	if sqliteErr == nil {
 		return false, nil
 	}
 	if ctx.Err() != nil {
-		return false, err
-	}
-	if src.Mode == OpenCodeSourceStorage {
-		return true, incompleteDiscoveryError(
-			s.spec.agent, "stream SQLite "+src.DBPath, err,
-		)
+		return false, sqliteErr
 	}
 	return true, incompleteDiscoveryError(
-		s.spec.agent, "stream SQLite "+src.DBPath, err,
+		s.spec.agent, "stream SQLite "+dbSources[0].DBPath, sqliteErr,
 	)
 }
 
@@ -557,17 +572,17 @@ func (s openCodeFormatSourceSet) discoverStorageEach(
 
 func (s openCodeFormatSourceSet) WatchPlan(context.Context) (WatchPlan, error) {
 	roots := make([]WatchRoot, 0, len(s.roots))
+	globs := []string{"*.json"}
+	for _, name := range s.spec.format.dbNames() {
+		globs = append(globs, name, name+"-wal")
+	}
 	for _, root := range s.roots {
 		for _, watchRoot := range s.spec.watchRoots(root) {
 			roots = append(roots, WatchRoot{
-				Path:      watchRoot,
-				Recursive: true,
-				IncludeGlobs: []string{
-					"*.json",
-					s.spec.dbName,
-					s.spec.dbName + "-wal",
-				},
-				DebounceKey: string(s.spec.agent) + ":opencode:" + watchRoot,
+				Path:         watchRoot,
+				Recursive:    true,
+				IncludeGlobs: globs,
+				DebounceKey:  string(s.spec.agent) + ":opencode:" + watchRoot,
 			})
 		}
 	}
@@ -854,28 +869,25 @@ func (s openCodeFormatSourceSet) sourcesForChangedPathInRoot(
 	if !ok {
 		return nil, false, nil
 	}
-	isSQLiteChange := true
-	switch rel {
-	case s.spec.dbName + "-shm":
-		// SHM is only SQLite's WAL index. WAL frames (or the checkpointed main
-		// database) carry the source changes, so SHM events are redundant.
-		return nil, true, nil
-	case s.spec.dbName + "-wal":
-		// A read-only connection can create an empty WAL while inspecting a
-		// quiet database. Ignore it, as well as WAL removal after a checkpoint;
-		// the corresponding main-database write is watched separately.
-		if !sqliteWALHasFrames(path) {
-			return nil, true, nil
-		}
-	case s.spec.dbName:
-		// The main database and WALs with transaction frames both fan out to
-		// the logical sessions stored in this shared SQLite container.
-	default:
-		isSQLiteChange = false
-	}
-
+	dbName, dbKind, isSQLiteChange := s.changedSQLiteDB(rel)
 	if isSQLiteChange {
-		dbPath := filepath.Join(root, s.spec.dbName)
+		switch dbKind {
+		case "shm":
+			// SHM is only SQLite's WAL index. WAL frames (or the checkpointed main
+			// database) carry the source changes, so SHM events are redundant.
+			return nil, true, nil
+		case "wal":
+			// A read-only connection can create an empty WAL while inspecting a
+			// quiet database. Ignore it, as well as WAL removal after a checkpoint;
+			// the corresponding main-database write is watched separately.
+			if !sqliteWALHasFrames(path) {
+				return nil, true, nil
+			}
+		default:
+			// The main database and WALs with transaction frames both fan out to
+			// the logical sessions stored in this shared SQLite container.
+		}
+		dbPath := filepath.Join(root, dbName)
 		if !IsRegularFile(dbPath) {
 			return nil, true, nil
 		}
@@ -966,6 +978,25 @@ func (s openCodeFormatSourceSet) sourcesForChangedPathInRoot(
 		return []SourceRef{source}, true, nil
 	}
 	return nil, false, nil
+}
+
+// changedSQLiteDB reports whether rel is one of this agent's SQLite DB
+// files (primary or alternate name) or its WAL/SHM sidecar, returning the
+// matched base DB name and the file kind ("main", "wal", or "shm").
+func (s openCodeFormatSourceSet) changedSQLiteDB(
+	rel string,
+) (dbName, kind string, ok bool) {
+	for _, name := range s.spec.format.dbNames() {
+		switch rel {
+		case name:
+			return name, "main", true
+		case name + "-wal":
+			return name, "wal", true
+		case name + "-shm":
+			return name, "shm", true
+		}
+	}
+	return "", "", false
 }
 
 func sqliteWALHasFrames(path string) bool {

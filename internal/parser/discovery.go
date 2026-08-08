@@ -93,12 +93,15 @@ type OpenCodeSource struct {
 type openCodeFormat struct {
 	agent         AgentType
 	dbName        string
+	altDBNames    []string
 	sessionSubdir string
 }
 
 var (
 	openCodeFmt = openCodeFormat{
-		agent: AgentOpenCode, dbName: "opencode.db", sessionSubdir: "session",
+		agent: AgentOpenCode, dbName: "opencode.db",
+		altDBNames:    []string{"opencode-next.db"},
+		sessionSubdir: "session",
 	}
 	kiloFmt = openCodeFormat{
 		agent: AgentKilo, dbName: "kilo.db", sessionSubdir: "session",
@@ -152,6 +155,43 @@ func resolveOpenCodeFormatSource(
 	return OpenCodeSource{Root: root}
 }
 
+// dbNames returns the primary SQLite filename followed by any alternate
+// names. OpenCode v2 ("opencode-next") writes a second database next to the
+// v1 opencode.db; both live in the same root and must be discovered and
+// parsed by the shared OpenCode-format provider.
+func (f openCodeFormat) dbNames() []string {
+	if len(f.altDBNames) == 0 {
+		return []string{f.dbName}
+	}
+	names := make([]string, 0, 1+len(f.altDBNames))
+	names = append(names, f.dbName)
+	names = append(names, f.altDBNames...)
+	return names
+}
+
+// resolveOpenCodeFormatDBSources returns one SQLite source per existing
+// database file under root, in dbNames order. Storage-mode handling is
+// unchanged and remains the job of resolveOpenCodeFormatSource.
+func resolveOpenCodeFormatDBSources(
+	f openCodeFormat, root string,
+) []OpenCodeSource {
+	if root == "" {
+		return nil
+	}
+	var sources []OpenCodeSource
+	for _, name := range f.dbNames() {
+		dbPath := filepath.Join(root, name)
+		if info, err := os.Stat(dbPath); err == nil && !info.IsDir() {
+			sources = append(sources, OpenCodeSource{
+				Mode:   OpenCodeSourceSQLite,
+				Root:   root,
+				DBPath: dbPath,
+			})
+		}
+	}
+	return sources
+}
+
 func discoverOpenCodeFormatSessions(
 	f openCodeFormat, root string,
 ) []DiscoveredFile {
@@ -202,8 +242,7 @@ func findOpenCodeFormatSourceFile(
 	}
 
 	src := resolveOpenCodeFormatSource(f, root)
-	switch src.Mode {
-	case OpenCodeSourceStorage:
+	if src.Mode == OpenCodeSourceStorage {
 		if entries, err := os.ReadDir(src.SessionRoot); err == nil {
 			for _, entry := range entries {
 				if !isDirOrSymlink(entry, src.SessionRoot) {
@@ -219,18 +258,13 @@ func findOpenCodeFormatSourceFile(
 				}
 			}
 		}
-		if OpenCodeSQLiteSessionExists(src.DBPath, sessionID) {
-			return OpenCodeSQLiteVirtualPath(src.DBPath, sessionID)
-		}
-		return ""
-	case OpenCodeSourceSQLite:
-		if OpenCodeSQLiteSessionExists(src.DBPath, sessionID) {
-			return OpenCodeSQLiteVirtualPath(src.DBPath, sessionID)
-		}
-		return ""
-	default:
-		return ""
 	}
+	for _, dbSrc := range resolveOpenCodeFormatDBSources(f, root) {
+		if OpenCodeSQLiteSessionExists(dbSrc.DBPath, sessionID) {
+			return OpenCodeSQLiteVirtualPath(dbSrc.DBPath, sessionID)
+		}
+	}
+	return ""
 }
 
 func openCodeFormatStorageSessionIDs(
@@ -297,7 +331,7 @@ func resolveOpenCodeFormatWatchRoots(
 }
 
 func parseOpenCodeFormatVirtualPath(
-	dbName, sourcePath string,
+	dbName, sourcePath string, altNames ...string,
 ) (dbPath, sessionID string, ok bool) {
 	idx := strings.LastIndex(sourcePath, "#")
 	if idx <= 0 || idx >= len(sourcePath)-1 {
@@ -305,7 +339,13 @@ func parseOpenCodeFormatVirtualPath(
 	}
 	dbPath = sourcePath[:idx]
 	sessionID = sourcePath[idx+1:]
-	if filepath.Base(dbPath) != dbName {
+	base := filepath.Base(dbPath)
+	if base != dbName {
+		for _, alt := range altNames {
+			if base == alt {
+				return dbPath, sessionID, true
+			}
+		}
 		return "", "", false
 	}
 	return dbPath, sessionID, true

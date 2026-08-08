@@ -499,6 +499,7 @@ func TestOpenCodeProviderSQLiteSourceMethods(t *testing.T) {
 	assert.True(t, plan.Roots[0].Recursive)
 	assert.Equal(t, []string{
 		"*.json", "opencode.db", "opencode.db-wal",
+		"opencode-next.db", "opencode-next.db-wal",
 	}, plan.Roots[0].IncludeGlobs)
 
 	discovered, err := provider.Discover(context.Background())
