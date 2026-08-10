@@ -488,6 +488,10 @@ func buildOpenCodeSession(
 	s openCodeSessionRow,
 	worktree, dbPath, machine string,
 ) (*ParsedSession, []ParsedMessage, error) {
+	if openCodeUsesV2Schema(db) {
+		return buildOpenCodeV2Session(db, s, worktree, dbPath, machine)
+	}
+
 	msgs, err := loadOpenCodeMessages(db, s.id)
 	if err != nil {
 		return nil, nil, fmt.Errorf(
@@ -518,6 +522,331 @@ func buildOpenCodeSession(
 		s, worktree, msgs, parts,
 	)
 	return sess, parsed, nil
+}
+
+// openCodeUsesV2Schema reports whether the shared opencode DB uses the
+// v2 session_message table (which carries each message's data JSON
+// directly) rather than the v1 message+part pair.
+//
+// Schema shape alone is ambiguous: an upgraded v1 DB can carry an empty
+// v2 session_message table (created by the v2 writer) while its real
+// conversation still lives in message/part. Decide by where the rows
+// actually are: session_message rows mean v2, message rows mean v1, and
+// only when both are empty fall back to the table-structure probe.
+func openCodeUsesV2Schema(db *sql.DB) bool {
+	var smRows int
+	if err := db.QueryRow(
+		"SELECT count(*) FROM session_message",
+	).Scan(&smRows); err == nil && smRows > 0 {
+		return true
+	}
+	var msgRows int
+	if err := db.QueryRow(
+		"SELECT count(*) FROM message",
+	).Scan(&msgRows); err == nil && msgRows > 0 {
+		return false
+	}
+	var n int
+	if err := db.QueryRow(
+		"SELECT count(*) FROM pragma_table_info('session_message') WHERE name = 'data'",
+	).Scan(&n); err != nil {
+		return false
+	}
+	return n > 0
+}
+
+// openCodeV2MessageRow is a row from the v2 session_message table.
+type openCodeV2MessageRow struct {
+	id          string
+	msgType     string
+	seq         int
+	data        string
+	timeCreated int64
+}
+
+func loadOpenCodeV2Messages(
+	db *sql.DB, sessionID string,
+) ([]openCodeV2MessageRow, error) {
+	rows, err := db.Query(`
+		SELECT id, type, seq, data, time_created
+		FROM session_message
+		WHERE session_id = ?
+		ORDER BY seq
+	`, sessionID)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+
+	var msgs []openCodeV2MessageRow
+	for rows.Next() {
+		var m openCodeV2MessageRow
+		if err := rows.Scan(
+			&m.id, &m.msgType, &m.seq,
+			&m.data, &m.timeCreated,
+		); err != nil {
+			return nil, err
+		}
+		msgs = append(msgs, m)
+	}
+	return msgs, rows.Err()
+}
+
+// buildOpenCodeV2Session builds a session from the v2 session_message
+// layout, where the conversation is stored entirely in each row's data
+// JSON rather than split across message and part tables.
+func buildOpenCodeV2Session(
+	db *sql.DB,
+	s openCodeSessionRow,
+	worktree, dbPath, machine string,
+) (*ParsedSession, []ParsedMessage, error) {
+	msgs, err := loadOpenCodeV2Messages(db, s.id)
+	if err != nil {
+		return nil, nil, fmt.Errorf(
+			"loading v2 messages for %s: %w", s.id, err,
+		)
+	}
+
+	sess, parsed, err := buildOpenCodeV2ParsedSession(
+		s,
+		worktree,
+		dbPath+"#"+s.id,
+		s.timeUpdated*1_000_000,
+		machine,
+		msgs,
+	)
+	if err != nil || sess == nil {
+		return sess, parsed, err
+	}
+	sess.File.Hash = buildOpenCodeV2SessionFingerprint(
+		s, worktree, msgs,
+	)
+	return sess, parsed, nil
+}
+
+func buildOpenCodeV2ParsedSession(
+	s openCodeSessionRow,
+	worktree, filePath string,
+	fileMtime int64,
+	machine string,
+	msgs []openCodeV2MessageRow,
+) (*ParsedSession, []ParsedMessage, error) {
+
+	var (
+		parsed       []ParsedMessage
+		firstMsg     string
+		hasUserOrAst bool
+		ordinal      int
+	)
+
+	// Prefer OpenCode's LLM-generated title when available, matching the
+	// v1 builder's placeholder handling.
+	if s.title != "" && !isOpenCodeDefaultTitle(s.title) {
+		firstMsg = truncate(s.title, 300)
+	}
+
+	for _, m := range msgs {
+		role := normalizeOpenCodeRole(m.msgType)
+		if role == "" {
+			continue
+		}
+		hasUserOrAst = true
+
+		pm := buildOpenCodeV2Message(
+			ordinal, role, m.timeCreated, m.data, worktree,
+		)
+		applyOpenCodeV2TokenUsage(&pm, m.data)
+		if strings.TrimSpace(pm.Content) == "" &&
+			!pm.HasToolUse {
+			continue
+		}
+
+		if role == RoleUser && firstMsg == "" {
+			firstMsg = truncate(
+				strings.ReplaceAll(pm.Content, "\n", " "),
+				300,
+			)
+		}
+
+		parsed = append(parsed, pm)
+		ordinal++
+	}
+
+	if !hasUserOrAst || len(parsed) == 0 {
+		return nil, nil, nil
+	}
+
+	sess := finalizeOpenCodeParsedSession(
+		s, worktree, filePath, fileMtime, machine,
+		parsed, firstMsg,
+	)
+	return sess, parsed, nil
+}
+
+// applyOpenCodeV2TokenUsage reads the model id from data.model.id and
+// the token counts from data.tokens (same nested cache shape as v1) and
+// applies them to pm.
+func applyOpenCodeV2TokenUsage(pm *ParsedMessage, dataRaw string) {
+	if model := gjson.Get(dataRaw, "model.id").Str; model != "" {
+		pm.Model = model
+	}
+	fields, ok := collectOpenCodeTokenFields(dataRaw)
+	if !ok {
+		return
+	}
+	applyOpenCodeTokenFields(pm, fields)
+}
+
+// openCodeV2ContentItem is a single element of a v2 assistant message's
+// content array. Tool items carry their own id/name plus a state object
+// whose input is an inline JSON object (unlike v1's escaped string).
+type openCodeV2ContentItem struct {
+	Type  string          `json:"type"`
+	ID    string          `json:"id"`
+	Name  string          `json:"name"`
+	Text  string          `json:"text"`
+	State json.RawMessage `json:"state"`
+}
+
+// openCodeV2MessageData holds the scalar fields of a v2 message row's
+// data JSON. User rows use Text; assistant rows use Content.
+type openCodeV2MessageData struct {
+	Text    string                  `json:"text"`
+	Content []openCodeV2ContentItem `json:"content"`
+}
+
+func buildOpenCodeV2Message(
+	ordinal int,
+	role RoleType,
+	timeCreatedMs int64,
+	dataRaw string,
+	cwd string,
+) ParsedMessage {
+	var (
+		texts       []string
+		toolCalls   []ParsedToolCall
+		hasThinking bool
+		hasToolUse  bool
+	)
+	var md openCodeV2MessageData
+	if json.Unmarshal([]byte(dataRaw), &md) != nil {
+		md = openCodeV2MessageData{}
+	}
+	if role == RoleUser {
+		if md.Text != "" {
+			texts = append(texts, md.Text)
+		}
+	} else {
+		for _, item := range md.Content {
+			switch item.Type {
+			case "text":
+				if item.Text != "" {
+					texts = append(texts, item.Text)
+				}
+			case "reasoning":
+				if item.Text != "" {
+					hasThinking = true
+					texts = append(texts,
+						"[Thinking]\n"+item.Text+"\n[/Thinking]")
+				}
+			case "tool":
+				hasToolUse = true
+				tc := extractOpenCodeV2ToolCall(item, cwd)
+				if tc.ToolName != "" {
+					toolCalls = append(toolCalls, tc)
+				}
+			}
+			// skip other item types.
+		}
+	}
+
+	content := strings.Join(texts, "\n")
+	return ParsedMessage{
+		Ordinal:       ordinal,
+		Role:          role,
+		Content:       content,
+		Timestamp:     millisToTime(timeCreatedMs),
+		HasThinking:   hasThinking,
+		HasToolUse:    hasToolUse,
+		ContentLength: len(content),
+		ToolCalls:     toolCalls,
+	}
+}
+
+// extractOpenCodeV2ToolCall builds a ParsedToolCall from a v2 content
+// item. v2 names the tool in `name` (v1 uses `tool`) and stores the call
+// id in `id` (v1 uses `callID`); the state input is an inline object.
+func extractOpenCodeV2ToolCall(
+	item openCodeV2ContentItem, cwd string,
+) ParsedToolCall {
+	var inputJSON string
+	if len(item.State) > 0 {
+		var state openCodeToolState
+		if err := json.Unmarshal(item.State, &state); err == nil {
+			if len(state.Input) > 0 {
+				inputJSON = string(state.Input)
+			}
+		}
+	}
+
+	var skillName string
+	switch item.Name {
+	case "skill":
+		skillName = gjson.Get(inputJSON, "skill").Str
+		if skillName == "" {
+			skillName = gjson.Get(inputJSON, "name").Str
+		}
+	default:
+		skillName = inferOpenCodeSkillName(item.Name, inputJSON, cwd)
+	}
+
+	return ParsedToolCall{
+		ToolUseID: item.ID,
+		ToolName:  item.Name,
+		Category:  NormalizeToolCategory(item.Name),
+		InputJSON: inputJSON,
+		SkillName: skillName,
+	}
+}
+
+// buildOpenCodeV2SessionFingerprint fingerprints a v2 session by hashing
+// each session_message row's data. The v1 fingerprint envelope is reused:
+// v2 messages have no parts, so the messages array carries one entry per
+// row with an empty parts list.
+func buildOpenCodeV2SessionFingerprint(
+	s openCodeSessionRow,
+	worktree string,
+	msgs []openCodeV2MessageRow,
+) string {
+	fp := openCodeStorageFingerprint{
+		Session: &openCodeStorageFingerprintSession{
+			ID:          s.id,
+			ProjectID:   s.projectID,
+			ParentID:    s.parentID,
+			Title:       s.title,
+			Worktree:    worktree,
+			TimeCreated: s.timeCreated,
+			TimeUpdated: s.timeUpdated,
+		},
+		Messages: make(
+			[]openCodeStorageFingerprintMessage,
+			0, len(msgs),
+		),
+	}
+	for _, msg := range msgs {
+		fp.Messages = append(fp.Messages,
+			openCodeStorageFingerprintMessage{
+				ID:   msg.id,
+				Time: msg.timeCreated,
+				Hash: openCodeStorageFingerprintHash(msg.data),
+			},
+		)
+	}
+	raw, err := json.Marshal(fp)
+	if err != nil {
+		return ""
+	}
+	return openCodeStorageFingerprintPrefix + string(raw)
 }
 
 func buildOpenCodeParsedSession(
@@ -589,6 +918,25 @@ func buildOpenCodeParsedSession(
 		return nil, nil, nil
 	}
 
+	sess := finalizeOpenCodeParsedSession(
+		s, worktree, filePath, fileMtime, machine,
+		parsed, firstMsg,
+	)
+	return sess, parsed, nil
+}
+
+// finalizeOpenCodeParsedSession assembles the ParsedSession shared
+// across both OpenCode storage layouts (message+part tables and the
+// v2 session_message table). Parsing of individual messages happens
+// in the layout-specific builders.
+func finalizeOpenCodeParsedSession(
+	s openCodeSessionRow,
+	worktree, filePath string,
+	fileMtime int64,
+	machine string,
+	parsed []ParsedMessage,
+	firstMsg string,
+) *ParsedSession {
 	project := ExtractProjectFromCwd(worktree)
 	if project == "" {
 		project = "unknown"
@@ -629,7 +977,7 @@ func buildOpenCodeParsedSession(
 
 	accumulateMessageTokenUsage(sess, parsed)
 
-	return sess, parsed, nil
+	return sess
 }
 
 // applyOpenCodeTokenUsage copies the assistant message's model
@@ -665,7 +1013,14 @@ func applyOpenCodeTokenUsage(
 	if !ok {
 		return
 	}
+	applyOpenCodeTokenFields(pm, fields)
+}
 
+// applyOpenCodeTokenFields maps collected OpenCode token fields onto a
+// ParsedMessage, preserving "known zero" coverage semantics.
+func applyOpenCodeTokenFields(
+	pm *ParsedMessage, fields openCodeTokenFields,
+) {
 	normalized := map[string]int{
 		"input_tokens":                fields.input,
 		"output_tokens":               fields.output,
@@ -1088,6 +1443,7 @@ func OpenCodeSourceMtime(sourcePath string) (int64, error) {
 	}
 	if dbPath, sessionID, ok := parseOpenCodeFormatVirtualPath(
 		openCodeFmt.dbName, sourcePath,
+		openCodeFmt.altDBNames...,
 	); ok {
 		return openCodeSQLiteSessionMtime(dbPath, sessionID)
 	}
