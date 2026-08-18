@@ -6,6 +6,7 @@ import (
 	"errors"
 	"fmt"
 	"log"
+	"slices"
 	"sort"
 	"strings"
 
@@ -18,6 +19,9 @@ const (
 	MaxRecallSearchTerms             = corerecall.MaxScoringQueryTerms
 	recallFTS4PreselectLimit         = 50000
 	recallEvidenceFTS4PreselectLimit = 50000
+	RecallQueryModeLexical           = "lexical"
+	RecallQueryModeVector            = "vector"
+	RecallQueryModeHybrid            = "hybrid"
 )
 
 type RecallEntry struct {
@@ -82,6 +86,7 @@ type RecallEvidence struct {
 
 type RecallQuery struct {
 	Text                string
+	Mode                string
 	Project             string
 	CWD                 string
 	GitBranch           string
@@ -89,12 +94,16 @@ type RecallQuery struct {
 	Type                string
 	Scope               string
 	Status              string
+	ReviewState         string
 	ExtractorMethod     string
 	SourceSessionID     string
 	SourceEpisodeID     string
 	SourceRunID         string
 	SupersedesEntryID   string
 	SupersededByEntryID string
+	CursorUpdatedAt     string
+	CursorID            string
+	ProbeNext           bool
 	TrustedOnly         bool
 	Limit               int
 }
@@ -237,6 +246,18 @@ func (db *DB) CopyRecallEntriesFrom(sourcePath string) error {
 	if err := copyRecallExtractStateFromAttachedTx(ctx, tx); err != nil {
 		return err
 	}
+	if err := copyRecallCorpusRevisionFromAttachedTx(ctx, tx); err != nil {
+		return err
+	}
+	if err := copyRecallQueryRevisionFromAttachedTx(ctx, tx); err != nil {
+		return err
+	}
+	if err := copyRecallEmbeddingChangesFromAttachedTx(ctx, tx); err != nil {
+		return err
+	}
+	if err := copyRecallEmbeddingDeletionsFromAttachedTx(ctx, tx); err != nil {
+		return err
+	}
 
 	res, err := tx.ExecContext(ctx, `
 		INSERT OR IGNORE INTO recall_entries (
@@ -312,6 +333,112 @@ func (db *DB) CopyRecallEntriesFrom(sourcePath string) error {
 				"source session not preserved)",
 			copied, total, total-copied,
 		)
+	}
+	return nil
+}
+
+func copyRecallCorpusRevisionFromAttachedTx(
+	ctx context.Context, tx *sql.Tx,
+) error {
+	if !oldDBHasTable(ctx, tx, "recall_corpus_state") {
+		return nil
+	}
+	if _, err := tx.ExecContext(ctx, `
+		UPDATE main.recall_corpus_state
+		SET revision = MAX(revision, COALESCE((
+			SELECT revision
+			FROM old_db.recall_corpus_state
+			WHERE singleton = 1
+		), revision))
+		WHERE singleton = 1`); err != nil {
+		return fmt.Errorf("copying recall corpus revision: %w", err)
+	}
+	return nil
+}
+
+func copyRecallQueryRevisionFromAttachedTx(
+	ctx context.Context, tx *sql.Tx,
+) error {
+	if !oldDBHasTable(ctx, tx, "recall_query_state") {
+		return nil
+	}
+	if _, err := tx.ExecContext(ctx, `
+		UPDATE main.recall_query_state
+		SET revision = MAX(revision, COALESCE((
+			SELECT revision
+			FROM old_db.recall_query_state
+			WHERE singleton = 1
+		), revision)) + 1
+		WHERE singleton = 1`); err != nil {
+		return fmt.Errorf("copying recall query revision: %w", err)
+	}
+	return nil
+}
+
+func copyRecallEmbeddingChangesFromAttachedTx(
+	ctx context.Context, tx *sql.Tx,
+) error {
+	if !oldDBHasTable(ctx, tx, "recall_embedding_changes") {
+		return nil
+	}
+	if _, err := tx.ExecContext(ctx, `
+		INSERT INTO main.recall_embedding_changes (entry_id, revision)
+		SELECT entry_id, revision
+		FROM old_db.recall_embedding_changes
+		WHERE true
+		ON CONFLICT(entry_id) DO UPDATE SET
+			revision = MAX(recall_embedding_changes.revision, excluded.revision)`); err != nil {
+		return fmt.Errorf("copying recall embedding changes: %w", err)
+	}
+	return nil
+}
+
+func copyRecallEmbeddingDeletionsFromAttachedTx(
+	ctx context.Context, tx *sql.Tx,
+) error {
+	if oldDBHasTable(ctx, tx, "recall_embedding_deletions") {
+		if _, err := tx.ExecContext(ctx, `
+			INSERT INTO main.recall_embedding_deletions (entry_id, deleted_at)
+			SELECT entry_id, deleted_at
+			FROM old_db.recall_embedding_deletions
+			WHERE true
+			ON CONFLICT(entry_id) DO UPDATE SET
+				deleted_at = excluded.deleted_at`); err != nil {
+			return fmt.Errorf("copying recall embedding deletions: %w", err)
+		}
+	}
+	// A full resync deliberately omits entries whose source session was not
+	// preserved. vectors.db survives that archive swap, so publish those
+	// identities as fresh tombstones for its next incremental refresh.
+	if _, err := tx.ExecContext(ctx, `
+		INSERT INTO main.recall_embedding_deletions (entry_id, deleted_at)
+		SELECT id, strftime('%Y-%m-%dT%H:%M:%fZ','now')
+		FROM old_db.recall_entries
+		WHERE source_session_id NOT IN (SELECT id FROM main.sessions)
+		ON CONFLICT(entry_id) DO UPDATE SET
+			deleted_at = excluded.deleted_at`); err != nil {
+		return fmt.Errorf("journaling recall entries skipped during resync: %w", err)
+	}
+	var hasDeletions bool
+	if err := tx.QueryRowContext(ctx, `
+		SELECT EXISTS (SELECT 1 FROM main.recall_embedding_deletions)
+	`).Scan(&hasDeletions); err != nil {
+		return fmt.Errorf("checking copied recall embedding deletions: %w", err)
+	}
+	if hasDeletions {
+		if _, err := tx.ExecContext(ctx, `
+			UPDATE main.recall_corpus_state
+			SET revision = revision + 1
+			WHERE singleton = 1;
+			INSERT INTO main.recall_embedding_changes (entry_id, revision)
+			SELECT deletion.entry_id, state.revision
+			FROM main.recall_embedding_deletions deletion
+			CROSS JOIN main.recall_corpus_state state
+			WHERE state.singleton = 1
+			ON CONFLICT(entry_id) DO UPDATE SET revision = excluded.revision;
+		`); err != nil {
+			return fmt.Errorf("sequencing copied recall embedding deletions: %w", err)
+		}
 	}
 	return nil
 }
@@ -581,6 +708,9 @@ func (db *DB) ListRecallEntries(
 	q = NormalizeRecallQuery(q)
 	where, args := buildRecallEntryWhere(q, false)
 	limit := recallLimit(q.Limit)
+	if q.ProbeNext {
+		limit++
+	}
 	query := "SELECT " + recallBaseCols +
 		" FROM recall_entries WHERE " + where +
 		" ORDER BY updated_at DESC, id ASC LIMIT ?"
@@ -607,6 +737,33 @@ func (db *DB) ListRecallEntries(
 		entries[i].Evidence = evidence[entries[i].ID]
 	}
 	return entries, nil
+}
+
+// ListServedRecallSourceRuns returns the extraction/import source runs that
+// currently contribute entries to the accepted Recall corpus.
+func (db *DB) ListServedRecallSourceRuns(ctx context.Context) ([]string, error) {
+	rows, err := db.getReader().QueryContext(ctx, `
+		SELECT DISTINCT source_run_id
+		FROM recall_entries
+		WHERE status = ? AND source_run_id != ''
+		ORDER BY source_run_id`, corerecall.StatusAccepted)
+	if err != nil {
+		return nil, fmt.Errorf("listing served recall source runs: %w", err)
+	}
+	defer rows.Close()
+
+	var sourceRuns []string
+	for rows.Next() {
+		var sourceRun string
+		if err := rows.Scan(&sourceRun); err != nil {
+			return nil, fmt.Errorf("scanning served recall source run: %w", err)
+		}
+		sourceRuns = append(sourceRuns, sourceRun)
+	}
+	if err := rows.Err(); err != nil {
+		return nil, fmt.Errorf("iterating served recall source runs: %w", err)
+	}
+	return sourceRuns, nil
 }
 
 func (db *DB) ListRecallEntryTextCandidates(
@@ -981,6 +1138,19 @@ func (db *DB) QueryRecallEntries(
 		return RecallPage{}, err
 	}
 	q = NormalizeRecallQuery(q)
+	switch q.Mode {
+	case RecallQueryModeVector:
+		return db.queryRecallEntriesVector(ctx, q)
+	case RecallQueryModeHybrid:
+		return db.queryRecallEntriesHybrid(ctx, q)
+	default:
+		return db.queryRecallEntriesLexical(ctx, q)
+	}
+}
+
+func (db *DB) queryRecallEntriesLexical(
+	ctx context.Context, q RecallQuery,
+) (RecallPage, error) {
 	if strings.TrimSpace(q.Text) == "" {
 		entries, err := db.ListRecallEntries(ctx, q)
 		if err != nil {
@@ -1045,10 +1215,192 @@ func (db *DB) QueryRecallEntries(
 	return page, nil
 }
 
+func (db *DB) queryRecallEntriesVector(
+	ctx context.Context, q RecallQuery,
+) (RecallPage, error) {
+	searcher := db.getRecallVectorSearcher()
+	if searcher == nil {
+		return RecallPage{}, NewSemanticUnavailableError(
+			"recall index is not available; run 'agentsview embeddings build --store recall'",
+		)
+	}
+	limit := recallLimit(q.Limit)
+	k := max(recallLimit(q.Limit)*4, SemanticOverfetchMin)
+	for {
+		hits, exhausted, snapshot, err := searcher.SearchRecall(ctx, q.Text, k)
+		if err != nil {
+			return RecallPage{}, err
+		}
+		page, err := db.recallPageFromVectorHits(ctx, q, hits, limit)
+		if err != nil {
+			return RecallPage{}, err
+		}
+		if err := searcher.ValidateRecallSnapshot(ctx, snapshot); err != nil {
+			return RecallPage{}, err
+		}
+		if len(page.RecallEntries) >= limit || exhausted {
+			return page, nil
+		}
+		next := k * 2
+		if next <= k {
+			return page, nil
+		}
+		k = next
+	}
+}
+
+func (db *DB) recallPageFromVectorHits(
+	ctx context.Context, q RecallQuery, hits []RecallVectorHit, limit int,
+) (RecallPage, error) {
+	if len(hits) == 0 {
+		return RecallPage{RecallEntries: []RecallResult{}}, nil
+	}
+	ids := make([]string, 0, len(hits))
+	seen := make(map[string]struct{}, len(hits))
+	for _, hit := range hits {
+		if hit.EntryID == "" {
+			continue
+		}
+		if _, ok := seen[hit.EntryID]; ok {
+			continue
+		}
+		seen[hit.EntryID] = struct{}{}
+		ids = append(ids, hit.EntryID)
+	}
+	entries, err := db.listRecallEntriesByIDs(ctx, q, ids)
+	if err != nil {
+		return RecallPage{}, err
+	}
+	byID := make(map[string]RecallEntry, len(entries))
+	for _, entry := range entries {
+		byID[entry.ID] = entry
+	}
+	page := RecallPage{RecallEntries: make([]RecallResult, 0, min(limit, len(entries)))}
+	seen = make(map[string]struct{}, len(entries))
+	for _, hit := range hits {
+		entry, ok := byID[hit.EntryID]
+		if !ok {
+			continue
+		}
+		if _, ok := seen[hit.EntryID]; ok {
+			continue
+		}
+		seen[hit.EntryID] = struct{}{}
+		page.RecallEntries = append(page.RecallEntries, RecallResult{
+			RecallEntry: entry,
+			Score:       float64(hit.Score),
+			MatchReasons: []string{
+				"semantic",
+			},
+		})
+		if len(page.RecallEntries) == limit {
+			break
+		}
+	}
+	return page, nil
+}
+
+func (db *DB) queryRecallEntriesHybrid(
+	ctx context.Context, q RecallQuery,
+) (RecallPage, error) {
+	limit := recallLimit(q.Limit)
+	candidateQuery := q
+	candidateQuery.Mode = RecallQueryModeLexical
+	candidateQuery.Limit = MaxRecallEntryLimit
+	lexical, err := db.queryRecallEntriesLexical(ctx, candidateQuery)
+	if err != nil {
+		return RecallPage{}, err
+	}
+	candidateQuery.Mode = RecallQueryModeVector
+	vector, err := db.queryRecallEntriesVector(ctx, candidateQuery)
+	if err != nil {
+		return RecallPage{}, err
+	}
+	legs := [][]RankedUnit{
+		recallResultRankedUnits(lexical.RecallEntries),
+		recallResultRankedUnits(vector.RecallEntries),
+	}
+	merged := RRFMerge(legs, limit)
+	byID := make(map[string]RecallResult,
+		len(lexical.RecallEntries)+len(vector.RecallEntries))
+	for _, result := range lexical.RecallEntries {
+		byID[result.ID] = result
+	}
+	for _, result := range vector.RecallEntries {
+		if existing, ok := byID[result.ID]; ok {
+			if !slices.Contains(existing.MatchReasons, "semantic") {
+				existing.MatchReasons = append(existing.MatchReasons, "semantic")
+			}
+			byID[result.ID] = existing
+			continue
+		}
+		byID[result.ID] = result
+	}
+	page := RecallPage{RecallEntries: make([]RecallResult, 0, len(merged))}
+	for _, fused := range merged {
+		result := byID[fused.Unit.Key]
+		result.Score = fused.Score
+		page.RecallEntries = append(page.RecallEntries, result)
+	}
+	return page, nil
+}
+
+func recallResultRankedUnits(results []RecallResult) []RankedUnit {
+	ranked := make([]RankedUnit, 0, len(results))
+	for _, result := range results {
+		ranked = append(ranked, RankedUnit{Key: result.ID})
+	}
+	return ranked
+}
+
+func (db *DB) listRecallEntriesByIDs(
+	ctx context.Context, q RecallQuery, ids []string,
+) ([]RecallEntry, error) {
+	if len(ids) == 0 {
+		return nil, nil
+	}
+	var entries []RecallEntry
+	err := queryChunked(ids, func(chunk []string) error {
+		where, filterArgs := buildRecallEntryWhere(q, false)
+		placeholders, idArgs := inPlaceholders(chunk)
+		args := append(idArgs, filterArgs...)
+		rows, err := db.getReader().QueryContext(ctx,
+			"SELECT "+recallBaseCols+" FROM recall_entries WHERE id IN "+
+				placeholders+" AND "+where,
+			args...,
+		)
+		if err != nil {
+			return fmt.Errorf("querying recall vector candidates: %w", err)
+		}
+		defer rows.Close()
+		chunkEntries, err := scanRecallEntryRows(rows)
+		if err != nil {
+			return err
+		}
+		entries = append(entries, chunkEntries...)
+		return nil
+	})
+	if err != nil {
+		return nil, err
+	}
+	evidence, err := db.listRecallEvidence(ctx, recallIDs(entries))
+	if err != nil {
+		return nil, err
+	}
+	for i := range entries {
+		entries[i].Evidence = evidence[entries[i].ID]
+	}
+	return entries, nil
+}
+
 // NormalizeRecallQuery trims whitespace from a query's exact-match filters so
 // padded values match consistently. It is exported so the Postgres store can
 // apply the same normalization as the SQLite store.
 func NormalizeRecallQuery(q RecallQuery) RecallQuery {
+	q.Mode = strings.ToLower(strings.TrimSpace(q.Mode))
+	if q.Mode == "" {
+		q.Mode = RecallQueryModeLexical
+	}
 	q.Project = strings.TrimSpace(q.Project)
 	q.CWD = strings.TrimSpace(q.CWD)
 	q.GitBranch = strings.TrimSpace(q.GitBranch)
@@ -1056,12 +1408,15 @@ func NormalizeRecallQuery(q RecallQuery) RecallQuery {
 	q.Type = strings.TrimSpace(q.Type)
 	q.Scope = strings.TrimSpace(q.Scope)
 	q.Status = strings.TrimSpace(q.Status)
+	q.ReviewState = strings.TrimSpace(q.ReviewState)
 	q.ExtractorMethod = strings.TrimSpace(q.ExtractorMethod)
 	q.SourceSessionID = strings.TrimSpace(q.SourceSessionID)
 	q.SourceEpisodeID = strings.TrimSpace(q.SourceEpisodeID)
 	q.SourceRunID = strings.TrimSpace(q.SourceRunID)
 	q.SupersedesEntryID = strings.TrimSpace(q.SupersedesEntryID)
 	q.SupersededByEntryID = strings.TrimSpace(q.SupersededByEntryID)
+	q.CursorUpdatedAt = strings.TrimSpace(q.CursorUpdatedAt)
+	q.CursorID = strings.TrimSpace(q.CursorID)
 	return q
 }
 
@@ -1070,11 +1425,41 @@ func NormalizeRecallQuery(q RecallQuery) RecallQuery {
 // for another explicit status is therefore a caller error, not an empty page.
 func ValidateRecallQuery(q RecallQuery) error {
 	q = NormalizeRecallQuery(q)
+	switch q.Mode {
+	case RecallQueryModeLexical, RecallQueryModeVector, RecallQueryModeHybrid:
+	default:
+		return fmt.Errorf(
+			"%w: recall query mode must be lexical, vector, or hybrid",
+			ErrInvalidRecallQuery,
+		)
+	}
+	if q.Mode != RecallQueryModeLexical && q.Status != "" &&
+		q.Status != corerecall.StatusAccepted {
+		return fmt.Errorf(
+			"%w: vector and hybrid recall queries only support accepted status",
+			ErrInvalidRecallQuery,
+		)
+	}
 	if q.TrustedOnly && q.Status != "" && q.Status != corerecall.StatusAccepted {
 		return fmt.Errorf(
 			"%w: trusted_only requires status %q",
 			ErrInvalidRecallQuery,
 			corerecall.StatusAccepted,
+		)
+	}
+	if q.ReviewState != "" {
+		if _, ok := corerecall.NormalizeReviewState(q.ReviewState); !ok {
+			return fmt.Errorf(
+				"%w: unknown recall review state %q",
+				ErrInvalidRecallQuery,
+				q.ReviewState,
+			)
+		}
+	}
+	if (q.CursorUpdatedAt == "") != (q.CursorID == "") {
+		return fmt.Errorf(
+			"%w: recall cursor requires both updated_at and id",
+			ErrInvalidRecallQuery,
 		)
 	}
 	return nil
@@ -1154,12 +1539,12 @@ func diversifyRecallResults(
 	byID map[string]RecallEntry,
 	limit int,
 ) []corerecall.Result {
-	if limit <= 0 || len(results) <= limit {
+	if limit <= 0 || len(results) == 0 {
 		return results
 	}
-	usedIDs := make(map[string]bool, limit)
-	usedSources := make(map[string]bool, limit)
-	out := make([]corerecall.Result, 0, limit)
+	usedIDs := make(map[string]bool, len(results))
+	usedSources := make(map[string]bool, len(results))
+	out := make([]corerecall.Result, 0, len(results))
 	for _, result := range results {
 		source := recallSourceDiversityKey(byID[result.Entry.ID])
 		if source == "" || usedSources[source] {
@@ -1168,20 +1553,14 @@ func diversifyRecallResults(
 		out = append(out, result)
 		usedIDs[result.Entry.ID] = true
 		usedSources[source] = true
-		if len(out) >= limit {
-			return out
-		}
 	}
 	for _, result := range results {
 		if usedIDs[result.Entry.ID] {
 			continue
 		}
 		out = append(out, result)
-		if len(out) >= limit {
-			return out
-		}
 	}
-	return out
+	return out[:min(limit, len(out))]
 }
 
 func recallSourceDiversityKey(m RecallEntry) string {
@@ -1242,6 +1621,10 @@ func buildRecallEntryWhere(q RecallQuery, includeText bool) (string, []any) {
 		preds = append(preds, "scope = ?")
 		args = append(args, q.Scope)
 	}
+	if q.ReviewState != "" {
+		preds = append(preds, "review_state = ?")
+		args = append(args, q.ReviewState)
+	}
 	if q.ExtractorMethod != "" {
 		preds = append(preds, "extractor_method = ?")
 		args = append(args, q.ExtractorMethod)
@@ -1265,6 +1648,12 @@ func buildRecallEntryWhere(q RecallQuery, includeText bool) (string, []any) {
 	if q.SupersededByEntryID != "" {
 		preds = append(preds, "superseded_by_entry_id = ?")
 		args = append(args, q.SupersededByEntryID)
+	}
+	if q.CursorUpdatedAt != "" {
+		preds = append(preds,
+			"(updated_at < ? OR (updated_at = ? AND id > ?))")
+		args = append(args,
+			q.CursorUpdatedAt, q.CursorUpdatedAt, q.CursorID)
 	}
 	if q.TrustedOnly {
 		preds = append(preds, "review_state = ?")

@@ -105,6 +105,7 @@ export class SessionsService {
     date,
     dateFrom,
     dateTo,
+    timezone,
     activeSince,
     minMessages,
     maxMessages,
@@ -155,6 +156,10 @@ export class SessionsService {
      * Filter sessions active on or before this date
      */
     dateTo?: string,
+    /**
+     * IANA timezone for calendar-date filters; defaults to UTC
+     */
+    timezone?: string,
     /**
      * Filter sessions active since this RFC3339 timestamp
      */
@@ -236,6 +241,7 @@ export class SessionsService {
         'date': date,
         'date_from': dateFrom,
         'date_to': dateTo,
+        'timezone': timezone,
         'active_since': activeSince,
         'min_messages': minMessages,
         'max_messages': maxMessages,
@@ -313,6 +319,7 @@ export class SessionsService {
     date,
     dateFrom,
     dateTo,
+    timezone,
     activeSince,
     minMessages,
     maxMessages,
@@ -363,6 +370,10 @@ export class SessionsService {
      * Filter sessions active on or before this date
      */
     dateTo?: string,
+    /**
+     * IANA timezone for calendar-date filters; defaults to UTC
+     */
+    timezone?: string,
     /**
      * Filter sessions active since this RFC3339 timestamp
      */
@@ -444,6 +455,7 @@ export class SessionsService {
         'date': date,
         'date_from': dateFrom,
         'date_to': dateTo,
+        'timezone': timezone,
         'active_since': activeSince,
         'min_messages': minMessages,
         'max_messages': maxMessages,
@@ -1190,6 +1202,7 @@ export class SessionsService {
     id,
     breakdown,
     rollup,
+    subagents,
   }: {
     /**
      * Session ID
@@ -1203,6 +1216,10 @@ export class SessionsService {
      * Include explicit subagent descendant costs
      */
     rollup?: boolean,
+    /**
+     * Fold subagent descendant usage into the totals, models, and breakdown
+     */
+    subagents?: boolean,
   }): CancelablePromise<SessionUsageResponse> {
     return __request(OpenAPI, {
       method: 'GET',
@@ -1213,6 +1230,7 @@ export class SessionsService {
       query: {
         'breakdown': breakdown,
         'rollup': rollup,
+        'subagents': subagents,
       },
       errors: {
         400: `Bad Request`,

@@ -49,6 +49,7 @@ across every project, model, and tool.
   <a class="agent-chip" data-agent="visualstudio-copilot" href="https://visualstudio.microsoft.com" target="_blank" rel="noopener"><span class="agent-chip__glyph"><svg viewBox="0 0 24 24" aria-hidden="true"><use xlink:href="#i-visualstudio"/></svg></span><span class="agent-chip__name">Visual Studio Copilot</span></a>
   <a class="agent-chip" data-agent="qwen" href="https://github.com/QwenLM/qwen-code" target="_blank" rel="noopener"><span class="agent-chip__glyph"><svg viewBox="0 0 24 24" aria-hidden="true"><use xlink:href="#i-qwen"/></svg></span><span class="agent-chip__name">Qwen Code</span></a>
   <a class="agent-chip" data-agent="deepseek-tui" href="https://www.deepseek.com" target="_blank" rel="noopener"><span class="agent-chip__glyph"><svg viewBox="0 0 24 24" aria-hidden="true"><use xlink:href="#i-deepseek"/></svg></span><span class="agent-chip__name">DeepSeek TUI</span></a>
+  <a class="agent-chip" data-agent="deepseek-harness" href="https://github.com/deepseek-ai/deepseek-harness" target="_blank" rel="noopener"><span class="agent-chip__glyph"><svg viewBox="0 0 24 24" aria-hidden="true"><use xlink:href="#i-deepseek"/></svg></span><span class="agent-chip__name">DeepSeek Harness</span></a>
   <a class="agent-chip" data-agent="vibe" href="https://mistral.ai" target="_blank" rel="noopener"><span class="agent-chip__glyph"><svg viewBox="0 0 24 24" aria-hidden="true"><use xlink:href="#i-mistral"/></svg></span><span class="agent-chip__name">Mistral Vibe</span></a>
   <a class="agent-chip" data-agent="zed" href="https://zed.dev" target="_blank" rel="noopener"><span class="agent-chip__glyph"><svg viewBox="0 0 24 24" aria-hidden="true"><use xlink:href="#i-zed"/></svg></span><span class="agent-chip__name">Zed</span></a>
   <a class="agent-chip" data-agent="warp" href="https://www.warp.dev" target="_blank" rel="noopener"><span class="agent-chip__glyph"><svg viewBox="0 0 24 24" aria-hidden="true"><use xlink:href="#i-warp"/></svg></span><span class="agent-chip__name">Warp</span></a>
@@ -61,15 +62,20 @@ across every project, model, and tool.
   <a class="agent-chip" data-agent="antigravity" href="https://antigravity.google" target="_blank" rel="noopener"><span class="agent-chip__glyph agent-chip__glyph--mono">Ag</span><span class="agent-chip__name">Antigravity</span></a>
   <a class="agent-chip" data-agent="gptme" href="https://gptme.org" target="_blank" rel="noopener"><span class="agent-chip__glyph agent-chip__glyph--mono">gm</span><span class="agent-chip__name">gptme</span></a>
   <a class="agent-chip" data-agent="kilo" href="https://kilocode.ai" target="_blank" rel="noopener"><span class="agent-chip__glyph agent-chip__glyph--mono">Kl</span><span class="agent-chip__name">Kilo</span></a>
+  <a class="agent-chip" data-agent="kilo-legacy" href="/configuration/#session-discovery"><span class="agent-chip__glyph agent-chip__glyph--mono">KL</span><span class="agent-chip__name">Kilo (legacy)</span></a>
   <a class="agent-chip" data-agent="kimi" href="https://www.kimi.com" target="_blank" rel="noopener"><span class="agent-chip__glyph agent-chip__glyph--mono">Km</span><span class="agent-chip__name">Kimi</span></a>
   <a class="agent-chip" data-agent="kimi-work" href="https://www.kimi.com" target="_blank" rel="noopener"><span class="agent-chip__glyph agent-chip__glyph--mono">Kw</span><span class="agent-chip__name">Kimi Work</span></a>
+  <a class="agent-chip" data-agent="omnigent" href="/configuration/#session-discovery"><span class="agent-chip__glyph agent-chip__glyph--mono">Og</span><span class="agent-chip__name">Omnigent</span></a>
   <a class="agent-chip" data-agent="kiro" href="https://kiro.dev" target="_blank" rel="noopener"><span class="agent-chip__glyph agent-chip__glyph--mono">Kr</span><span class="agent-chip__name">Kiro</span></a>
   <a class="agent-chip" data-agent="openhands" href="https://github.com/All-Hands-AI/OpenHands" target="_blank" rel="noopener"><span class="agent-chip__glyph agent-chip__glyph--mono">OH</span><span class="agent-chip__name">OpenHands</span></a>
   <a class="agent-chip" data-agent="zcode" href="/configuration/#session-discovery"><span class="agent-chip__glyph agent-chip__glyph--mono">Zc</span><span class="agent-chip__name">ZCode</span></a>
   <a class="agent-chip" data-agent="zencoder" href="https://zencoder.ai" target="_blank" rel="noopener"><span class="agent-chip__glyph agent-chip__glyph--mono">Ze</span><span class="agent-chip__name">Zencoder</span></a>
   <a class="agent-chip" data-agent="commandcode" href="/configuration/#session-discovery"><span class="agent-chip__glyph agent-chip__glyph--mono">Cc</span><span class="agent-chip__name">Command Code</span></a>
+  <a class="agent-chip" data-agent="codebuff" href="/configuration/#session-discovery"><span class="agent-chip__glyph agent-chip__glyph--mono">Cb</span><span class="agent-chip__name">Codebuff</span></a>
   <a class="agent-chip" data-agent="cortex-code" href="/configuration/#session-discovery"><span class="agent-chip__glyph agent-chip__glyph--mono">Cx</span><span class="agent-chip__name">Cortex Code</span></a>
   <a class="agent-chip" data-agent="forge" href="/configuration/#session-discovery"><span class="agent-chip__glyph agent-chip__glyph--mono">Fo</span><span class="agent-chip__name">Forge</span></a>
+  <a class="agent-chip" data-agent="freebuff" href="/configuration/#session-discovery"><span class="agent-chip__glyph agent-chip__glyph--mono">Fb</span><span class="agent-chip__name">Freebuff</span></a>
+  <a class="agent-chip" data-agent="goose" href="https://goose-docs.ai/" target="_blank" rel="noopener"><span class="agent-chip__glyph agent-chip__glyph--mono">Go</span><span class="agent-chip__name">Goose</span></a>
   <a class="agent-chip" data-agent="grok" href="/configuration/#session-discovery"><span class="agent-chip__glyph agent-chip__glyph--mono">Gr</span><span class="agent-chip__name">Grok</span></a>
   <a class="agent-chip" data-agent="hermes" href="/configuration/#session-discovery"><span class="agent-chip__glyph agent-chip__glyph--mono">He</span><span class="agent-chip__name">Hermes</span></a>
   <a class="agent-chip" data-agent="iflow" href="/configuration/#session-discovery"><span class="agent-chip__glyph agent-chip__glyph--mono">iF</span><span class="agent-chip__name">iFlow</span></a>
@@ -77,11 +83,17 @@ across every project, model, and tool.
   <a class="agent-chip" data-agent="omp" href="/configuration/#session-discovery"><span class="agent-chip__glyph agent-chip__glyph--mono">Om</span><span class="agent-chip__name">OhMyPi</span></a>
   <a class="agent-chip" data-agent="openclaw" href="/configuration/#session-discovery"><span class="agent-chip__glyph agent-chip__glyph--mono">Oc</span><span class="agent-chip__name">OpenClaw</span></a>
   <a class="agent-chip" data-agent="pi" href="/configuration/#session-discovery"><span class="agent-chip__glyph agent-chip__glyph--mono">&#960;</span><span class="agent-chip__name">Pi</span></a>
+  <a class="agent-chip" data-agent="prime-agent" href="https://github.com/PrimeIntellect-ai/prime-agent" target="_blank" rel="noopener"><span class="agent-chip__glyph agent-chip__glyph--mono">Pr</span><span class="agent-chip__name">Prime Agent</span></a>
   <a class="agent-chip" data-agent="piebald" href="/configuration/#session-discovery"><span class="agent-chip__glyph agent-chip__glyph--mono">Pb</span><span class="agent-chip__name">Piebald</span></a>
+  <a class="agent-chip" data-agent="poolside" href="/configuration/#session-discovery"><span class="agent-chip__glyph agent-chip__glyph--mono">Po</span><span class="agent-chip__name">Poolside</span></a>
   <a class="agent-chip" data-agent="qclaw" href="/configuration/#session-discovery"><span class="agent-chip__glyph agent-chip__glyph--mono">Qc</span><span class="agent-chip__name">QClaw</span></a>
+  <a class="agent-chip" data-agent="qoder" href="/configuration/#session-discovery"><span class="agent-chip__glyph agent-chip__glyph--mono">Qd</span><span class="agent-chip__name">Qoder</span></a>
   <a class="agent-chip" data-agent="qwenpaw" href="/configuration/#session-discovery"><span class="agent-chip__glyph agent-chip__glyph--mono">Qp</span><span class="agent-chip__name">QwenPaw</span></a>
   <a class="agent-chip" data-agent="reasonix" href="/configuration/#session-discovery"><span class="agent-chip__glyph agent-chip__glyph--mono">Rx</span><span class="agent-chip__name">Reasonix</span></a>
+  <a class="agent-chip" data-agent="roocode" href="/configuration/#session-discovery"><span class="agent-chip__glyph agent-chip__glyph--mono">Ro</span><span class="agent-chip__name">RooCode</span></a>
   <a class="agent-chip" data-agent="shelley" href="/configuration/#session-discovery"><span class="agent-chip__glyph agent-chip__glyph--mono">Sh</span><span class="agent-chip__name">Shelley</span></a>
+  <a class="agent-chip" data-agent="trae" href="/configuration/#session-discovery"><span class="agent-chip__glyph agent-chip__glyph--mono">Tr</span><span class="agent-chip__name">Trae</span></a>
+  <a class="agent-chip" data-agent="traex" href="/configuration/#session-discovery"><span class="agent-chip__glyph agent-chip__glyph--mono">Tx</span><span class="agent-chip__name">TraeX</span></a>
   <a class="agent-chip" data-agent="workbuddy" href="/configuration/#session-discovery"><span class="agent-chip__glyph agent-chip__glyph--mono">Wb</span><span class="agent-chip__name">WorkBuddy</span></a>
 </div>
 
@@ -181,17 +193,16 @@ See [Activity](/activity/) for the full reference.
 AgentsView reads the session files that your
 [AI coding agents](/configuration/#session-discovery) leave on your machine and
 gives you a local-first desktop and web app to work with them. By default
-everything stays on your machine. Optionally, [PostgreSQL sync](/pg-sync/) can
-push session data to a shared database for team or multi-machine setups.
+everything stays on your machine. For multi-machine use, a primary viewer can
+read [out-of-band filesystem copies](/filesystem-sync/), or
+[PostgreSQL sync](/pg-sync/) can push session data to a shared database.
 
 <div class="grid cards" markdown>
 
--   **AI-Powered Insights**
+-   **Generated Insights**
 
-    Generate summaries and analysis of your coding sessions
-    using Claude, Codex, Copilot, or Gemini. Get daily
-    activity digests, multi-day analyses, and
-    recommendations — scoped by project or across everything.
+    Generate model-written reports over an explicit session scope and manage
+    them alongside the [Recall corpus](/recall/).
 
 -   **Browse Sessions**
 
@@ -199,6 +210,12 @@ push session data to a shared database for team or multi-machine setups.
     See the full conversation: user prompts, assistant
     responses, thinking blocks, and tool calls. Filter by
     project, agent, date, or message count.
+
+-   **Manage Project Data**
+
+    Inspect the archive-wide [project inventory](/data/), open
+    observed folders, preview reclassification impact, and manage
+    per-machine worktree mapping rules from one workspace.
 
 -   **Search Everything**
 
@@ -208,6 +225,17 @@ push session data to a shared database for team or multi-machine setups.
     Opt-in [semantic search](/semantic-search/) matches by
     meaning when you don't remember the exact words, and every
     match cites the conversation unit it came from.
+
+-   **Browse Recall**
+
+    Explore the experimental [Recall corpus](/recall/) with extraction
+    coverage, filters, expandable entries, and evidence links back to
+    source transcripts.
+
+-   **Measure Quality**
+
+    Inspect deterministic [Quality signals](/quality/), rule-based
+    recommendations, coverage, and source-session evidence.
 
 -   **Recent Edits**
 
@@ -250,17 +278,19 @@ push session data to a shared database for team or multi-machine setups.
 
     Works with [dozens of AI coding session sources](/configuration/#session-discovery)
     including Claude Code, OpenClaude, Codex, Copilot, Cursor,
-    Gemini, OpenHands, Aider, Claude Cowork, DeepSeek TUI, gptme,
-    Grok, Kilo, MiMoCode, Mistral Vibe, OhMyPi, QwenPaw, Reasonix,
-    Shelley, Visual Studio Copilot, and ZCode. Auto-discovers session
+    Gemini, OpenHands, Aider, Claude Cowork, Codebuff, DeepSeek TUI,
+    DeepSeek Harness, Freebuff, Goose, gptme, Grok, Kilo, Kilo (legacy),
+    Kimi Work, MiMoCode, Mistral Vibe, OhMyPi, Omnigent, Poolside, Prime Agent,
+    Qoder, QwenPaw, Reasonix, RooCode, Shelley, Trae, TraeX, Visual Studio
+    Copilot, and ZCode. Auto-discovers session
     directories so there's nothing to configure.
 
 -   **Import Chat History**
 
-    Import your [Claude.ai and ChatGPT](/chat-import/)
-    conversations — including images. Upload a zip export
-    and browse everything in one place alongside your
-    agent coding sessions.
+    Import your [Claude.ai, ChatGPT, and Gemini Apps](/chat-import/)
+    conversations. The web dialog handles Claude.ai and ChatGPT exports,
+    including images; the CLI also imports Gemini Apps activity from Google
+    Takeout.
 
 -   **Runs Locally**
 

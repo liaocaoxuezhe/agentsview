@@ -28,10 +28,11 @@ import (
 
 // SyncConfig holds parsed CLI options for the sync command.
 type SyncConfig struct {
-	Full bool
-	Host string
-	User string
-	Port int
+	Full   bool
+	Host   string
+	User   string
+	Port   int
+	Target string
 	// CPUProfile, MemProfile, and Trace are hidden flags that capture a
 	// pprof CPU profile, allocation snapshot, and runtime trace for the
 	// sync pass. Empty strings disable each independently.
@@ -51,6 +52,9 @@ func runSync(cfg SyncConfig) {
 // db close) so runSync can translate the result into a non-zero
 // exit code without skipping that cleanup.
 func doSync(cfg SyncConfig) (hadRemoteFailures bool) {
+	if err := validateArtifactSyncConfig(cfg); err != nil {
+		fatal("%v", err)
+	}
 	appCfg, err := config.LoadMinimal()
 	if err != nil {
 		log.Fatalf("loading config: %v", err)
@@ -113,6 +117,19 @@ func doSync(cfg SyncConfig) (hadRemoteFailures bool) {
 				if err != nil {
 					fatal("daemon remote sync: %v", err)
 				}
+				if cfg.Target != "" {
+					result, err := runDaemonArtifactExchange(
+						context.Background(),
+						tr,
+						appCfg.AuthToken,
+						cfg.Target,
+						cfg.Full,
+					)
+					if err != nil {
+						fatal("%v", err)
+					}
+					printArtifactSyncSummary(os.Stdout, result)
+				}
 				return len(failures) > 0
 			}
 			if useDaemon {
@@ -154,6 +171,19 @@ func doSync(cfg SyncConfig) (hadRemoteFailures bool) {
 					fatal("daemon sync: %v", err)
 				}
 				printSyncSummary(stats, start)
+				if cfg.Target != "" {
+					result, err := runDaemonArtifactExchange(
+						context.Background(),
+						tr,
+						appCfg.AuthToken,
+						cfg.Target,
+						cfg.Full,
+					)
+					if err != nil {
+						fatal("%v", err)
+					}
+					printArtifactSyncSummary(os.Stdout, result)
+				}
 				return false
 			}
 			// Read-only mirror daemons do not own the local SQLite
@@ -181,7 +211,17 @@ func doSync(cfg SyncConfig) (hadRemoteFailures bool) {
 	}
 
 	if len(appCfg.RemoteHosts) == 0 {
-		runLocalSync(context.Background(), appCfg, database, cfg.Full)
+		if cfg.Target == "" {
+			runLocalSync(context.Background(), appCfg, database, cfg.Full)
+		} else {
+			result, err := runLocalAndArtifactFolderSync(
+				context.Background(), appCfg, database, cfg,
+			)
+			if err != nil {
+				fatal("local sync before artifact exchange: %v", err)
+			}
+			printArtifactSyncSummary(os.Stdout, result)
+		}
 		return false
 	}
 	progress := newRemoteProgressPrinter(os.Stdout, time.Now)
@@ -202,6 +242,15 @@ func doSync(cfg SyncConfig) (hadRemoteFailures bool) {
 			return true
 		}
 		fatal("local sync: %v", blocked)
+	}
+	if cfg.Target != "" {
+		result, err := runArtifactFolderSync(
+			context.Background(), appCfg, database, cfg,
+		)
+		if err != nil {
+			fatal("%v", err)
+		}
+		printArtifactSyncSummary(os.Stdout, result)
 	}
 	return len(failures) > 0
 }
@@ -426,8 +475,9 @@ var runLocalSyncWithFallbackCLI = runLocalSyncWithFallback
 var coordinateLocalSyncRunner = coordinateLocalSync
 
 type preparedHTTPRebuildLeaseCLI struct {
-	prepared preparedHTTPRebuildCLI
-	release  func()
+	prepared  preparedHTTPRebuildCLI
+	release   func()
+	committed bool
 }
 
 func (l *preparedHTTPRebuildLeaseCLI) Close() error {
@@ -439,6 +489,21 @@ func (l *preparedHTTPRebuildLeaseCLI) Close() error {
 		l.release = nil
 	}
 	return l.prepared.Close()
+}
+
+func (l *preparedHTTPRebuildLeaseCLI) Commit() error {
+	if l == nil || l.prepared == nil || l.committed {
+		return nil
+	}
+	committer, ok := l.prepared.(sync.RebuildCommitter)
+	if !ok {
+		return nil
+	}
+	if err := committer.Commit(); err != nil {
+		return err
+	}
+	l.committed = true
+	return nil
 }
 
 var runSSHRemoteSync = func(
@@ -473,11 +538,16 @@ var runHTTPRemoteSync = func(
 			rh.Host,
 		)
 	}
+	fullReason := remotesync.FullImportReason("")
+	if full {
+		fullReason = remotesync.FullImportExplicit
+	}
 	return remotesync.HTTPSync{
 		Host:                    rh.Host,
 		URL:                     rh.URL,
 		Token:                   token,
 		Full:                    full,
+		FullReason:              fullReason,
 		DataDir:                 appCfg.DataDir,
 		DB:                      database,
 		BlockedResultCategories: appCfg.ResultContentBlockedCategories,
@@ -563,6 +633,10 @@ func runConfiguredLocalAndRemotes(
 ) (didResync bool, failures []remoteHostFailure, retErr error) {
 	httpHosts, sshHosts := partitionConfiguredRemoteHosts(hosts)
 	didResync = full || database.NeedsResync()
+	fullReason := remotesync.FullImportDataRebuild
+	if full {
+		fullReason = remotesync.FullImportExplicit
+	}
 	outerOwnsHTTP := didResync && len(httpHosts) > 0
 
 	run := func() (remotesync.SyncStats, error) {
@@ -589,7 +663,7 @@ func runConfiguredLocalAndRemotes(
 			ctx, appCfg, database, full, progress,
 			func() (sync.RebuildOptions, sync.RebuildCleanup, error) {
 				prepared, err := prepareConfiguredHTTPHosts(
-					ctx, appCfg, database, httpHosts, progress,
+					ctx, appCfg, database, httpHosts, fullReason, progress,
 				)
 				if err != nil {
 					return sync.RebuildOptions{}, prepared, err
@@ -670,6 +744,7 @@ func prepareConfiguredHTTPHosts(
 	appCfg config.Config,
 	database *db.DB,
 	hosts []config.RemoteHost,
+	fullReason remotesync.FullImportReason,
 	progress sync.ProgressFunc,
 ) (preparedHTTPRebuildCLI, error) {
 	if len(hosts) == 0 {
@@ -689,6 +764,7 @@ func prepareConfiguredHTTPHosts(
 			URL:                     host.URL,
 			Token:                   host.Token,
 			Full:                    true,
+			FullReason:              fullReason,
 			DataDir:                 appCfg.DataDir,
 			DB:                      database,
 			BlockedResultCategories: appCfg.ResultContentBlockedCategories,
@@ -884,7 +960,10 @@ func coordinateLocalSync(
 
 	engine := sync.NewEngine(database, sync.EngineConfig{
 		AgentDirs:               appCfg.AgentDirs,
+		SourceMachines:          appCfg.SourceMachines,
+		DisabledAgents:          appCfg.DisabledAgents,
 		IncludeCwdPrefixes:      appCfg.SyncIncludeCwdPrefixes,
+		ScanProtectedPaths:      appCfg.ScanProtectedPaths,
 		Machine:                 appCfg.LocalMachineName,
 		BlockedResultCategories: appCfg.ResultContentBlockedCategories,
 	})
@@ -898,7 +977,7 @@ func coordinateLocalSync(
 		)
 	} else {
 		stats, err = engine.SyncThenRunWithRebuild(
-			ctx, full, progress, prepare, work,
+			ctx, full, progress, prepare, nil, work,
 		)
 	}
 	engine.PhaseStats().Log("sync")

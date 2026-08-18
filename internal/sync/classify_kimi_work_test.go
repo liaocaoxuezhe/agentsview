@@ -99,7 +99,8 @@ func TestEngineClassifyKimiWorkPaths(t *testing.T) {
 
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
-			files := eng.classifyPaths([]string{tt.path})
+			files, err := eng.classifyPaths(t.Context(), []string{tt.path})
+			require.NoError(t, err)
 			if !tt.want {
 				assert.Empty(t, files)
 				return

@@ -43,6 +43,87 @@ type multiSessionMatch struct {
 	DiscoveryMTimeNS       int64
 }
 
+// classifySQLiteContainerPath maps a stored or changed path to its database
+// container and member, shared by every multi-session provider whose
+// sessions live in one shared SQLite database (Zed, Shelley, Omnigent).
+// dbRelPath is the container's path relative to a provider root (e.g.
+// "shelley.db", "threads/threads.db"); parseVirtual splits a virtual member
+// path into its physical container path and raw member ID. allowMissing
+// relaxes the regular-file requirement so a database delete (or its WAL/SHM
+// sibling) still classifies for tombstones. rejectShmSiblingEvents refuses to
+// resolve a bare "-shm" sibling event to the container; only Omnigent sets
+// it, because opening its own read connections updates that file's mtime and
+// would otherwise make every scan trigger the next one.
+func classifySQLiteContainerPath(
+	root, path, dbRelPath string,
+	allowMissing, rejectShmSiblingEvents bool,
+	parseVirtual func(path string) (dbPath, memberID string, ok bool),
+) (multiSessionMatch, bool) {
+	root = filepath.Clean(root)
+	path = filepath.Clean(path)
+	requireRegular := !allowMissing
+	if dbPath, memberID, ok := parseVirtual(path); ok {
+		if !sqliteContainerUnderRoot(root, dbPath, dbRelPath, requireRegular) {
+			return multiSessionMatch{}, false
+		}
+		return multiSessionMatch{
+			Path:      path,
+			Container: dbPath,
+			MemberID:  memberID,
+		}, true
+	}
+	if sqliteContainerUnderRoot(root, path, dbRelPath, requireRegular) {
+		return multiSessionMatch{Path: path, Container: path}, true
+	}
+	if allowMissing {
+		if dbPath, ok := sqliteContainerPathForEvent(
+			root, path, dbRelPath, rejectShmSiblingEvents,
+		); ok {
+			return multiSessionMatch{Path: dbPath, Container: dbPath}, true
+		}
+	}
+	return multiSessionMatch{}, false
+}
+
+// sqliteContainerUnderRoot reports whether dbPath is the provider's shared
+// database at its expected location under root.
+func sqliteContainerUnderRoot(
+	root, dbPath, dbRelPath string, requireRegular bool,
+) bool {
+	root = filepath.Clean(root)
+	dbPath = filepath.Clean(dbPath)
+	rel, ok := relUnder(root, dbPath)
+	if !ok || filepath.ToSlash(rel) != dbRelPath {
+		return false
+	}
+	return !requireRegular || IsRegularFile(dbPath)
+}
+
+// sqliteContainerPathForEvent resolves a changed-path event naming the
+// database file itself or a WAL/SHM/journal sibling to the container's
+// canonical path.
+func sqliteContainerPathForEvent(
+	root, path, dbRelPath string, rejectShmSiblingEvents bool,
+) (string, bool) {
+	root = filepath.Clean(root)
+	path = filepath.Clean(path)
+	if rejectShmSiblingEvents && strings.HasSuffix(path, "-shm") {
+		return "", false
+	}
+	rel, ok := relUnder(root, path)
+	if !ok {
+		return "", false
+	}
+	dbDir := filepath.ToSlash(filepath.Dir(dbRelPath))
+	dbBase := filepath.Base(dbRelPath)
+	if filepath.ToSlash(rel) == dbRelPath ||
+		(filepath.ToSlash(filepath.Dir(rel)) == dbDir &&
+			strings.HasPrefix(filepath.Base(rel), dbBase+"-")) {
+		return filepath.Join(root, filepath.FromSlash(dbRelPath)), true
+	}
+	return "", false
+}
+
 type multiSessionConfig struct {
 	// discoverContainers returns the physical container paths under one root;
 	// each becomes a whole-container source that fans out on parse.
@@ -84,7 +165,8 @@ type multiSessionConfig struct {
 	// parseContainer parses every member of a container into one result each.
 	// The full ParseRequest is passed so a closure can read req.Machine and
 	// per-request hints such as req.Source.ProjectHint.
-	parseContainer func(src multiSessionSource, req ParseRequest) ([]ParseResult, error)
+	parseContainer        func(src multiSessionSource, req ParseRequest) ([]ParseResult, error)
+	parseContainerContext func(context.Context, multiSessionSource, ParseRequest) ([]ParseResult, error)
 	// parseMember parses a single member; a nil result is a clean no-session.
 	parseMember        func(src multiSessionSource, req ParseRequest) (*ParseResult, error)
 	parseMemberContext func(context.Context, multiSessionSource, ParseRequest) (*ParseResult, error)
@@ -196,6 +278,12 @@ func WithContainerParse(
 	return func(c *multiSessionConfig) { c.parseContainer = fn }
 }
 
+func WithContextContainerParse(
+	fn func(context.Context, multiSessionSource, ParseRequest) ([]ParseResult, error),
+) MultiSessionOption {
+	return func(c *multiSessionConfig) { c.parseContainerContext = fn }
+}
+
 func WithContainerParseOutcome(
 	fn func(src multiSessionSource, req ParseRequest) (ParseOutcome, error),
 ) MultiSessionOption {
@@ -254,7 +342,7 @@ func NewMultiSessionContainerSourceSet(
 		panic("multi-session container: missing WithMemberLookup")
 	case cfg.fingerprint == nil && cfg.fingerprintContext == nil:
 		panic("multi-session container: missing WithFingerprint")
-	case cfg.parseContainer == nil && cfg.parseContainerOutcome == nil:
+	case cfg.parseContainer == nil && cfg.parseContainerContext == nil && cfg.parseContainerOutcome == nil:
 		panic("multi-session container: missing WithContainerParse or WithContainerParseOutcome")
 	case cfg.parseMember == nil && cfg.parseMemberContext == nil:
 		panic("multi-session container: missing WithMemberParse")
@@ -270,6 +358,34 @@ type multiSessionContainerSourceSet struct {
 	agent AgentType
 	roots []string
 	cfg   multiSessionConfig
+}
+
+// ReconciliationContainer maps a requested reconciliation root to the
+// physical container that atomically owns it: the container file itself, a
+// member's virtual spelling, or a sidecar event path (SQLite WAL/SHM). The
+// scope planner widens such a request to the container's whole virtual
+// membership; the generic descendant proof would name only the bare path,
+// which admits no "<container>#<member>" source and pages no member row — a
+// successful no-op over the sessions the caller asked about. Classification
+// runs with allowMissing so a deleted container still resolves and its
+// members remain reclaimable. Requests arrive absolutized, so a relative
+// configured root is also tried in its absolute spelling.
+func (s multiSessionContainerSourceSet) ReconciliationContainer(
+	requested string,
+) (string, bool) {
+	for _, root := range s.roots {
+		spellings := []string{root}
+		if abs := cleanReconciliationScopeRoot(root); abs != filepath.Clean(root) {
+			spellings = append(spellings, abs)
+		}
+		for _, spelling := range spellings {
+			if match, ok := s.cfg.classifyPath(spelling, requested, true); ok &&
+				match.Container != "" {
+				return match.Container, true
+			}
+		}
+	}
+	return "", false
 }
 
 func (s multiSessionContainerSourceSet) Discover(
@@ -670,7 +786,13 @@ func (s multiSessionContainerSourceSet) parse(
 		return outcome, nil
 	}
 
-	results, err := s.cfg.parseContainer(src, req)
+	var results []ParseResult
+	var err error
+	if s.cfg.parseContainerContext != nil {
+		results, err = s.cfg.parseContainerContext(ctx, src, req)
+	} else {
+		results, err = s.cfg.parseContainer(src, req)
+	}
 	if err != nil {
 		return ParseOutcome{}, err
 	}
@@ -692,6 +814,13 @@ func (s multiSessionContainerSourceSet) parse(
 		ResultSetComplete: true,
 		ForceReplace:      true,
 	}, nil
+}
+
+func unsupportedMultiSessionOutcome() ParseOutcome {
+	return ParseOutcome{
+		ResultSetComplete: true,
+		SkipReason:        SkipUnsupportedSource,
+	}
 }
 
 // skipOutcome builds the "no session" outcome for a container/member that

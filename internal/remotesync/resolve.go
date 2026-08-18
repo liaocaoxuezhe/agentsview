@@ -15,20 +15,36 @@ import (
 func ResolveTargets(cfg config.Config) TargetSet {
 	dirs := make(map[parser.AgentType][]string)
 	files := make(map[parser.AgentType][]string)
-	var extra []string
+	providerExtraFiles := make(map[parser.AgentType][]string)
+	var forbiddenRoots []string
 	for _, def := range parser.Registry {
+		resolvedDirs := cfg.ResolveDirs(def.Type)
+		if def.RemoteSyncExcluded {
+			for _, dir := range resolvedDirs {
+				forbiddenRoots = appendUniqueForbiddenRoot(forbiddenRoots, dir)
+			}
+			continue
+		}
 		if !resolveAgentHasOnDiskSource(def) {
 			continue
 		}
-		for _, dir := range cfg.ResolveDirs(def.Type) {
+		for _, dir := range resolvedDirs {
+			// Remote imports assign the serving host to every transported root.
+			// A structured root attributed to another machine would therefore
+			// lose its identity in transit, so keep it as a local archive input
+			// instead of advertising it for remote sync.
+			if !isLocalRemoteSyncSource(cfg, def.Type, dir) {
+				forbiddenRoots = appendUniqueForbiddenRoot(forbiddenRoots, dir)
+				continue
+			}
 			if def.Type == parser.AgentHermes {
 				hermesDirs, hermesFiles := resolveHermesTargets(dir)
 				if len(hermesDirs) > 0 {
 					dirs[def.Type] = append(dirs[def.Type], hermesDirs...)
 				}
 				for _, file := range hermesFiles {
-					if !slices.Contains(extra, file) {
-						extra = append(extra, file)
+					if !slices.Contains(providerExtraFiles[def.Type], file) {
+						providerExtraFiles[def.Type] = append(providerExtraFiles[def.Type], file)
 					}
 				}
 				continue
@@ -64,6 +80,13 @@ func ResolveTargets(cfg config.Config) TargetSet {
 				}
 				continue
 			}
+			if def.Type == parser.AgentPoolside {
+				target := resolvePoolsideTarget(dir)
+				if target != "" {
+					dirs[def.Type] = append(dirs[def.Type], target)
+				}
+				continue
+			}
 			if info, err := os.Stat(dir); err != nil || !info.IsDir() {
 				continue
 			}
@@ -71,14 +94,104 @@ func ResolveTargets(cfg config.Config) TargetSet {
 			if def.Type == parser.AgentCodex {
 				index := filepath.Join(filepath.Dir(dir), parser.CodexSessionIndexFilename)
 				if info, err := os.Stat(index); err == nil && !info.IsDir() {
-					if !slices.Contains(extra, index) {
-						extra = append(extra, index)
+					if !slices.Contains(providerExtraFiles[def.Type], index) {
+						providerExtraFiles[def.Type] = append(
+							providerExtraFiles[def.Type], index,
+						)
 					}
 				}
 			}
 		}
 	}
-	return TargetSet{Dirs: dirs, Files: files, ExtraFiles: extra}
+	return filterForbiddenTargets(TargetSet{
+		Dirs: dirs, Files: files, ProviderExtraFiles: providerExtraFiles,
+		ForbiddenRoots: forbiddenRoots,
+	})
+}
+
+func isLocalRemoteSyncSource(
+	cfg config.Config, agent parser.AgentType, dir string,
+) bool {
+	machine, ok := cfg.SourceMachines[agent][dir]
+	return !ok || machine == "" || machine == cfg.LocalMachineName
+}
+
+// filterForbiddenTargets drops resolved targets that lie inside a forbidden
+// root before they are advertised. Overlapping directory overrides can nest
+// an allowed agent's root beneath an excluded agent's root; advertising the
+// nested target would make every honest client echo it back and fail the
+// whole request in SelectAllowedTargets (fail closed, HTTP 403) instead of
+// syncing the remaining targets. The per-item forbidden checks in
+// SelectAllowedTargets stay as defense-in-depth against stale or
+// hand-crafted requests. Registry order does not matter here: the filter
+// runs after every excluded agent has contributed its roots.
+func filterForbiddenTargets(t TargetSet) TargetSet {
+	if len(t.ForbiddenRoots) == 0 {
+		return t
+	}
+	forbidden := newForbiddenRootMatcher(t.ForbiddenRoots)
+	fileScoped := make(map[parser.AgentType]bool, len(t.Files))
+	for agent := range t.Files {
+		fileScoped[agent] = true
+	}
+	for agent, dirs := range t.Dirs {
+		kept := withoutForbidden(dirs, forbidden)
+		if len(kept) == 0 {
+			delete(t.Dirs, agent)
+			continue
+		}
+		t.Dirs[agent] = kept
+	}
+	for agent, files := range t.Files {
+		kept := withoutForbidden(files, forbidden)
+		if len(kept) == 0 {
+			delete(t.Files, agent)
+			continue
+		}
+		t.Files[agent] = kept
+	}
+	// A file-scoped agent's root is only safe to advertise alongside its
+	// curated file list; if filtering removed either half, drop both so the
+	// agent cannot degrade to a raw directory target.
+	for agent := range fileScoped {
+		_, hasDirs := t.Dirs[agent]
+		_, hasFiles := t.Files[agent]
+		if hasDirs != hasFiles {
+			delete(t.Dirs, agent)
+			delete(t.Files, agent)
+		}
+	}
+	t.ExtraFiles = withoutForbidden(t.ExtraFiles, forbidden)
+	for agent, files := range t.ProviderExtraFiles {
+		kept := withoutForbidden(files, forbidden)
+		if len(kept) == 0 {
+			delete(t.ProviderExtraFiles, agent)
+			continue
+		}
+		t.ProviderExtraFiles[agent] = kept
+	}
+	return t
+}
+
+func withoutForbidden(paths []string, forbidden forbiddenRootMatcher) []string {
+	var kept []string
+	for _, path := range paths {
+		if !forbidden.within(path) {
+			kept = append(kept, path)
+		}
+	}
+	return kept
+}
+
+func appendUniqueForbiddenRoot(roots []string, root string) []string {
+	if root == "" {
+		return roots
+	}
+	root = filepath.Clean(root)
+	if slices.Contains(roots, root) {
+		return roots
+	}
+	return append(roots, root)
 }
 
 func resolveHermesTargets(root string) ([]string, []string) {
@@ -173,7 +286,7 @@ func hermesStateFiles(stateDB string, includeDB bool) []string {
 }
 
 func resolveAgentHasOnDiskSource(def parser.AgentDef) bool {
-	if def.Type == parser.AgentTrae {
+	if def.RemoteSyncExcluded {
 		return false
 	}
 	if !def.FileBased {
@@ -309,6 +422,29 @@ func resolveKiloLegacyTarget(root string) (string, []string) {
 	return targetRoot, files
 }
 
+// resolvePoolsideTarget narrows a Poolside application-data root to
+// the trajectories/ subdirectory. The configured root is the entire
+// poolside data directory, which may contain config, caches, or
+// credentials alongside trajectories. Only the trajectories/ subdirectory
+// is parsed, so only it must be archived during remote sync. When the
+// root already points to a trajectories/ directory, it is used as-is.
+func resolvePoolsideTarget(root string) string {
+	clean := filepath.Clean(root)
+	if filepath.Base(clean) == "trajectories" {
+		info, err := os.Stat(clean)
+		if err != nil || !info.IsDir() {
+			return ""
+		}
+		return clean
+	}
+	trajectoriesDir := filepath.Join(clean, "trajectories")
+	info, err := os.Stat(trajectoriesDir)
+	if err != nil || !info.IsDir() {
+		return ""
+	}
+	return trajectoriesDir
+}
+
 func windsurfRemoteWorkspaceRoot(root string) string {
 	clean := filepath.Clean(root)
 	if filepath.Base(clean) == "workspaceStorage" {
@@ -374,8 +510,10 @@ func TargetSetAllowed(allowed TargetSet, requested TargetSet) bool {
 
 func SelectAllowedTargets(allowed TargetSet, requested TargetSet) (TargetSet, bool) {
 	selected := TargetSet{
-		Dirs: make(map[parser.AgentType][]string),
+		Dirs:           make(map[parser.AgentType][]string),
+		ForbiddenRoots: append([]string(nil), allowed.ForbiddenRoots...),
 	}
+	forbidden := newForbiddenRootMatcher(selected.ForbiddenRoots)
 	for agent, dirs := range requested.Dirs {
 		allowedDirs := allowed.Dirs[agent]
 		if _, fileScoped := allowed.Files[agent]; fileScoped {
@@ -387,6 +525,9 @@ func SelectAllowedTargets(allowed TargetSet, requested TargetSet) (TargetSet, bo
 		for _, dir := range dirs {
 			selectedDir, ok := selectAllowedString(allowedDirs, dir)
 			if !ok {
+				return TargetSet{}, false
+			}
+			if forbidden.within(selectedDir) {
 				return TargetSet{}, false
 			}
 			selected.Dirs[agent] = append(selected.Dirs[agent], selectedDir)
@@ -415,6 +556,9 @@ func SelectAllowedTargets(allowed TargetSet, requested TargetSet) (TargetSet, bo
 			if selected.Files == nil {
 				selected.Files = make(map[parser.AgentType][]string)
 			}
+			if forbidden.within(selectedFile) {
+				return TargetSet{}, false
+			}
 			selected.Files[agent] = append(selected.Files[agent], selectedFile)
 		}
 	}
@@ -423,7 +567,28 @@ func SelectAllowedTargets(allowed TargetSet, requested TargetSet) (TargetSet, bo
 		if !ok {
 			return TargetSet{}, false
 		}
+		if forbidden.within(selectedFile) {
+			return TargetSet{}, false
+		}
 		selected.ExtraFiles = append(selected.ExtraFiles, selectedFile)
+	}
+	for agent, files := range requested.ProviderExtraFiles {
+		allowedFiles, ok := allowed.ProviderExtraFiles[agent]
+		if !ok {
+			return TargetSet{}, false
+		}
+		for _, file := range files {
+			selectedFile, ok := selectAllowedString(allowedFiles, file)
+			if !ok || forbidden.within(selectedFile) {
+				return TargetSet{}, false
+			}
+			if selected.ProviderExtraFiles == nil {
+				selected.ProviderExtraFiles = make(map[parser.AgentType][]string)
+			}
+			selected.ProviderExtraFiles[agent] = append(
+				selected.ProviderExtraFiles[agent], selectedFile,
+			)
+		}
 	}
 	return selected, true
 }
@@ -551,9 +716,10 @@ func isAiderUnsafeRoot(dir string) bool {
 // comparisons additionally require matching path dialects and reject
 // symlinked ancestors that would escape the allowed root.
 func SelectAllowedFiles(allowed TargetSet, files []string) ([]string, bool) {
+	forbidden := newForbiddenRootMatcher(allowed.ForbiddenRoots)
 	selected := make([]string, 0, len(files))
 	for _, file := range files {
-		canonical, ok := selectAllowedFile(allowed, file)
+		canonical, ok := selectAllowedFile(allowed, forbidden, file)
 		if !ok {
 			return nil, false
 		}
@@ -562,9 +728,18 @@ func SelectAllowedFiles(allowed TargetSet, files []string) ([]string, bool) {
 	return selected, true
 }
 
-func selectAllowedFile(allowed TargetSet, file string) (string, bool) {
-	if canonical, ok := selectAllowedString(allowed.ExtraFiles, file); ok {
-		return canonical, true
+// selectAllowedFile validates the request string against the allowed sets
+// first and checks forbidden roots only on a match. The forbidden check
+// canonicalizes its argument with filesystem access, which must never run
+// on an unmatched client-supplied path: on Windows a raw request naming
+// \\attacker\share would otherwise force an outbound SMB connection.
+// Every accept path below is either a server-derived string or anchored
+// under a trusted allowed root before the matcher sees it.
+func selectAllowedFile(
+	allowed TargetSet, forbidden forbiddenRootMatcher, file string,
+) (string, bool) {
+	if canonical, ok := selectAllowedString(allowed.AllExtraFiles(), file); ok {
+		return canonical, !forbidden.within(canonical)
 	}
 	for agent, files := range allowed.Files {
 		if !verbatimFileScopedAgent(agent) {
@@ -578,10 +753,10 @@ func selectAllowedFile(allowed TargetSet, file string) (string, bool) {
 		// skips it because its delta roots come from the same fresh
 		// resolution.
 		if canonical, ok := selectAllowedString(files, file); ok {
-			return canonical, true
+			return canonical, !forbidden.within(canonical)
 		}
 		if verbatimSessionFileUnderAllowedRoot(allowed, agent, file) {
-			return file, true
+			return file, !forbidden.within(file)
 		}
 	}
 	if !isAbsRemotePath(file) {
@@ -618,8 +793,10 @@ func selectAllowedFile(allowed TargetSet, file string) (string, bool) {
 				// Exact root matches are allowed: file roots (Aider
 				// history files) must stream, and a directory root
 				// yields nothing because WriteArchiveFiles skips
-				// non-regular entries.
-				return file, true
+				// non-regular entries. The file is anchored under the
+				// trusted dir at this point, so the forbidden check may
+				// canonicalize it.
+				return file, !forbidden.within(file)
 			}
 		}
 	}

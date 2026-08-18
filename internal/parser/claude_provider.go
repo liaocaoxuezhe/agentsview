@@ -78,6 +78,17 @@ func (p *claudeProvider) Fingerprint(
 	return p.sources.Fingerprint(ctx, source)
 }
 
+// ComputeMultiFileStatHash implements parser.MultiFileStatHasher for the
+// single-file Claude transcript. Claude has no sibling companions; the
+// digest exists so stat-verified freshness persists in provider_freshness
+// across process restarts, sparing a fresh engine (daemon restart or a
+// one-shot CLI sync) the full-content hash that Fingerprint performs for
+// every unchanged transcript. The ctime term in the tuple preserves the
+// in-place-rewrite detection the content hash provided.
+func (p *claudeProvider) ComputeMultiFileStatHash(chatPath string) uint64 {
+	return fileStatTupleDigest(0xC1, chatPath)
+}
+
 func (p *claudeProvider) Parse(
 	ctx context.Context,
 	req ParseRequest,
@@ -91,7 +102,10 @@ func (p *claudeProvider) Parse(
 	}
 	machine := firstNonEmptyJSONLString(req.Machine, p.Config.Machine)
 	project := claudeProviderProject(ctx, req.Source.ProjectHint, path)
-	results, excludedIDs, err := claudeParseWithExclusions(path, project, machine)
+	opts := claudeParseOptions{
+		siblingLineage: claudeSourceIsProjectLevel(req.Source, path),
+	}
+	results, excludedIDs, err := claudeParseFile(path, project, machine, opts)
 	if err != nil {
 		return ParseOutcome{}, err
 	}
@@ -168,8 +182,9 @@ func (p *claudeProvider) ParseIncremental(
 			startOrdinal:  req.StartOrdinal,
 			lastEntryUUID: req.LastEntryUUID,
 			stored: claudeStoredIdentity{
-				agentLabel: req.StoredAgentLabel,
-				entrypoint: req.StoredEntrypoint,
+				agentLabel:  req.StoredAgentLabel,
+				entrypoint:  req.StoredEntrypoint,
+				sessionKind: req.StoredSessionKind,
 			},
 			storedLinearParse:         req.StoredClaudeLinearParse,
 			storedTailClaudeMessageID: req.StoredLastClaudeMessageID,
@@ -217,6 +232,35 @@ func (p *claudeProvider) ParseIncremental(
 type claudeSource struct {
 	Root string
 	Path string
+}
+
+// claudeSourceIsProjectLevel reports whether a discovered local source
+// is a top-level project transcript (root/<project>/<session>.jsonl).
+// Only those participate in background-fork sibling lineage: subagent
+// transcripts, materialized s3 objects, and uploads never do.
+func claudeSourceIsProjectLevel(source SourceRef, path string) bool {
+	var root string
+	switch src := source.Opaque.(type) {
+	case claudeSource:
+		root = src.Root
+	case *claudeSource:
+		if src == nil {
+			return false
+		}
+		root = src.Root
+	default:
+		return false
+	}
+	if root == "" {
+		return false
+	}
+	rel, err := filepath.Rel(filepath.Clean(root), filepath.Clean(path))
+	if err != nil {
+		return false
+	}
+	parts := strings.Split(rel, string(filepath.Separator))
+	return len(parts) == 2 && strings.HasSuffix(parts[1], ".jsonl") &&
+		!strings.HasPrefix(parts[1], "agent-")
 }
 
 type claudeSourceSet struct {
@@ -328,7 +372,7 @@ func (s claudeSourceSet) discoveredSourceRef(
 	root string, file DiscoveredFile,
 ) (SourceRef, bool) {
 	if strings.HasPrefix(file.Path, "s3://") {
-		return s3SourceRefFromDiscoveredFile(file), true
+		return s3SourceRefFromDiscoveredFile(root, file), true
 	}
 	return s.sourceRef(root, file.Path)
 }
@@ -632,6 +676,7 @@ func claudeProviderCapabilities() Capabilities {
 			ExcludedSessions:     CapabilitySupported,
 			ForceReplaceOnParse:  CapabilitySupported,
 			VerifiedLocalStat:    CapabilitySupported,
+			MultiFileStatHash:    CapabilitySupported,
 		},
 		Content: ContentCapabilities{
 			FirstMessage:         CapabilitySupported,
@@ -648,6 +693,11 @@ func claudeProviderCapabilities() Capabilities {
 			MalformedLineCount:   CapabilitySupported,
 			Model:                CapabilitySupported,
 			StopReason:           CapabilitySupported,
+		},
+		Sync: ProviderSyncSemantics{
+			FingerprintHashInCacheKey:           true,
+			FingerprintHashRequiredForFreshness: true,
+			SkipCacheFreshWithoutStoredRow:      true,
 		},
 	}
 }

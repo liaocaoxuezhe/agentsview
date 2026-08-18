@@ -87,7 +87,7 @@ disabled by default because applying a broad range automatically
 can make some pages run substantially more expensive queries.
 
 To carry selections among Sessions, Usage, Activity, Trends, and
-Insights, enable **Settings > Date ranges > Link date ranges across
+Quality, enable **Settings > Date ranges > Link date ranges across
 pages**. An explicit dated URL always controls the target page. With
 linking enabled, that selection can then carry to date-aware pages
 opened later at their bare URLs.
@@ -130,7 +130,7 @@ model's messages.
 
 !!! note "Dashboard-only scope"
     The model filter applies only to the analytics dashboard. The
-    [Session Insights](/insights/) page and the session list are
+    [Generated insights](/recall/?tab=generated) and the session list are
     not scoped by it, so a model selected here does not silently
     narrow those views. The [Usage](/token-usage/) page keeps its
     own separate model filter.
@@ -269,17 +269,15 @@ projects, tools, and velocity sections.
 
 ---
 
-## Session Insights
+## Generated Insights
 
-AgentsView can generate AI-powered summaries and analysis of your
-coding sessions using Claude, Codex, Copilot, or Gemini. Click
-**More → Insights** in the header navigation to open the Insights
-page, where you can generate daily activity digests, multi-day
-summaries, and deeper analyses of your agent workflow patterns —
-scoped by project or across everything.
+AgentsView can generate model-written reports over an explicit session scope
+using Claude, Codex, Copilot, Gemini, or Kiro. Open **Recall → Generated
+insights** to choose the date range, project, session agent, automated-session
+scope, template, generator, and optional focus.
 
-See the [Session Insights](/insights/) page for full
-documentation.
+See [Recall](/recall/#current-surface) for generation, archive, and privacy
+details.
 
 ---
 
@@ -633,6 +631,10 @@ button** that appears on hover. Click it to copy the full
 message content to the clipboard — a checkmark confirms the
 copy for 1.5 seconds.
 
+Inline `<teammate-message>` content and messages from teammate session ancestry
+are labeled **Teammate**, keeping peer-agent replies distinct from user prompts
+and ordinary subagent output.
+
 Claude Code sessions also show a fork action on each message header
 when the local server can launch or return a command. Clicking it
 starts a new Claude run from the selected point by rendering the
@@ -673,6 +675,14 @@ the full command text, including multi-line commands like
 heredocs that would otherwise be truncated. Tool result content
 is stored alongside the tool call when available, giving a
 complete view of input and output.
+
+Expanded outputs start in **Raw** mode, which preserves the exact escaped text
+recorded by the agent. Switch to **Formatted** to render Markdown, including
+headings, lists, tables, and highlighted fenced code; HTML is sanitized before
+display. The mode changes presentation only—the stored result and copy button
+continue to use the raw output.
+
+![Formatted tool output](/assets/generated/screenshots/tool-output-formatted.png)
 
 Hover or focus a tool block to reveal copy buttons for the
 structured input and, when present, the tool output.
@@ -852,12 +862,16 @@ timestamps. Toggle it from the session header.
 
 ![Session Vital Signs in context](/assets/generated/screenshots/session-vital-signs.png)
 
-It has four stacked sections:
+It has five stacked sections when experimental Recall is available:
 
-- **Session summary** — total wall-clock, turn count, tool call
-  count, sub-agent count, and the slowest call as a clickable
-  link that scrolls the conversation to that call. Live sessions
-  show a `running …+` indicator that ticks forward.
+- **Session summary** — repository and worktree context recorded by the trace,
+  total wall-clock, turn count, tool call count, sub-agent count, and the
+  slowest call as a clickable link that scrolls the conversation to that call.
+  Live sessions show a `running …+` indicator that ticks forward.
+- **Recall (experimental)** — provenance-linked entries whose evidence comes
+  from the current session. Evidence-range links jump to the supporting
+  transcript message. An empty state appears when the local archive has no
+  matching entries.
 - **Time spent** — per-category aggregate bars across the
   normalized taxonomy (`Read`, `Edit`, `Write`, `Bash`, `Grep`,
   `Glob`, `Task`, `Tool`, `Other`, plus a `Mixed` bucket for
@@ -869,8 +883,8 @@ It has four stacked sections:
   scroll the conversation to that turn.
 - **Calls** — chronological list of tool calls with horizontal
   duration bars. Parallel `tool_use` runs are bracketed as a
-  single group. Sub-agent rows expand inline to show the child
-  session's calls.
+  single group. Call details start collapsed for quicker transcript navigation.
+  Sub-agent rows expand inline to show the child session's calls.
 
 ![Vital Signs panel detail](/assets/generated/screenshots/vital-signs-panel.png)
 
@@ -1213,12 +1227,11 @@ Settings are organized into sections:
 
 | Section | What You Can Configure |
 |---------|----------------------|
-| Language | Interface language (English, Simplified Chinese, Traditional Chinese, or Korean) |
-| Appearance | Theme (light/dark), high-contrast mode, message layout, text size, block visibility, desktop zoom level |
-| Date ranges | Browser-local checkbox for linking date selections across Sessions, Usage, Activity, Trends, and Insights |
+| Language | Interface language (English, French, Simplified Chinese, Traditional Chinese, or Korean) |
+| Appearance | Theme (light/dark), high-contrast mode, chart colors, message layout, text size, block visibility, desktop zoom level |
+| Date ranges | Browser-local checkbox for linking date selections across Sessions, Usage, Activity, Trends, and Quality |
 | Agent Directories | Custom paths for each agent's session files. For Devin CLI, point at the local root that contains `cli/` (for example a redacted `.../Application Support/devin` path), not copied config or OAuth files. |
 | Terminal | Default terminal emulator for session resume |
-| Worktree Mappings | Map worktree paths back to their main project (see [Worktree Project Mappings](/configuration/#worktree-project-mappings)) |
 | Embeddings | Current semantic-index build phase, progress, throughput, ETA, last result, and local generations |
 | GitHub | Personal access token for Gist publishing |
 | Remote Access | Remote connections toggle, auth token, connect to remote server |
@@ -1227,12 +1240,17 @@ Settings are organized into sections:
 
 ![Settings remote access section](/assets/generated/screenshots/settings-remote.png)
 
-Language, Appearance, and Date ranges preferences are stored in the browser and
-do not write `~/.agentsview/config.toml`. Agent directory overrides, terminal
-settings, the saved GitHub token, and the local server's remote-access
-authentication settings use `~/.agentsview/config.toml`. Worktree Mappings live
-separately in the local archive database. See
-[Remote Access](/remote-access/) for details on the remote access settings.
+![Chart color palette setting](/assets/generated/screenshots/settings-chart-colors.png)
+
+Language, theme, high contrast, message layout, text size, block visibility,
+desktop zoom, and Date ranges preferences are stored in the browser. **Chart
+colors** are the exception within Appearance: the selected palette is saved
+server-wide as `chart_palette` in `~/.agentsview/config.toml`. Agent directory
+overrides, terminal settings, the saved GitHub token, and the local server's
+remote-access authentication settings also use that file. Worktree mapping
+rules moved to the [Data page](/data/#rules) and live in the local archive
+database. See [Remote Access](/remote-access/) for details on the remote access
+settings.
 
 ---
 
@@ -1270,6 +1288,12 @@ Settings > Appearance also offers a **high-contrast** mode for
 greater legibility and a **text size** control (90–130%) that
 scales message and interface text. Both preferences are saved
 and persist across sessions.
+
+The **Chart colors** control selects the categorical palette used by the
+dashboard skill trend, Trends, and Usage charts. Choose **Agentsview** for the
+project palette or **Matplotlib** for its gray-free categorical families. This
+setting is server-wide rather than browser-local, so all clients connected to
+the same writable server use the same palette.
 
 ### Iframe Embedding
 

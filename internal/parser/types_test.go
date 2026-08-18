@@ -228,9 +228,11 @@ func TestAgentByType(t *testing.T) {
 		{AgentAmp, true},
 		{AgentVSCodeCopilot, true},
 		{AgentPi, true},
+		{AgentPrimeAgent, true},
 		{AgentOMP, true},
 		{AgentDevin, true},
 		{AgentDeepSeekTUI, true},
+		{AgentDeepSeekHarness, true},
 		{"unknown", false},
 	}
 	for _, tt := range tests {
@@ -268,6 +270,12 @@ func TestAgentByPrefix(t *testing.T) {
 			true,
 		},
 		{
+			"traex prefix",
+			"traex:some-uuid",
+			AgentTraeX,
+			true,
+		},
+		{
 			"copilot prefix",
 			"copilot:sess-id",
 			AgentCopilot,
@@ -277,6 +285,12 @@ func TestAgentByPrefix(t *testing.T) {
 			"gemini prefix",
 			"gemini:sess-id",
 			AgentGemini,
+			true,
+		},
+		{
+			"gemini apps prefix",
+			"gemini-apps:sess-id",
+			AgentGeminiApps,
 			true,
 		},
 		{
@@ -328,6 +342,12 @@ func TestAgentByPrefix(t *testing.T) {
 			true,
 		},
 		{
+			"prime agent prefix",
+			"prime-agent:019c1234-session",
+			AgentPrimeAgent,
+			true,
+		},
+		{
 			"omp prefix",
 			"omp:omp-session-uuid",
 			AgentOMP,
@@ -364,6 +384,12 @@ func TestAgentByPrefix(t *testing.T) {
 			"deepseek tui prefix",
 			"deepseek-tui:sess-id",
 			AgentDeepSeekTUI,
+			true,
+		},
+		{
+			"deepseek harness prefix",
+			"deepseek-harness:sess-id",
+			AgentDeepSeekHarness,
 			true,
 		},
 		{
@@ -414,8 +440,10 @@ func TestRegistryCompleteness(t *testing.T) {
 		AgentOpenClaude,
 		AgentCowork,
 		AgentCodex,
+		AgentTraeX,
 		AgentCopilot,
 		AgentGemini,
+		AgentGeminiApps,
 		AgentMiMoCode,
 		AgentOpenCode,
 		AgentKilo,
@@ -428,10 +456,12 @@ func TestRegistryCompleteness(t *testing.T) {
 		AgentTrae,
 		AgentVSCopilot,
 		AgentPi,
+		AgentPrimeAgent,
 		AgentOMP,
 		AgentQwen,
 		AgentCommandCode,
 		AgentDeepSeekTUI,
+		AgentDeepSeekHarness,
 		AgentOpenClaw,
 		AgentQClaw,
 		AgentKimi,
@@ -443,6 +473,7 @@ func TestRegistryCompleteness(t *testing.T) {
 		AgentCortex,
 		AgentHermes,
 		AgentGrok,
+		AgentGoose,
 		AgentForge,
 		AgentDevin,
 		AgentPiebald,
@@ -465,6 +496,9 @@ func TestRegistryCompleteness(t *testing.T) {
 		AgentAider,
 		AgentReasonix,
 		AgentRooCode,
+		AgentPoolside,
+		AgentOmnigent,
+		AgentCodebuff,
 	}
 
 	expected := make(map[AgentType]bool, len(allTypes))
@@ -621,6 +655,16 @@ func TestShelleyRegistryEntry(t *testing.T) {
 	assert.Equal(t, "shelley:", def.IDPrefix)
 }
 
+func TestOmnigentRegistryEntry(t *testing.T) {
+	def, ok := AgentByType(AgentOmnigent)
+	require.True(t, ok, "AgentOmnigent missing from Registry")
+	require.True(t, def.FileBased, "Omnigent FileBased")
+	assert.Equal(t, "OMNIGENT_DIR", def.EnvVar)
+	assert.Equal(t, "omnigent_dirs", def.ConfigKey)
+	assert.Equal(t, "omnigent:", def.IDPrefix)
+	require.Equal(t, []string{".omnigent"}, def.DefaultDirs)
+}
+
 func TestOpenCodeRegistryEntry(t *testing.T) {
 	def, ok := AgentByType(AgentOpenCode)
 	require.True(t, ok, "AgentOpenCode missing from Registry")
@@ -665,6 +709,14 @@ func TestPeriodicReconcileCapability(t *testing.T) {
 	// subdirectory changes are invisible to their shallow watch coverage.
 	assert.True(t, optedIn[AgentOpenHands])
 	assert.True(t, optedIn[AgentAider])
+	// Omnigent's watcher scans only members at or past the stored
+	// updated_at floor, so metadata-only edits and deletions rely on the
+	// scheduled fingerprint-gated container reparse.
+	assert.True(t, optedIn[AgentOmnigent])
+	// Codebuff's recursive per-project watch covers existing projects;
+	// scheduled reconciliation picks up newly created project
+	// directories under the root (see codebuffWatchRoots).
+	assert.True(t, optedIn[AgentCodebuff])
 	// Cowork's provider WatchPlan registers its root recursively
 	// (coworkWatchRoots Recursive:true overrides legacy ShallowWatch), so
 	// scheduled reconciliation would redundantly rescan the whole archive.
@@ -676,6 +728,28 @@ func TestPeriodicReconcileCapability(t *testing.T) {
 	assert.False(t, optedIn[AgentHermes])
 	assert.False(t, optedIn[AgentClaude])
 	assert.False(t, optedIn[AgentGemini])
+}
+
+func TestRemoteSyncExcludedCapability(t *testing.T) {
+	excluded := map[AgentType]bool{}
+	for _, def := range Registry {
+		excluded[def.Type] = def.RemoteSyncExcluded
+	}
+	// Trae's modern layout stores sessions as encrypted state that a remote
+	// machine cannot read, so it opts out of every remote sync artifact.
+	assert.True(t, excluded[AgentTrae])
+	// Omnigent's chat.db co-locates transcripts with authentication
+	// secrets, so its source tree never leaves the machine.
+	assert.True(t, excluded[AgentOmnigent])
+	assert.False(t, excluded[AgentClaude])
+	assert.False(t, excluded[AgentCodex])
+}
+
+func TestRemoteSyncExcludedAgent(t *testing.T) {
+	assert.True(t, RemoteSyncExcludedAgent(AgentTrae))
+	assert.True(t, RemoteSyncExcludedAgent(AgentOmnigent))
+	assert.False(t, RemoteSyncExcludedAgent(AgentClaude))
+	assert.False(t, RemoteSyncExcludedAgent(AgentType("unknown-agent")))
 }
 
 func TestAgentByPrefixCowork(t *testing.T) {
@@ -732,6 +806,18 @@ func TestDeepSeekTUIRegistryEntry(t *testing.T) {
 	assert.Equal(t, "deepseek_tui_sessions_dirs", def.ConfigKey)
 	assert.Equal(t, []string{".codewhale/sessions", ".deepseek/sessions"}, def.DefaultDirs)
 	assert.Equal(t, "deepseek-tui:", def.IDPrefix)
+}
+
+func TestDeepSeekHarnessRegistryEntry(t *testing.T) {
+	def, ok := AgentByType(AgentDeepSeekHarness)
+	require.True(t, ok, "AgentDeepSeekHarness missing from Registry")
+	require.True(t, def.FileBased, "DeepSeek Harness FileBased")
+	assert.Equal(t, "DeepSeek Harness", def.DisplayName)
+	assert.Equal(t, "DEEPSEEK_HARNESS_SESSIONS_DIR", def.EnvVar)
+	assert.Equal(t, "DSH_HOME", def.DefaultRootEnvVar)
+	assert.Equal(t, "deepseek_harness_sessions_dirs", def.ConfigKey)
+	assert.Equal(t, []string{".dsh/sessions"}, def.DefaultDirs)
+	assert.Equal(t, "deepseek-harness:", def.IDPrefix)
 }
 
 func TestResolveOpenCodeSourcePrefersStorage(t *testing.T) {
@@ -1292,4 +1378,19 @@ func TestReasonixRegistryEntry(t *testing.T) {
 	}
 	assert.True(t, hasUnix, "DefaultDirs should contain .reasonix")
 	assert.True(t, hasWindows, "DefaultDirs should contain AppData/Roaming/reasonix")
+}
+
+func TestFreebuffNotRegistered(t *testing.T) {
+	// Freebuff intentionally shares the Codebuff provider and is NOT
+	// registered in Registry. Freebuff sessions do carry agent =
+	// AgentFreebuff with freebuff:-prefixed IDs (set by
+	// parseCodebuffSession when run-state.json agentType contains
+	// "free"), but there is no separate registry entry or factory:
+	// sync canonicalizes freebuff onto the Codebuff provider def
+	// (AgentByPrefix maps freebuff: IDs to the Codebuff def), so
+	// lifecycle operations over the shared roots run once.
+	for _, def := range Registry {
+		assert.NotEqualf(t, AgentFreebuff, def.Type,
+			"AgentFreebuff must not be registered — it shares the Codebuff provider")
+	}
 }

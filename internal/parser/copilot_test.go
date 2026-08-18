@@ -10,6 +10,8 @@ import (
 
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
+
+	"go.kenn.io/agentsview/internal/money"
 )
 
 // newCopilotTestProvider builds a concrete copilotProvider for the given roots
@@ -122,6 +124,7 @@ func TestParseCopilotSession_ToolCalls(t *testing.T) {
 		`{"type":"session.start","data":{"sessionId":"tool-test"},"timestamp":"2025-01-15T10:00:00Z"}`,
 		`{"type":"user.message","data":{"content":"Read the config file"},"timestamp":"2025-01-15T10:00:01Z"}`,
 		`{"type":"assistant.message","data":{"content":"","toolRequests":[{"toolCallId":"tc-1","name":"view","arguments":"{\"path\":\"config.json\"}"}]},"timestamp":"2025-01-15T10:00:02Z"}`,
+		`{"type":"tool.execution_start","data":{"toolCallId":"tc-1"},"timestamp":"2025-01-15T10:00:02.100Z"}`,
 		`{"type":"tool.execution_complete","data":{"toolCallId":"tc-1","success":true,"result":"{\"key\":\"value\"}"},"timestamp":"2025-01-15T10:00:03Z"}`,
 		`{"type":"assistant.message","data":{"content":"The config file contains a key-value pair."},"timestamp":"2025-01-15T10:00:04Z"}`,
 	)
@@ -137,6 +140,12 @@ func TestParseCopilotSession_ToolCalls(t *testing.T) {
 		ToolUseID: "tc-1",
 		InputJSON: `{"path":"config.json"}`,
 	}})
+	require.Len(t, tcMsg.ToolCalls[0].ResultEvents, 2)
+	assert.Equal(t, "started", tcMsg.ToolCalls[0].ResultEvents[0].Status)
+	assert.Equal(t, "completed", tcMsg.ToolCalls[0].ResultEvents[1].Status)
+	assert.Equal(t, "tool_execution", tcMsg.ToolCalls[0].ResultEvents[1].Source)
+	assert.Equal(t, parseTimestamp("2025-01-15T10:00:03Z"),
+		tcMsg.ToolCalls[0].ResultEvents[1].Timestamp)
 
 	// Check tool result message.
 	trMsg := msgs[2]
@@ -672,8 +681,8 @@ func TestParseCopilotSession_ShutdownUsageEvents(t *testing.T) {
 	assert.Equal(t, 873267, u.CacheReadInputTokens)
 	assert.Equal(t, 51438, u.CacheCreationInputTokens)
 	assert.Equal(t, 432, u.ReasoningTokens)
-	require.NotNil(t, u.CostUSD)
-	assert.InDelta(t, 0.0175, *u.CostUSD, 1e-12)
+	require.NotNil(t, u.Cost)
+	assert.Equal(t, money.MustParseDollars("0.0175"), *u.Cost)
 	assert.Equal(t, "exact", u.CostStatus)
 	assert.Equal(t, copilotReportedCostSource, u.CostSource)
 	assert.Equal(t, "shutdown:copilot:shut-test:claude-sonnet-4-6:0", u.DedupKey)
@@ -716,11 +725,11 @@ func TestParseCopilotSession_ReportedCostPricingCutoff(t *testing.T) {
 			_, _, usage := parseCopilotFull(t, path, "m")
 			require.Len(t, usage, 1)
 			if tt.wantReported {
-				require.NotNil(t, usage[0].CostUSD)
-				assert.InDelta(t, 0.025, *usage[0].CostUSD, 1e-12)
+				require.NotNil(t, usage[0].Cost)
+				assert.Equal(t, money.MustParseDollars("0.025"), *usage[0].Cost)
 				assert.Equal(t, "copilot-reported", usage[0].CostSource)
 			} else {
-				assert.Nil(t, usage[0].CostUSD)
+				assert.Nil(t, usage[0].Cost)
 				assert.Empty(t, usage[0].CostSource)
 			}
 		})
@@ -753,17 +762,17 @@ func TestParseCopilotSession_ShutdownMultiModel(t *testing.T) {
 	assert.Equal(t, 60, haiku.InputTokens)
 	assert.Equal(t, 80, haiku.OutputTokens)
 
-	reported := 0.0
+	reported := money.Money{}
 	carriers := 0
 	for _, u := range usage {
 		if u.CostSource == copilotReportedCostSource {
-			require.NotNil(t, u.CostUSD)
-			reported += *u.CostUSD
+			require.NotNil(t, u.Cost)
+			reported = money.MustAdd(reported, *u.Cost)
 			carriers++
 		}
 	}
 	assert.Equal(t, 1, carriers, "session cost must have one carrier row")
-	assert.InDelta(t, 0.025, reported, 1e-12)
+	assert.Equal(t, money.MustParseDollars("0.025"), reported)
 }
 
 func TestParseCopilotSession_MultiShutdown_SameModel(t *testing.T) {
@@ -792,10 +801,10 @@ func TestParseCopilotSession_MultiShutdown_SameModel(t *testing.T) {
 	// Second segment: fresh = 300 - 250 - 20 = 30
 	assert.Equal(t, 30, usage[1].InputTokens)
 	assert.Equal(t, 80, usage[1].OutputTokens)
-	assert.Nil(t, usage[0].CostUSD,
+	assert.Nil(t, usage[0].Cost,
 		"earlier cumulative shutdown total must be superseded")
-	require.NotNil(t, usage[1].CostUSD)
-	assert.InDelta(t, 0.0275, *usage[1].CostUSD, 1e-12)
+	require.NotNil(t, usage[1].Cost)
+	assert.Equal(t, money.MustParseDollars("0.0275"), *usage[1].Cost)
 	assert.Equal(t, copilotReportedCostSource, usage[1].CostSource)
 }
 
@@ -812,11 +821,11 @@ func TestParseCopilotSession_MultiShutdown_MissingTotalPreservesReportedCost(
 
 	_, _, usage := parseCopilotFull(t, path, "m")
 	require.Len(t, usage, 2)
-	require.NotNil(t, usage[0].CostUSD,
+	require.NotNil(t, usage[0].Cost,
 		"shutdown without totalNanoAiu must preserve the last reported total")
-	assert.InDelta(t, 0.0125, *usage[0].CostUSD, 1e-12)
+	assert.Equal(t, money.MustParseDollars("0.0125"), *usage[0].Cost)
 	assert.Equal(t, copilotReportedCostSource, usage[0].CostSource)
-	assert.Nil(t, usage[1].CostUSD)
+	assert.Nil(t, usage[1].Cost)
 	assert.Empty(t, usage[1].CostSource)
 }
 
@@ -843,10 +852,10 @@ func TestParseCopilotSession_MultiShutdown_InvalidTotalPreservesReportedCost(
 
 			_, _, usage := parseCopilotFull(t, path, "m")
 			require.Len(t, usage, 2)
-			require.NotNil(t, usage[0].CostUSD)
-			assert.InDelta(t, 0.0125, *usage[0].CostUSD, 1e-12)
+			require.NotNil(t, usage[0].Cost)
+			assert.Equal(t, money.MustParseDollars("0.0125"), *usage[0].Cost)
 			assert.Equal(t, copilotReportedCostSource, usage[0].CostSource)
-			assert.Nil(t, usage[1].CostUSD)
+			assert.Nil(t, usage[1].Cost)
 			assert.Empty(t, usage[1].CostSource)
 		})
 	}
@@ -863,9 +872,9 @@ func TestParseCopilotSession_MultiShutdown_LastZeroIsAuthoritative(t *testing.T)
 
 	_, _, usage := parseCopilotFull(t, path, "m")
 	require.Len(t, usage, 2)
-	assert.Nil(t, usage[0].CostUSD)
-	require.NotNil(t, usage[1].CostUSD)
-	assert.Zero(t, *usage[1].CostUSD)
+	assert.Nil(t, usage[0].Cost)
+	require.NotNil(t, usage[1].Cost)
+	assert.Zero(t, *usage[1].Cost)
 	assert.Equal(t, copilotReportedCostSource, usage[1].CostSource)
 }
 

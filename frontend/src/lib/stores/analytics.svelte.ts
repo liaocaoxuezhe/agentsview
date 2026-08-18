@@ -21,6 +21,8 @@ import { sessions } from "./sessions.svelte.js";
 import { perf, type PerfEntryStatus } from "./perf.svelte.js";
 import { rollingRange, today } from "../utils/dates.js";
 
+export const ANALYTICS_DEFAULT_WINDOW_DAYS = 365;
+
 type AnalyticsParams = Parameters<
   typeof AnalyticsService.getApiV1AnalyticsSummary
 >[0];
@@ -52,10 +54,12 @@ type Panel =
 type FetchResult = "ok" | "error" | "aborted";
 
 class AnalyticsStore {
-  from: string = $state(rollingRange(365).from);
+  from: string = $state(
+    rollingRange(ANALYTICS_DEFAULT_WINDOW_DAYS).from,
+  );
   to: string = $state(today());
   isPinned: boolean = $state(false);
-  windowDays: number = $state(365);
+  windowDays: number = $state(ANALYTICS_DEFAULT_WINDOW_DAYS);
   granularity: Granularity = $state("day");
   skillsGranularity: Granularity = $state("week");
   metric: HeatmapMetric = $state("messages");
@@ -147,7 +151,7 @@ class AnalyticsStore {
   private abortControllers: Partial<Record<Panel, AbortController>> = {};
   // Scope key of the cached `signals`: the Analytics-only filters (model plus
   // the heatmap drill-down) the cached data was fetched with. Used to drop the
-  // cache when a fetch crosses the Analytics / Insights boundary, where those
+  // cache when a fetch crosses the Analytics / Quality boundary, where those
   // filters do not exist.
   private signalsScope: string | null = null;
 
@@ -286,7 +290,7 @@ class AnalyticsStore {
   setAutomatedScope(scope: AutomatedScope) {
     this.automatedScope = scope;
     this.includeAutomated = scope !== "human";
-    this.fetchSignalsForInsights();
+    this.fetchSignalsForQuality();
   }
 
   clearRecentlyActive() {
@@ -463,8 +467,8 @@ class AnalyticsStore {
   }
 
   signalEvidenceParams(): AnalyticsParams {
-    // Insights-only drilldown: omit the Analytics model filter so signal
-    // evidence matches the unscoped Insights signal facts (the Insights page
+    // Quality-only drilldown: omit the Analytics model filter so signal
+    // evidence matches the unscoped Quality signal facts (the Quality page
     // has no model control).
     return this.filterParams({ includeModel: false });
   }
@@ -750,9 +754,9 @@ class AnalyticsStore {
     opts: { includeModel?: boolean } = {},
   ): Promise<FetchResult> {
     const includeModel = opts.includeModel ?? true;
-    // `signals` is a cache shared by the Analytics page and the Insights page.
-    // Key it by the filters that exist on Analytics but not Insights: the model
-    // and the heatmap drill-down (date/day/hour), which fetchSignalsForInsights
+    // `signals` is a cache shared by the Analytics page and the Quality page.
+    // Key it by the filters that exist on Analytics but not Quality: the model
+    // and the heatmap drill-down (date/day/hour), which fetchSignalsForQuality
     // clears. When this fetch's scope differs from the cached one, drop the
     // cache so another scope's signals are never shown while the fetch is in
     // flight or retained if it fails; a matching scope keeps the in-place
@@ -780,14 +784,14 @@ class AnalyticsStore {
     );
   }
 
-  async fetchSignalsForInsights() {
+  async fetchSignalsForQuality() {
     this.rollDates();
     this.selectedDate = null;
     this.selectedDow = null;
     this.selectedHour = null;
-    // The Insights page has no model control and the model filter is an
+    // The Quality page has no model control and the model filter is an
     // Analytics-only scope; omit it so a model selected on Analytics does not
-    // silently narrow the Insights signal facts.
+    // silently narrow the Quality signal facts.
     await this.fetchSignals({ includeModel: false });
   }
 

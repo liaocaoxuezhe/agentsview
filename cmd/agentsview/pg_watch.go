@@ -2,6 +2,7 @@ package main
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"log"
 	"os"
@@ -12,6 +13,7 @@ import (
 	"github.com/gofrs/flock"
 	"go.kenn.io/agentsview/internal/config"
 	"go.kenn.io/agentsview/internal/postgres"
+	syncpkg "go.kenn.io/agentsview/internal/sync"
 	"go.kenn.io/kit/daemon"
 )
 
@@ -19,8 +21,8 @@ import (
 // interface so the pusher can be tested without a live database.
 type pgTarget interface {
 	EnsureSchema(ctx context.Context) error
-	Push(
-		ctx context.Context, full bool,
+	PushWithOptions(
+		ctx context.Context, opts postgres.PushOptions,
 		onProgress func(postgres.PushProgress),
 	) (postgres.PushResult, error)
 	Close() error
@@ -30,10 +32,28 @@ type pgTarget interface {
 // connecting and reconnecting after errors so a transiently
 // unreachable database never crashes the daemon.
 type pgPusher struct {
-	localSync     func(context.Context) error
+	localSync  func(context.Context) error
+	scopedSync func(
+		context.Context, syncpkg.WatchBatch, *syncpkg.WatchRecoveryScope,
+		func() error,
+	) error
 	ensurePricing func(context.Context) error
 	connect       func() (pgTarget, error)
 	target        pgTarget
+	// vectorReconcileNeeded is true until a generation-wide vector
+	// reconciliation succeeds in this watch process, and again after
+	// any push error or a vector phase that skipped or deferred work.
+	// While true, change pushes stay generation-wide so nothing waits
+	// on the interval floor unnecessarily; while false, change pushes
+	// scope their vector reads to the changed relational sessions.
+	vectorReconcileNeeded bool
+	// lastReconciledVectorGeneration is the PG generation id of the last
+	// clean generation-wide reconciliation in this process. A scoped push
+	// carrying it lets the vector phase promote itself to generation-wide
+	// when the active generation id differs, so a re-embed or a
+	// reset/drop-and-recreate (by any machine) never leaves a generation
+	// partially populated.
+	lastReconciledVectorGeneration int64
 }
 
 // push performs one local-sync-then-push cycle. On any PG error it
@@ -41,9 +61,32 @@ type pgPusher struct {
 func (p *pgPusher) push(
 	ctx context.Context, reason pushReason, full bool,
 ) error {
+	return p.pushBatch(ctx, reason, full, nil, nil)
+}
+
+func (p *pgPusher) pushBatch(
+	ctx context.Context,
+	reason pushReason,
+	full bool,
+	batch *syncpkg.WatchBatch,
+	recovery *syncpkg.WatchRecoveryScope,
+) error {
+	push := func() error { return p.pushAfterSync(ctx, reason, full) }
+	if batch != nil {
+		if p.scopedSync == nil {
+			return errors.New("scoped local sync is unavailable")
+		}
+		return p.scopedSync(ctx, *batch, recovery, push)
+	}
 	if err := p.localSync(ctx); err != nil {
 		return fmt.Errorf("local sync: %w", err)
 	}
+	return push()
+}
+
+func (p *pgPusher) pushAfterSync(
+	ctx context.Context, reason pushReason, full bool,
+) error {
 	if p.ensurePricing != nil {
 		if err := p.ensurePricing(ctx); err != nil {
 			if ctxErr := ctx.Err(); ctxErr != nil {
@@ -62,17 +105,26 @@ func (p *pgPusher) push(
 		}
 		p.target = t
 	}
-	// EnsureSchema is idempotent and memoized inside *postgres.Sync,
-	// so calling it every cycle is cheap after the first success.
 	if err := p.target.EnsureSchema(ctx); err != nil {
 		p.reset()
 		return fmt.Errorf("ensure schema: %w", err)
 	}
-	res, err := p.target.Push(ctx, full, nil)
+	scoped := scopedVectorPush(reason, full, p.vectorReconcileNeeded)
+	res, err := p.target.PushWithOptions(ctx, postgres.PushOptions{
+		Full:                           full,
+		ScopeVectorsToChangedSessions:  scoped,
+		LastReconciledVectorGeneration: p.lastReconciledVectorGeneration,
+	}, nil)
 	if err != nil {
+		p.vectorReconcileNeeded = true
 		p.reset()
 		return fmt.Errorf("push: %w", err)
 	}
+	p.vectorReconcileNeeded, p.lastReconciledVectorGeneration =
+		nextVectorReconcile(
+			p.vectorReconcileNeeded,
+			p.lastReconciledVectorGeneration, scoped, res,
+		)
 	if res.Errors > 0 {
 		logPGWatchPushResult(res, reason)
 		log.Printf(
@@ -83,6 +135,53 @@ func (p *pgPusher) push(
 	}
 	logPGWatchPushResult(res, reason)
 	return nil
+}
+
+// scopedVectorPush reports whether a push may scope its vector phase
+// to the changed relational sessions: only change-triggered, non-full
+// pushes after a clean generation-wide reconciliation qualify.
+// Startup, interval-floor, shutdown, and full pushes always reconcile
+// generation-wide, which also owns eviction of PG-only state rows and
+// pickup of vector-only changes (e.g. an embeddings build finishing
+// with no relational change).
+func scopedVectorPush(
+	reason pushReason, full, reconcileNeeded bool,
+) bool {
+	return reason == reasonChange && !full && !reconcileNeeded
+}
+
+// nextVectorReconcile folds the post-push update of the reconcile bit and
+// the last-reconciled generation id. A skipped or deferring vector phase
+// leaves work behind, so the next push goes generation-wide and the id is
+// unchanged; a clean generation-wide phase clears the bit and records the
+// generation id it reconciled; a clean scoped phase leaves both as they were.
+//
+// The phase ran generation-wide when the caller did not scope it, or when it
+// scoped but the active generation id differed from the last reconciled one —
+// pushVectors promotes that case, so the same predicate recovers it here
+// without a separate result flag. pushVectors also promotes when its machine
+// push record is missing (vector tables recreated onto a reused id); that
+// promotion is invisible here, and needs no recovery: the phase reconciled
+// the reused id generation-wide, so the unchanged memo describes it.
+//
+// A generation-wide phase reporting a zero generation id clears nothing: a
+// daemon predating the field omits it, and clearing on such a response
+// would let the next change push scope with a zero memo, which the vector
+// phase cannot promote if the generation was recreated meanwhile. Current
+// servers report a nonzero id on every clean unskipped phase, so scoping
+// resumes with the first response that carries one.
+func nextVectorReconcile(
+	current bool, lastGeneration int64,
+	scoped bool, res postgres.PushResult,
+) (bool, int64) {
+	if res.Vectors.Skipped || res.Vectors.SessionsDeferred > 0 {
+		return true, lastGeneration
+	}
+	generation := res.Vectors.GenerationID
+	if generation != 0 && (!scoped || generation != lastGeneration) {
+		return false, generation
+	}
+	return current, lastGeneration
 }
 
 func logPGWatchPushResult(res postgres.PushResult, reason pushReason) {

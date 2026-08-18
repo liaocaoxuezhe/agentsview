@@ -217,6 +217,22 @@ func NormalizeToolCategory(rawName string) string {
 	case "zencoder-rag-mcp__web_search":
 		return "Read"
 
+	// Codebuff / Freebuff tools
+	// Note: "read_files" (Warp→Read), "list_directory" (Gemini→Read),
+	// "write_file" (Gemini→Write), "str_replace" (Pi→Edit),
+	// "skill" (Amp→Tool) are handled in earlier sections.
+	case "read_subtree", "file-picker":
+		return "Read"
+	case "suggest_followups", "write_todos", "read_url", "ask_user",
+		"render_ui", "gravity_index":
+		return "Tool"
+	case "run_terminal_command", "basher":
+		return "Bash"
+	case "code-searcher", "code-reviewer":
+		return "Tool"
+	case "spawn_agents":
+		return "Task"
+
 	// ChatGPT tools
 	case "code_interpreter":
 		return "Bash"
@@ -262,6 +278,12 @@ func NormalizeToolCategory(rawName string) string {
 		return "Read"
 	case "use_computer":
 		return "Tool"
+
+	// Poolside tools (only tools not already covered above)
+	case "todo_action", "switch_mode", "question", "exit":
+		return "Tool"
+	case "shell_kill", "shell_status", "shell_tail":
+		return "Bash"
 
 	default:
 		// MCP tools may carry a server prefix (e.g.

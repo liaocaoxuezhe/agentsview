@@ -15,7 +15,9 @@ import (
 	"strings"
 	"time"
 
+	"go.kenn.io/agentsview/internal/activity"
 	"go.kenn.io/agentsview/internal/export"
+	"go.kenn.io/agentsview/internal/money"
 )
 
 const sessionExportOrder = "last_activity_at DESC, id ASC"
@@ -84,7 +86,7 @@ type SessionModelUsage struct {
 	CacheCreationInputTokens int                                   `json:"cache_creation_input_tokens"`
 	CacheReadInputTokens     int                                   `json:"cache_read_input_tokens"`
 	ReasoningTokens          int                                   `json:"reasoning_tokens"`
-	CostUSD                  float64                               `json:"cost_usd"`
+	Cost                     money.Money                           `json:"cost"`
 	HasCost                  bool                                  `json:"has_cost"`
 	ByModel                  map[string]SessionModelUsageBreakdown `json:"by_model"`
 }
@@ -96,7 +98,7 @@ type SessionModelUsageBreakdown struct {
 	CacheCreationInputTokens int               `json:"cache_creation_input_tokens"`
 	CacheReadInputTokens     int               `json:"cache_read_input_tokens"`
 	ReasoningTokens          int               `json:"reasoning_tokens"`
-	CostUSD                  float64           `json:"cost_usd"`
+	Cost                     money.Money       `json:"cost"`
 	HasCost                  bool              `json:"has_cost"`
 	CostSource               export.CostSource `json:"cost_source"`
 }
@@ -131,6 +133,7 @@ type sessionExportCursorFilters struct {
 	Date                 string   `json:"date,omitempty"`
 	DateFrom             string   `json:"date_from,omitempty"`
 	DateTo               string   `json:"date_to,omitempty"`
+	Timezone             string   `json:"timezone,omitempty"`
 	ActiveSince          string   `json:"active_since,omitempty"`
 	MinMessages          int      `json:"min_messages,omitempty"`
 	MaxMessages          int      `json:"max_messages,omitempty"`
@@ -157,8 +160,8 @@ type sessionExportUsageAccum struct {
 	cacheCreationInputTokens int
 	cacheReadInputTokens     int
 	reasoningTokens          int
-	costUSD                  float64
-	authoritativeCost        *float64
+	cost                     money.Money
+	authoritativeCost        *money.Money
 	contributing             bool
 	allPriced                bool
 	seen                     map[usageDedupToken]struct{}
@@ -170,7 +173,7 @@ type sessionExportModelUsageAccum struct {
 	cacheCreationInputTokens int
 	cacheReadInputTokens     int
 	reasoningTokens          int
-	costUSD                  float64
+	cost                     money.Money
 	contributing             bool
 	allPriced                bool
 	computed                 bool
@@ -745,18 +748,42 @@ func (db *DB) attachSessionExportUsage(
 	}
 
 	query, args := sessionExportUsageQuery(sessionExportIDs(rows))
-	sqlRows, err := q.QueryContext(ctx, query, args...)
+	usageRows, err := querySessionExportUsageRows(ctx, q, query, args)
 	if err != nil {
-		return nil, fmt.Errorf("querying session export usage: %w", err)
+		return nil, err
 	}
-	defer sqlRows.Close()
+	peers, err := sessionExportClaudeSnapshotPeers(
+		ctx, q, usageRows, sessionExportIDs(rows),
+	)
+	if err != nil {
+		return nil, err
+	}
+	usageRows = append(usageRows, peers...)
 
-	for sqlRows.Next() {
-		r, err := scanUsageRow(sqlRows)
-		if err != nil {
-			return nil, fmt.Errorf("scanning session export usage: %w", err)
+	snapshotRows := make([]activity.UsageRow, len(usageRows))
+	for i, r := range usageRows {
+		_, outputTok, _, _, _ := sessionExportUsageTokens(r)
+		ordinal := int64(-1)
+		if r.messageOrdinal.Valid {
+			ordinal = r.messageOrdinal.Int64
 		}
-		a := accum[r.sessionID]
+		snapshotRows[i] = activity.UsageRow{
+			SessionID:         r.sessionID,
+			Timestamp:         r.ts,
+			MessageOrdinal:    ordinal,
+			OutputTokens:      outputTok,
+			WebSearchRequests: usageRowWebSearchRequests(r.usageSource, r.tokenJSON),
+			ClaudeMessageID:   r.claudeMessageID,
+			ClaudeRequestID:   r.claudeRequestID,
+		}
+	}
+	snapshotMask, snapshotAttribution, snapshotWebSearchRequests :=
+		activity.ClaudeSnapshotSurvivorSelection(snapshotRows)
+	for i, r := range usageRows {
+		if !snapshotMask[i] {
+			continue
+		}
+		a := accum[snapshotAttribution[i]]
 		if a == nil {
 			continue
 		}
@@ -773,14 +800,18 @@ func (db *DB) attachSessionExportUsage(
 			sessionExportUsageTokens(r)
 		costRow := r
 		authoritative := r.costSource == CopilotReportedCostSource &&
-			r.costUSD.Valid
+			r.cost.Valid
 		if authoritative {
-			v := r.costUSD.Float64
+			v := money.Money{Microdollars: r.cost.Int64}
 			a.authoritativeCost = &v
-			costRow.costUSD = sql.NullFloat64{}
+			costRow.cost = sql.NullInt64{}
 			resolver.RecordUnattributedReported()
 		}
-		cost, priced, contributes := sessionRowCost(costRow, resolver)
+		cost, priced, contributes, priceErr := sessionRowCostWithWebSearchRequests(
+			costRow, snapshotWebSearchRequests[i], resolver)
+		if priceErr != nil {
+			return nil, priceErr
+		}
 		if !contributes {
 			continue
 		}
@@ -792,7 +823,11 @@ func (db *DB) attachSessionExportUsage(
 		a.cacheReadInputTokens += cacheRdTok
 		a.reasoningTokens += reasoningTok
 		if priced {
-			a.costUSD += cost
+			a.cost, priceErr = money.Add(a.cost, cost)
+			if priceErr != nil {
+				return nil, fmt.Errorf(
+					"summing session export cost: %w", priceErr)
+			}
 		} else {
 			a.allPriced = false
 		}
@@ -807,21 +842,20 @@ func (db *DB) attachSessionExportUsage(
 		ma.cacheCreationInputTokens += cacheCrTok
 		ma.cacheReadInputTokens += cacheRdTok
 		ma.reasoningTokens += reasoningTok
-		if authoritative {
-			ma.computed = true
-		} else if r.costUSD.Valid {
+		if costRow.cost.Valid {
 			ma.reported = true
 		} else {
 			ma.computed = true
 		}
 		if priced {
-			ma.costUSD += cost
+			ma.cost, priceErr = money.Add(ma.cost, cost)
+			if priceErr != nil {
+				return nil, fmt.Errorf(
+					"summing session export model cost: %w", priceErr)
+			}
 		} else {
 			ma.allPriced = false
 		}
-	}
-	if err := sqlRows.Err(); err != nil {
-		return nil, fmt.Errorf("iterating session export usage: %w", err)
 	}
 	for _, a := range accum {
 		if a == nil || a.authoritativeCost == nil {
@@ -840,16 +874,17 @@ func (db *DB) attachSessionExportUsage(
 		sort.Slice(models, func(i, j int) bool {
 			return models[i].model < models[j].model
 		})
-		weights := make([]float64, len(models))
+		weights := make([]money.Money, len(models))
 		for i, model := range models {
-			weights[i] = model.usage.costUSD
+			weights[i] = model.usage.cost
 		}
 		costs := export.AllocateCostByWeight(*a.authoritativeCost, weights)
 		for i, model := range models {
-			model.usage.costUSD = costs[i]
+			model.usage.cost = costs[i]
 			model.usage.allPriced = true
 		}
-		a.costUSD = *a.authoritativeCost
+		a.cost = *a.authoritativeCost
+		a.allPriced = true
 	}
 
 	for i := range rows {
@@ -864,13 +899,9 @@ func (db *DB) attachSessionExportUsage(
 			CacheCreationInputTokens: a.cacheCreationInputTokens,
 			CacheReadInputTokens:     a.cacheReadInputTokens,
 			ReasoningTokens:          a.reasoningTokens,
-			CostUSD:                  a.costUSD,
-			HasCost: a.authoritativeCost != nil ||
-				(a.contributing && a.allPriced),
-			ByModel: sessionExportModelUsageBreakdowns(a.byModel),
-		}
-		if a.authoritativeCost != nil {
-			rows[i].ModelUsage.CostUSD = *a.authoritativeCost
+			Cost:                     a.cost,
+			HasCost:                  a.authoritativeCost != nil || (a.contributing && a.allPriced),
+			ByModel:                  sessionExportModelUsageBreakdowns(a.byModel),
 		}
 	}
 	block, err := resolver.BuildBlock()
@@ -891,6 +922,95 @@ func sessionExportUsageQuery(sessionIDs []string) (string, []any) {
 	AND u.session_id IN (` + strings.Join(placeholders, ",") + `)
 	ORDER BY u.session_id ASC, u.ts ASC, COALESCE(u.message_ordinal, -1) ASC`
 	return query, args
+}
+
+func querySessionExportUsageRows(
+	ctx context.Context, q sessionExportQuerier, query string, args []any,
+) ([]usageScanRow, error) {
+	sqlRows, err := q.QueryContext(ctx, query, args...)
+	if err != nil {
+		return nil, fmt.Errorf("querying session export usage: %w", err)
+	}
+	defer sqlRows.Close()
+
+	usageRows := []usageScanRow{}
+	for sqlRows.Next() {
+		r, scanErr := scanUsageRow(sqlRows)
+		if scanErr != nil {
+			return nil, fmt.Errorf("scanning session export usage: %w", scanErr)
+		}
+		usageRows = append(usageRows, r)
+	}
+	if err := sqlRows.Err(); err != nil {
+		return nil, fmt.Errorf("iterating session export usage: %w", err)
+	}
+	return usageRows, nil
+}
+
+func sessionExportClaudeSnapshotPeers(
+	ctx context.Context,
+	q sessionExportQuerier,
+	pageRows []usageScanRow,
+	pageSessionIDs []string,
+) ([]usageScanRow, error) {
+	type snapshotKey struct {
+		messageID string
+		requestID string
+	}
+	keySet := make(map[snapshotKey]struct{})
+	for _, row := range pageRows {
+		if row.claudeMessageID == "" || row.claudeRequestID == "" {
+			continue
+		}
+		keySet[snapshotKey{
+			messageID: row.claudeMessageID,
+			requestID: row.claudeRequestID,
+		}] = struct{}{}
+	}
+	keys := make([]snapshotKey, 0, len(keySet))
+	for key := range keySet {
+		keys = append(keys, key)
+	}
+	sort.Slice(keys, func(i, j int) bool {
+		if keys[i].messageID != keys[j].messageID {
+			return keys[i].messageID < keys[j].messageID
+		}
+		return keys[i].requestID < keys[j].requestID
+	})
+	pageIDs := make(map[string]struct{}, len(pageSessionIDs))
+	for _, id := range pageSessionIDs {
+		pageIDs[id] = struct{}{}
+	}
+
+	peers := []usageScanRow{}
+	const snapshotKeyChunk = maxSQLVars / 2
+	for i := 0; i < len(keys); i += snapshotKeyChunk {
+		end := min(i+snapshotKeyChunk, len(keys))
+		predicates := make([]string, 0, end-i)
+		args := make([]any, 0, (end-i)*2)
+		for _, key := range keys[i:end] {
+			predicates = append(predicates,
+				"(m.claude_message_id = ? AND m.claude_request_id = ?)")
+			args = append(args, key.messageID, key.requestID)
+		}
+		rowsSQL := usageRowsSQLWithWhere(
+			usageMessageEligibility+" AND ("+strings.Join(predicates, " OR ")+")",
+			usageEventEligibility+" AND 1 = 0")
+		query := usageRowSelectFromRows(rowsSQL) + `
+			ORDER BY u.session_id ASC, u.ts ASC,
+				COALESCE(u.message_ordinal, -1) ASC`
+		matching, err := querySessionExportUsageRows(ctx, q, query, args)
+		if err != nil {
+			return nil, fmt.Errorf("loading Claude snapshot peers: %w", err)
+		}
+		for _, row := range matching {
+			if _, pageOwned := pageIDs[row.sessionID]; pageOwned {
+				continue
+			}
+			peers = append(peers, row)
+		}
+	}
+	return peers, nil
 }
 
 func sessionExportUsageTokens(
@@ -999,6 +1119,7 @@ func sessionExportFilters(f SessionFilter) sessionExportCursorFilters {
 		Date:                 f.Date,
 		DateFrom:             f.DateFrom,
 		DateTo:               f.DateTo,
+		Timezone:             f.Timezone,
 		ActiveSince:          f.ActiveSince,
 		MinMessages:          f.MinMessages,
 		MaxMessages:          f.MaxMessages,
@@ -1028,6 +1149,7 @@ func sessionExportFilterFromCursor(f sessionExportCursorFilters) SessionFilter {
 		Date:                 f.Date,
 		DateFrom:             f.DateFrom,
 		DateTo:               f.DateTo,
+		Timezone:             f.Timezone,
 		ActiveSince:          f.ActiveSince,
 		MinMessages:          f.MinMessages,
 		MaxMessages:          f.MaxMessages,
@@ -1055,6 +1177,17 @@ func canonicalSessionExportFilter(f SessionFilter) SessionFilter {
 	f.Date = strings.TrimSpace(f.Date)
 	f.DateFrom = strings.TrimSpace(f.DateFrom)
 	f.DateTo = strings.TrimSpace(f.DateTo)
+	if timezone, err := NormalizeSessionTimezone(f.Timezone); err == nil {
+		if timezone == "UTC" {
+			// Preserve the existing cursor wire form while treating an
+			// explicit UTC filter as equivalent to the omitted UTC default.
+			f.Timezone = ""
+		} else {
+			f.Timezone = timezone
+		}
+	} else {
+		f.Timezone = strings.TrimSpace(f.Timezone)
+	}
 	f.ActiveSince = strings.TrimSpace(f.ActiveSince)
 	f.AutomatedScope = normalizeAutomatedScope(f.AutomatedScope, f.ExcludeAutomated)
 	f.ExcludeAutomated = false
@@ -1108,12 +1241,6 @@ func sessionExportFiltersEqual(
 
 func buildSessionExportFilter(f SessionFilter) (string, []any) {
 	dialect := SQLiteQueryDialect()
-	if f.IncludeChildren {
-		dialect.activityExpr = sessionExportLastActivitySortExprFor("root_session")
-	} else {
-		dialect.activityExpr = sessionExportLastActivitySortExpr()
-	}
-	dialect.activityParam = func(ph string) string { return "julianday(" + ph + ")" }
 	return BuildSessionFilterSQL(f, dialect)
 }
 
@@ -1220,7 +1347,7 @@ func sessionExportModelUsageBreakdowns(
 			CacheCreationInputTokens: a.cacheCreationInputTokens,
 			CacheReadInputTokens:     a.cacheReadInputTokens,
 			ReasoningTokens:          a.reasoningTokens,
-			CostUSD:                  a.costUSD,
+			Cost:                     a.cost,
 			HasCost:                  a.contributing && a.allPriced,
 			CostSource:               sessionExportCostSource(a.computed, a.reported),
 		}

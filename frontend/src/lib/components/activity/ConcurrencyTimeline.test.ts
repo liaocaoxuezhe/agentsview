@@ -4,6 +4,7 @@ import { fireEvent, render } from "@testing-library/svelte";
 import { mount, tick, unmount } from "svelte";
 import ConcurrencyTimeline from "./ConcurrencyTimeline.svelte";
 import type { Report } from "../../api/types.js";
+import { testMoney } from "../../test/money.js";
 
 class ResizeObserverMock {
   observe = vi.fn();
@@ -20,7 +21,7 @@ function makeReport(overrides: Partial<Report> = {}): Report {
       max_agents: 0,
       agent_minutes: 0,
       output_tokens: 0,
-      cost: 0,
+      cost: testMoney(0),
       interactive_at_peak: 0,
       automated_at_peak: 0,
     },
@@ -30,7 +31,7 @@ function makeReport(overrides: Partial<Report> = {}): Report {
       max_agents: 2,
       agent_minutes: 12,
       output_tokens: 4000,
-      cost: 0.4,
+      cost: testMoney(0.4),
       interactive_at_peak: 1,
       automated_at_peak: 1,
     },
@@ -40,7 +41,7 @@ function makeReport(overrides: Partial<Report> = {}): Report {
       max_agents: 3,
       agent_minutes: 30,
       output_tokens: 9000,
-      cost: 0.9,
+      cost: testMoney(0.9),
       interactive_at_peak: 2,
       automated_at_peak: 1,
     },
@@ -50,7 +51,7 @@ function makeReport(overrides: Partial<Report> = {}): Report {
       max_agents: 1,
       agent_minutes: 8,
       output_tokens: 2000,
-      cost: 0.2,
+      cost: testMoney(0.2),
       interactive_at_peak: 1,
       automated_at_peak: 0,
     },
@@ -60,7 +61,7 @@ function makeReport(overrides: Partial<Report> = {}): Report {
       max_agents: 0,
       agent_minutes: 0,
       output_tokens: 0,
-      cost: 0,
+      cost: testMoney(0),
       interactive_at_peak: 0,
       automated_at_peak: 0,
     },
@@ -76,7 +77,7 @@ function makeReport(overrides: Partial<Report> = {}): Report {
       distinct_projects: 2,
       distinct_models: 1,
       output_tokens: 15000,
-      cost: 1.5,
+      cost: testMoney(1.5),
     },
     partial: false,
     as_of: null,
@@ -95,7 +96,8 @@ function makeReport(overrides: Partial<Report> = {}): Report {
     by_model: null,
     by_agent: null,
     by_session: null,
-    intervals: [],
+    sessions_total: 0,
+    projects: {},
     ...overrides,
   } as Report;
   // Backfill the peak-automation split onto any bucket literal that omits it
@@ -122,7 +124,7 @@ function popoverReport(): Report {
         max_agents: 2,
         agent_minutes: 4,
         output_tokens: 0,
-        cost: 0,
+        cost: testMoney(0),
       },
     ],
     by_session: [
@@ -134,7 +136,7 @@ function popoverReport(): Report {
         primary_model: "m",
         models: ["m"],
         agent_minutes: 2,
-        cost: 0,
+        cost: testMoney(0),
         output_tokens: 0,
         first_active: "2026-06-16T10:00:00Z",
         last_active: "2026-06-16T10:02:00Z",
@@ -148,18 +150,13 @@ function popoverReport(): Report {
         primary_model: "m",
         models: ["m"],
         agent_minutes: 2,
-        cost: 0,
+        cost: testMoney(0),
         output_tokens: 0,
         first_active: "2026-06-16T10:01:00Z",
         last_active: "2026-06-16T10:03:00Z",
         timing_quality: "timed",
       },
     ] as Report["by_session"],
-    intervals: [
-      { session_id: "a", start: "2026-06-16T10:00:00Z", end: "2026-06-16T10:01:00Z" },
-      { session_id: "a", start: "2026-06-16T10:01:00Z", end: "2026-06-16T10:02:00Z" },
-      { session_id: "b", start: "2026-06-16T10:01:00Z", end: "2026-06-16T10:03:00Z" },
-    ] as Report["intervals"],
   });
 }
 
@@ -180,7 +177,7 @@ function minuteReport(overrides: Partial<Report> = {}): Report {
         max_agents: 1,
         agent_minutes: 5,
         output_tokens: 10,
-        cost: 0,
+        cost: testMoney(0),
       },
       {
         start: "2026-06-16T00:05:00Z",
@@ -188,7 +185,7 @@ function minuteReport(overrides: Partial<Report> = {}): Report {
         max_agents: 2,
         agent_minutes: 5,
         output_tokens: 20,
-        cost: 0,
+        cost: testMoney(0),
       },
       {
         start: "2026-06-16T00:10:00Z",
@@ -196,7 +193,7 @@ function minuteReport(overrides: Partial<Report> = {}): Report {
         max_agents: 1,
         agent_minutes: 5,
         output_tokens: 5,
-        cost: 0,
+        cost: testMoney(0),
       },
     ] as Report["buckets"],
     ...overrides,
@@ -397,7 +394,7 @@ describe("ConcurrencyTimeline", () => {
     target.remove();
   });
 
-  it("emits the active session ids for a clicked slot", async () => {
+  it("emits the bucket index for server-side membership paging", async () => {
     const onSelectBucket = vi.fn();
     const target = document.createElement("div");
     document.body.appendChild(target);
@@ -410,15 +407,14 @@ describe("ConcurrencyTimeline", () => {
       new MouseEvent("click", { bubbles: true }),
     );
     await tick();
-    // 3 intervals, "a" deduped to one row, sorted by earliest overlap then id.
     expect(onSelectBucket).toHaveBeenCalledWith(
-      expect.objectContaining({ idx: 0, sessionIds: ["a", "b"] }),
+      { idx: 0, label: "10:00–10:05" },
     );
     unmount(c);
     target.remove();
   });
 
-  it("emits an empty session list for an idle slot", async () => {
+  it("emits an idle bucket index without computing membership locally", async () => {
     const report = makeReport({
       bucket_unit: "minute",
       bucket_seconds: 300,
@@ -431,7 +427,7 @@ describe("ConcurrencyTimeline", () => {
           max_agents: 1,
           agent_minutes: 1,
           output_tokens: 0,
-          cost: 0,
+          cost: testMoney(0),
         },
         {
           start: "2026-06-16T10:05:00Z",
@@ -439,11 +435,10 @@ describe("ConcurrencyTimeline", () => {
           max_agents: 0,
           agent_minutes: 0,
           output_tokens: 0,
-          cost: 0,
+          cost: testMoney(0),
         },
       ],
       by_session: [] as Report["by_session"],
-      intervals: [] as Report["intervals"],
     });
     const onSelectBucket = vi.fn();
     const target = document.createElement("div");
@@ -458,7 +453,7 @@ describe("ConcurrencyTimeline", () => {
     (hits[1] as SVGRectElement).dispatchEvent(new MouseEvent("click", { bubbles: true }));
     await tick();
     expect(onSelectBucket).toHaveBeenCalledWith(
-      expect.objectContaining({ idx: 1, sessionIds: [] }),
+      { idx: 1, label: "10:05–10:10" },
     );
     unmount(c);
     target.remove();
@@ -548,7 +543,7 @@ describe("ConcurrencyTimeline", () => {
           max_agents: 1,
           agent_minutes: 10,
           output_tokens: 1,
-          cost: 0,
+          cost: testMoney(0),
         },
         {
           start: "2026-06-16T00:00:00Z",
@@ -556,7 +551,7 @@ describe("ConcurrencyTimeline", () => {
           max_agents: 1,
           agent_minutes: 10,
           output_tokens: 1,
-          cost: 0,
+          cost: testMoney(0),
         },
       ] as Report["buckets"],
     });
@@ -583,7 +578,7 @@ describe("ConcurrencyTimeline", () => {
           max_agents: 2,
           agent_minutes: 20,
           output_tokens: 100,
-          cost: 0,
+          cost: testMoney(0),
         },
       ] as Report["buckets"],
     });

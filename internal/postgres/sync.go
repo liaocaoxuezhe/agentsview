@@ -166,6 +166,14 @@ type Sync struct {
 	syncStateTarget        string
 	migrateLegacySyncState bool
 
+	// archiveID caches this local archive's stable identifier, populated at
+	// the top of Push and stamped onto every pushed session's
+	// source_archive_id column.
+	archiveID string
+	// databaseGeneration identifies the exact local database generation that
+	// produced each pushed session and its identity snapshot.
+	databaseGeneration string
+
 	// Project filtering for push scope.
 	projects        []string
 	excludeProjects []string
@@ -173,6 +181,14 @@ type Sync struct {
 	// vectorSource, when set, supplies the local vectors.db active generation
 	// pushed as a phase at the end of Push. Nil disables the phase.
 	vectorSource VectorPushSource
+	// afterVectorApply is a full/scoped post-apply test hook.
+	afterVectorApply func()
+	// beforeVectorWitnessRecord is a generation-wide pre-witness test hook.
+	beforeVectorWitnessRecord func()
+	// afterVectorGenerationLookup is a scoped-promotion test hook.
+	afterVectorGenerationLookup func()
+	// afterScopedVectorApply is a scoped-retry test hook.
+	afterScopedVectorApply func()
 
 	closeOnce sync.Once
 	closeErr  error

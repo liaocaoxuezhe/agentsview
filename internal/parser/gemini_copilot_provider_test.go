@@ -87,6 +87,146 @@ func TestGeminiProviderSourceMethods(t *testing.T) {
 	require.Empty(t, fingerprint)
 }
 
+func TestGeminiProviderDiscoverEmptyRootSkipsProjectMap(t *testing.T) {
+	root := t.TempDir()
+	require.NoError(t, os.MkdirAll(
+		filepath.Join(root, "tmp", "unused-project", geminiChatsDir),
+		0o755,
+	))
+	writeSourceFile(t, filepath.Join(root, "projects.json"),
+		`{"projects":{"/projects/unused":"unused-project"}}`)
+
+	projectMapBuilds := 0
+	orig := buildGeminiProjectMap
+	buildGeminiProjectMap = func(string) map[string]string {
+		projectMapBuilds++
+		return map[string]string{}
+	}
+	t.Cleanup(func() { buildGeminiProjectMap = orig })
+
+	provider, ok := NewProvider(AgentGemini, ProviderConfig{Roots: []string{root}})
+	require.True(t, ok)
+	discovered, err := provider.Discover(t.Context())
+	require.NoError(t, err)
+	assert.Empty(t, discovered)
+	assert.Zero(t, projectMapBuilds)
+}
+
+func TestGeminiProviderDiscoverEachEmptyRootSkipsProjectMap(t *testing.T) {
+	root := t.TempDir()
+	require.NoError(t, os.MkdirAll(
+		filepath.Join(root, "tmp", "unused-project", geminiChatsDir),
+		0o755,
+	))
+	writeSourceFile(t, filepath.Join(root, "trustedFolders.json"),
+		`{"trustedFolders":["/projects/unused"]}`)
+
+	diskMapBuilds := 0
+	orig := newGeminiDiscoveryMap
+	newGeminiDiscoveryMap = func(ctx context.Context) (*discoveryDiskMap, error) {
+		diskMapBuilds++
+		return newDiscoveryDiskMapForContext(ctx)
+	}
+	t.Cleanup(func() { newGeminiDiscoveryMap = orig })
+
+	provider, ok := NewProvider(AgentGemini, ProviderConfig{Roots: []string{root}})
+	require.True(t, ok)
+	discoverer, ok := provider.(StreamingDiscoverer)
+	require.True(t, ok)
+	var discovered []SourceRef
+	err := discoverer.DiscoverEach(t.Context(), func(source SourceRef) error {
+		discovered = append(discovered, source)
+		return nil
+	})
+	require.NoError(t, err)
+	assert.Empty(t, discovered)
+	assert.Zero(t, diskMapBuilds)
+}
+
+func TestGeminiProviderDiscoverEachBuildsOneProjectMapForSessions(t *testing.T) {
+	root := t.TempDir()
+	writeSourceFile(t, filepath.Join(root, "projects.json"),
+		`{"projects":{"/projects/used":"used-project"}}`)
+	for _, name := range []string{
+		"session-2026-06-19T12-00-first.json",
+		"session-2026-06-19T12-01-second.jsonl",
+	} {
+		writeSourceFile(t, filepath.Join(root, "tmp", "used-project", geminiChatsDir, name), "{}")
+	}
+
+	diskMapBuilds := 0
+	orig := newGeminiDiscoveryMap
+	newGeminiDiscoveryMap = func(ctx context.Context) (*discoveryDiskMap, error) {
+		diskMapBuilds++
+		return newDiscoveryDiskMapForContext(ctx)
+	}
+	t.Cleanup(func() { newGeminiDiscoveryMap = orig })
+
+	provider, ok := NewProvider(AgentGemini, ProviderConfig{Roots: []string{root}})
+	require.True(t, ok)
+	discoverer, ok := provider.(StreamingDiscoverer)
+	require.True(t, ok)
+	var discovered []SourceRef
+	err := discoverer.DiscoverEach(t.Context(), func(source SourceRef) error {
+		discovered = append(discovered, source)
+		return nil
+	})
+	require.NoError(t, err)
+	require.Len(t, discovered, 2)
+	assert.Equal(t, "used", discovered[0].ProjectHint)
+	assert.Equal(t, "used", discovered[1].ProjectHint)
+	assert.Equal(t, 1, diskMapBuilds)
+}
+
+func TestGeminiProviderReconciliationProjectMapWorkIsArchiveBounded(t *testing.T) {
+	var projectMapBuilds int
+	orig := buildGeminiProjectMap
+	buildGeminiProjectMap = func(string) map[string]string {
+		projectMapBuilds++
+		return map[string]string{}
+	}
+	t.Cleanup(func() { buildGeminiProjectMap = orig })
+
+	for _, sourceCount := range []int{1, 64} {
+		t.Run(fmt.Sprintf("sources_%d", sourceCount), func(t *testing.T) {
+			root := t.TempDir()
+			sourcePaths := make([]string, sourceCount)
+			for i := range sourcePaths {
+				sourcePaths[i] = filepath.Join(
+					root,
+					"tmp",
+					fmt.Sprintf("project-hash-%03d", i),
+					geminiChatsDir,
+					fmt.Sprintf("session-2026-06-19T12-%02d-source.json", i),
+				)
+				writeSourceFile(t, sourcePaths[i], "{}")
+			}
+
+			provider, ok := NewProvider(AgentGemini, ProviderConfig{
+				Roots: []string{root},
+			})
+			require.True(t, ok)
+			resolver, ok := provider.(ReconciliationSourceResolver)
+			require.True(t, ok)
+
+			projectMapBuilds = 0
+			for i, path := range sourcePaths {
+				project := fmt.Sprintf("spooled_project_%d", i)
+				source, found, err := resolver.SourceForReconciliation(
+					t.Context(), path, project,
+				)
+				require.NoError(t, err)
+				require.True(t, found)
+				assert.Equal(t, path, source.DisplayPath)
+				assert.Equal(t, path, source.FingerprintKey)
+				assert.Equal(t, project, source.ProjectHint)
+			}
+			assert.Zero(t, projectMapBuilds,
+				"exact reconciliation must not rebuild root-wide metadata per source")
+		})
+	}
+}
+
 func TestGeminiProviderProjectMetadataChangesClassifyAndFingerprint(t *testing.T) {
 	root := t.TempDir()
 	sessionID := "gemini-project-metadata"

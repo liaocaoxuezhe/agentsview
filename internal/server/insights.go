@@ -13,6 +13,7 @@ import (
 	"github.com/danielgtaylor/huma/v2"
 	"go.kenn.io/agentsview/internal/db"
 	"go.kenn.io/agentsview/internal/insight"
+	"go.kenn.io/agentsview/internal/money"
 	"go.kenn.io/agentsview/internal/timeutil"
 )
 
@@ -196,8 +197,9 @@ func (s *Server) generateCannedInsight(
 	if !status("building_payload") {
 		return
 	}
+	generationOptions := s.currentInsightGenerateOptions(ctx)
 	payload, aggregateHash, cacheKey, err := s.buildCannedPayload(
-		ctx, kind, req,
+		ctx, kind, req, generationOptions,
 	)
 	if err != nil {
 		log.Printf("canned insight payload error: %v", err)
@@ -242,6 +244,9 @@ func (s *Server) generateCannedInsight(
 		ctx, 3*time.Minute,
 	)
 	defer cancel()
+	genCtx = context.WithValue(
+		genCtx, insightGenerationOptionsContextKey{}, generationOptions,
+	)
 	result, err := s.generateStreamFunc(
 		genCtx, req.Agent, prompt, nil,
 	)
@@ -392,6 +397,7 @@ func (s *Server) buildCannedPayload(
 	ctx context.Context,
 	kind insight.CannedKind,
 	req generateInsightRequest,
+	generationOptions insight.GenerateOptions,
 ) (insight.CannedAggregatePayload, string, string, error) {
 	filters := insight.CannedSessionFilters{
 		Timezone:       "UTC",
@@ -440,6 +446,10 @@ func (s *Server) buildCannedPayload(
 	if err != nil {
 		return insight.CannedAggregatePayload{}, "", "", err
 	}
+	modelBreakdowns, err := foldCannedModelBreakdowns(usageResult.Daily)
+	if err != nil {
+		return insight.CannedAggregatePayload{}, "", "", err
+	}
 	usageSummary := &insight.CannedUsageSummary{
 		InputTokens:         usageResult.Totals.InputTokens,
 		OutputTokens:        usageResult.Totals.OutputTokens,
@@ -447,7 +457,7 @@ func (s *Server) buildCannedPayload(
 		CacheReadTokens:     usageResult.Totals.CacheReadTokens,
 		TotalCost:           usageResult.Totals.TotalCost,
 		CacheSavings:        usageResult.Totals.CacheSavings,
-		ModelBreakdowns:     foldCannedModelBreakdowns(usageResult.Daily),
+		ModelBreakdowns:     modelBreakdowns,
 		TopSessionsByCost:   topSessions,
 	}
 	coachSessions, err := s.listCannedCoachSessions(ctx, req)
@@ -481,6 +491,7 @@ func (s *Server) buildCannedPayload(
 		req.Agent, req.Prompt, aggregateHash,
 		filters.AutomatedScope,
 		filters,
+		generationOptions,
 	)
 	if err != nil {
 		return insight.CannedAggregatePayload{}, "", "", err
@@ -490,13 +501,13 @@ func (s *Server) buildCannedPayload(
 
 func foldCannedModelBreakdowns(
 	daily []db.DailyUsageEntry,
-) []insight.CannedModelBreakdown {
+) ([]insight.CannedModelBreakdown, error) {
 	type modelAccum struct {
 		inputTok  int
 		outputTok int
 		cacheCr   int
 		cacheRd   int
-		cost      float64
+		cost      money.Money
 	}
 	byModel := make(map[string]*modelAccum)
 	for _, day := range daily {
@@ -510,7 +521,11 @@ func foldCannedModelBreakdowns(
 			acc.outputTok += model.OutputTokens
 			acc.cacheCr += model.CacheCreationTokens
 			acc.cacheRd += model.CacheReadTokens
-			acc.cost += model.Cost
+			var err error
+			acc.cost, err = money.Add(acc.cost, model.Cost)
+			if err != nil {
+				return nil, fmt.Errorf("summing canned insight model cost: %w", err)
+			}
 		}
 	}
 	out := make([]insight.CannedModelBreakdown, 0, len(byModel))
@@ -525,12 +540,12 @@ func foldCannedModelBreakdowns(
 		})
 	}
 	sort.Slice(out, func(i, j int) bool {
-		if out[i].Cost != out[j].Cost {
-			return out[i].Cost > out[j].Cost
+		if out[i].Cost.Microdollars != out[j].Cost.Microdollars {
+			return out[i].Cost.Microdollars > out[j].Cost.Microdollars
 		}
 		return out[i].ModelName < out[j].ModelName
 	})
-	return out
+	return out, nil
 }
 
 func (s *Server) listCannedCoachSessions(

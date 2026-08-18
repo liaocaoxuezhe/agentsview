@@ -1,13 +1,17 @@
+import { SESSION_FILTER_KEYS } from "./sessionRouteParams.js";
+
 export type Route =
   | "sessions"
   | "usage"
   | "token-usage"
   | "activity"
   | "trends"
-  | "insights"
+  | "recall"
+  | "quality"
   | "pinned"
   | "trash"
   | "recent-edits"
+  | "data"
   | "settings";
 
 const VALID_ROUTES: ReadonlySet<string> = new Set<Route>([
@@ -16,10 +20,12 @@ const VALID_ROUTES: ReadonlySet<string> = new Set<Route>([
   "token-usage",
   "activity",
   "trends",
-  "insights",
+  "recall",
+  "quality",
   "pinned",
   "trash",
   "recent-edits",
+  "data",
   "settings",
 ]);
 
@@ -37,6 +43,7 @@ export function parsePath(): {
   route: Route;
   sessionId: string | null;
   params: Record<string, string>;
+  isRootPath: boolean;
 } {
   const basePath = getBasePath();
   let pathname = window.location.pathname;
@@ -44,6 +51,7 @@ export function parsePath(): {
     pathname = pathname.slice(basePath.length);
   }
   if (!pathname.startsWith("/")) pathname = "/" + pathname;
+  const isRootPath = pathname === "/";
 
   const segments = pathname
     .split("/")
@@ -66,33 +74,17 @@ export function parsePath(): {
     new URLSearchParams(window.location.search),
   );
 
-  return { route, sessionId, params };
+  return { route, sessionId, params, isRootPath };
 }
 
 /** Params that are not part of routing but must survive navigations. */
 const STICKY_PARAMS = new Set(["desktop"]);
-const SESSION_ROUTE_PARAMS = new Set([
-  "project",
-  "machine",
-  "agent",
-  "termination",
-  "date",
-  "date_from",
-  "date_to",
-  "active_since",
-  "exclude_project",
-  "min_messages",
-  "max_messages",
-  "min_user_messages",
-  "include_one_shot",
-  "include_automated",
-  "window_days",
-]);
 
 export class RouterStore {
   route: Route = $state("sessions");
   params: Record<string, string> = $state({});
   sessionId: string | null = $state(null);
+  isRootPath: boolean = $state(false);
   #onPopState: () => void;
   #stickyParams: Record<string, string>;
 
@@ -101,6 +93,7 @@ export class RouterStore {
     this.route = initial.route;
     this.params = initial.params;
     this.sessionId = initial.sessionId;
+    this.isRootPath = initial.isRootPath;
 
     this.#stickyParams = {};
     for (const [k, v] of Object.entries(initial.params)) {
@@ -114,6 +107,7 @@ export class RouterStore {
       this.route = parsed.route;
       this.params = parsed.params;
       this.sessionId = parsed.sessionId;
+      this.isRootPath = parsed.isRootPath;
       this.#replaceSticky(parsed.params);
     };
     window.addEventListener("popstate", this.#onPopState);
@@ -161,7 +155,7 @@ export class RouterStore {
     if (this.route !== "sessions") return {};
     const params: Record<string, string> = {};
     for (const [key, value] of Object.entries(this.params)) {
-      if (SESSION_ROUTE_PARAMS.has(key)) {
+      if (SESSION_FILTER_KEYS.has(key)) {
         params[key] = value;
       }
     }
@@ -180,6 +174,14 @@ export class RouterStore {
       ...current,
       ...(params ?? {}),
     };
+  }
+
+  /** Build an href for a route link (includes sticky params). */
+  buildHref(
+    route: Route,
+    params: Record<string, string> = {},
+  ): string {
+    return this.#buildUrl(`/${route}`, params);
   }
 
   /** Build an href for a session link (includes sticky params). */
@@ -208,8 +210,22 @@ export class RouterStore {
     this.route = route;
     this.params = { ...this.#stickyParams, ...params };
     this.sessionId = null;
+    this.isRootPath = false;
     window.history.pushState(null, "", url);
     return true;
+  }
+
+  replace(
+    route: Route,
+    params: Record<string, string> = {},
+  ): void {
+    const url = this.#buildUrl(`/${route}`, params);
+    this.#updateSticky(params);
+    this.route = route;
+    this.params = { ...this.#stickyParams, ...params };
+    this.sessionId = null;
+    this.isRootPath = false;
+    window.history.replaceState(null, "", url);
   }
 
   navigateToSessions(
@@ -236,6 +252,7 @@ export class RouterStore {
     this.route = "sessions";
     this.params = { ...this.#stickyParams, ...nextParams };
     this.sessionId = id;
+    this.isRootPath = false;
     window.history.pushState(null, "", url);
   }
 
@@ -247,6 +264,7 @@ export class RouterStore {
     this.route = "sessions";
     this.params = { ...this.#stickyParams, ...params };
     this.sessionId = null;
+    this.isRootPath = false;
     window.history.pushState(null, "", url);
   }
 
@@ -258,6 +276,7 @@ export class RouterStore {
     const url = this.#buildUrl(path, params);
     this.#updateSticky(params);
     this.params = { ...this.#stickyParams, ...params };
+    this.isRootPath = false;
     window.history.replaceState(null, "", url);
   }
 }

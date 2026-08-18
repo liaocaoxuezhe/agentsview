@@ -16,8 +16,10 @@
   import {
     ActivityIcon,
     ChartColumnIcon,
+    DatabaseIcon,
     Grid2x2Icon,
     LayoutGridIcon,
+    LightbulbIcon,
     LogsIcon,
     PencilIcon,
     PinIcon,
@@ -74,7 +76,6 @@
         )
       : SIDEBAR_WIDTH_DEFAULT,
   );
-
   function handleBackdropClick() {
     ui.closeSidebar();
   }
@@ -299,6 +300,7 @@
   {/if}
 
   <aside
+    id="session-sidebar"
     class="sidebar"
     class:open={ui.sidebarOpen}
     style:width={isDesktop ? `${sidebarWidth}px` : undefined}
@@ -338,6 +340,14 @@
       </button>
       <button
         class="mobile-nav-btn"
+        class:active={router.route === "recall"}
+        onclick={() => mobileNav("recall")}
+      >
+        <LightbulbIcon size="12" strokeWidth="2" aria-hidden="true" />
+        {m.nav_recall()}
+      </button>
+      <button
+        class="mobile-nav-btn"
         class:active={router.route === "pinned"}
         onclick={() => mobileNav("pinned")}
       >
@@ -346,11 +356,11 @@
       </button>
       <button
         class="mobile-nav-btn"
-        class:active={router.route === "insights"}
-        onclick={() => mobileNav("insights")}
+        class:active={router.route === "quality"}
+        onclick={() => mobileNav("quality")}
       >
         <LogsIcon size="12" strokeWidth="2" aria-hidden="true" />
-        {m.nav_insights()}
+        {m.nav_quality()}
       </button>
       <button
         class="mobile-nav-btn"
@@ -367,6 +377,14 @@
       >
         <PencilIcon size="12" strokeWidth="2" aria-hidden="true" />
         {m.nav_recent_edits()}
+      </button>
+      <button
+        class="mobile-nav-btn"
+        class:active={router.route === "data"}
+        onclick={() => mobileNav("data")}
+      >
+        <DatabaseIcon size="12" strokeWidth="2" aria-hidden="true" />
+        {m.nav_data()}
       </button>
     </nav>
     {@render sidebar()}

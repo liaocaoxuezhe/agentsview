@@ -592,7 +592,7 @@ func loadPushMessageTokenFingerprints(
 		SELECT session_id, ordinal, model, token_usage, context_tokens,
 			output_tokens, has_context_tokens, has_output_tokens,
 			claude_message_id, claude_request_id,
-			source_type, source_subtype, source_uuid,
+			source_type, source_subtype, prompt_source, source_uuid,
 			source_parent_uuid, is_sidechain, is_compact_boundary
 		 FROM messages
 		WHERE session_id = ANY($1)
@@ -610,13 +610,13 @@ func loadPushMessageTokenFingerprints(
 		var model, tokenUsage string
 		var hasContextTokens, hasOutputTokens bool
 		var claudeMsgID, claudeReqID string
-		var srcType, srcSubtype, srcUUID, srcParentUUID string
+		var srcType, srcSubtype, promptSource, srcUUID, srcParentUUID string
 		var isSidechain, isCompactBoundary bool
 		if err := rows.Scan(
 			&sessionID, &ordinal, &model, &tokenUsage, &contextTokens,
 			&outputTokens, &hasContextTokens, &hasOutputTokens,
 			&claudeMsgID, &claudeReqID,
-			&srcType, &srcSubtype, &srcUUID, &srcParentUUID,
+			&srcType, &srcSubtype, &promptSource, &srcUUID, &srcParentUUID,
 			&isSidechain, &isCompactBoundary,
 		); err != nil {
 			return err
@@ -629,7 +629,7 @@ func loadPushMessageTokenFingerprints(
 		fmt.Fprintf(
 			b,
 			"%d|%d:%s|%d:%s|%d|%d|%t|%t|%s|%s|"+
-				"%d:%s|%d:%s|%d:%s|%d:%s|%t|%t;",
+				"%d:%s|%d:%s|%d:%s|%d:%s|%d:%s|%t|%t;",
 			ordinal,
 			len(model), model,
 			len(tokenUsage), tokenUsage,
@@ -638,6 +638,7 @@ func loadPushMessageTokenFingerprints(
 			claudeMsgID, claudeReqID,
 			len(srcType), srcType,
 			len(srcSubtype), srcSubtype,
+			len(promptSource), promptSource,
 			len(srcUUID), srcUUID,
 			len(srcParentUUID), srcParentUUID,
 			isSidechain, isCompactBoundary,
@@ -758,7 +759,7 @@ func loadPushUsageEventFingerprints(
 		SELECT session_id, message_ordinal, source, model,
 			input_tokens, output_tokens,
 			cache_creation_input_tokens, cache_read_input_tokens,
-			reasoning_tokens, cost_usd, cost_status, cost_source,
+			reasoning_tokens, cost_microdollars, cost_status, cost_source,
 			occurred_at, dedup_key
 		 FROM usage_events
 		WHERE session_id = ANY($1)
@@ -777,7 +778,7 @@ func loadPushUsageEventFingerprints(
 		var inputTokens, outputTokens int
 		var cacheCreationInputTokens, cacheReadInputTokens int
 		var reasoningTokens int
-		var cost sql.NullFloat64
+		var cost sql.NullInt64
 		var occurredAt sql.NullTime
 		var dedupKey sql.NullString
 		if err := rows.Scan(
@@ -800,7 +801,7 @@ func loadPushUsageEventFingerprints(
 		}
 		fmt.Fprintf(
 			b,
-			"%t|%d|%d:%s|%d:%s|%d|%d|%d|%d|%d|%t|%g|%d:%s|%d:%s|%d:%s|%d:%s;",
+			"%t|%d|%d:%s|%d:%s|%d|%d|%d|%d|%d|%t|%d|%d:%s|%d:%s|%d:%s|%d:%s;",
 			ordinal.Valid,
 			ordinal.Int64,
 			len(source), source,
@@ -811,7 +812,7 @@ func loadPushUsageEventFingerprints(
 			cacheReadInputTokens,
 			reasoningTokens,
 			cost.Valid,
-			cost.Float64,
+			cost.Int64,
 			len(costStatus), costStatus,
 			len(costSource), costSource,
 			len(occurred), occurred,

@@ -22,14 +22,19 @@
   import TopSessions from "./TopSessions.svelte";
   import ActiveFilters from "./ActiveFilters.svelte";
   import SessionFilterControl from "../filters/SessionFilterControl.svelte";
+  import SidebarToggleButton from "../layout/SidebarToggleButton.svelte";
   import FilterDropdown from "../usage/FilterDropdown.svelte";
-  import { analytics } from "../../stores/analytics.svelte.js";
+  import {
+    analytics,
+    ANALYTICS_DEFAULT_WINDOW_DAYS,
+  } from "../../stores/analytics.svelte.js";
   import { analyticsPageDates } from "../../stores/analyticsPageDates.js";
   import {
     sessions,
     filtersToParams,
   } from "../../stores/sessions.svelte.js";
   import { events } from "../../stores/events.svelte.js";
+  import { starred } from "../../stores/starred.svelte.js";
   import { ui } from "../../stores/ui.svelte.js";
   import { sync } from "../../stores/sync.svelte.js";
   import { router } from "../../stores/router.svelte.js";
@@ -45,6 +50,18 @@
   import { exportAnalyticsCSV } from "../../utils/csv-export.js";
   import RefreshControl from "../shared/RefreshControl.svelte";
   import { m } from "../../i18n/index.js";
+
+  interface Props {
+    suppressSessionDateRestore?: boolean;
+    suppressSessionDateRefresh?: boolean;
+    onSessionDateRestoreSuppressed?: () => void;
+  }
+
+  let {
+    suppressSessionDateRestore = false,
+    suppressSessionDateRefresh = false,
+    onSessionDateRestoreSuppressed,
+  }: Props = $props();
 
   const SESSION_ANALYTICS_WINDOW_PARAM = "window_days";
 
@@ -175,11 +192,16 @@
   function writeSessionDateParams(state: PanelDateState): void {
     const sessionChanged = syncSessionFiltersForDateState(state);
     const params = filtersToParams(sessions.filters);
+    if (starred.filterOnly) params.starred = "true";
     delete params[SESSION_ANALYTICS_WINDOW_PARAM];
     if (state.mode === "rolling" && state.windowDays) {
       params[SESSION_ANALYTICS_WINDOW_PARAM] = String(state.windowDays);
     }
-    router.replaceParams(params);
+    if (router.isRootPath) {
+      router.navigateToSessions(params);
+    } else {
+      router.replaceParams(params);
+    }
     if (sessionChanged) sessions.load();
   }
 
@@ -220,6 +242,7 @@
 
   function refreshAnalytics(): Promise<void> {
     const refresh = analytics.fetchAll();
+    if (router.isRootPath || suppressSessionDateRefresh) return refresh;
     const state = currentAnalyticsPanelDate();
     if (state && !analyticsDateYokeIsClear()) {
       yokedDates.updateFromPanel(state);
@@ -398,6 +421,19 @@
     const earliestSession = sync.stats?.earliest_session ?? undefined;
     untrack(() => {
       if (route !== "sessions") return;
+      if (router.isRootPath) {
+        if (lastAnalyticsDateUrlSignature !== "root-landing") {
+          analytics.applyRollingWindow(
+            ANALYTICS_DEFAULT_WINDOW_DAYS,
+          );
+          analytics.fetchAll();
+        }
+        lastAnalyticsDateUrlSignature = "root-landing";
+        analyticsDateUrlInitRan = false;
+        analyticsDateUrlInitComplete = false;
+        sessionDateIntentEstablished = false;
+        return;
+      }
 
       const fixedState = sessionParamsToPanelDate(params, {
         earliest: earliestSession,
@@ -434,15 +470,20 @@
         }
         let changed = false;
         if (firstRun) {
-          const seed = yokedDates.seedForPanel();
-          const retained = seed
-            ? null
-            : analyticsPageDates.restoreWithIntent("sessions");
-          state = seed
-            ? rangeToPanelDate(seed)
-            : retained?.state ?? null;
-          sessionDateIntentEstablished = seed !== null ||
-            retained?.explicitDateIntent === true;
+          if (suppressSessionDateRestore) {
+            sessionDateIntentEstablished = false;
+            onSessionDateRestoreSuppressed?.();
+          } else {
+            const seed = yokedDates.seedForPanel();
+            const retained = seed
+              ? null
+              : analyticsPageDates.restoreWithIntent("sessions");
+            state = seed
+              ? rangeToPanelDate(seed)
+              : retained?.state ?? null;
+            sessionDateIntentEstablished = seed !== null ||
+              retained?.explicitDateIntent === true;
+          }
           if (state) {
             changed = applyAnalyticsPanelDate(state);
             if (sessionDateIntentEstablished) {
@@ -508,8 +549,12 @@
 
 <div class="analytics-page">
   <div class="analytics-toolbar">
-    {#if !ui.sidebarOpen}
-      <div class="toolbar-filter-anchor">
+    {#if !ui.isMobileViewport && !ui.sidebarOpen}
+      <div
+        class="toolbar-filter-anchor"
+        data-sidebar-focus-region="content"
+      >
+        <SidebarToggleButton placement="content" />
         <SessionFilterControl
           showDisplay={false}
           showStarred={false}

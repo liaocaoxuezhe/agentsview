@@ -11,7 +11,9 @@ import (
 	"strings"
 	"time"
 
+	"go.kenn.io/agentsview/internal/activity"
 	"go.kenn.io/agentsview/internal/export"
+	"go.kenn.io/agentsview/internal/money"
 	"go.kenn.io/agentsview/internal/parser"
 	pricingpkg "go.kenn.io/agentsview/internal/pricing"
 )
@@ -22,18 +24,36 @@ const CopilotReportedCostSource = "copilot-reported"
 
 // aiCreditUSD is the USD value of one AI credit for agents whose cost
 // is denominated in AI credits (the AICreditsDenominated capability).
-const aiCreditUSD = 0.01
+const microdollarsPerAICredit = 10_000
 
 // AICreditsFromCost converts a USD cost into AI credits when the
 // agent's cost is denominated in AI credits, and returns 0 otherwise.
 // It is the single home of the credit conversion shared by the SQLite,
 // PostgreSQL, and DuckDB usage paths; a per-agent credit rate would
 // slot in here rather than at each accumulation site.
-func AICreditsFromCost(agent string, costUSD float64) float64 {
-	if costUSD == 0 || !parser.AgentNameUsesAICredits(agent) {
+func AICreditsFromCost(agent string, cost money.Money) float64 {
+	if cost.Microdollars == 0 || !parser.AgentNameUsesAICredits(agent) {
 		return 0
 	}
-	return costUSD / aiCreditUSD
+	return float64(cost.Microdollars) / microdollarsPerAICredit
+}
+
+// microdollarsPerDollar converts Money.Microdollars to float64 dollars
+// for the deprecated CostUSD compatibility field.
+const microdollarsPerDollar = 1_000_000.0
+
+// CostUSDFromCost renders cost as float64 dollars for the deprecated
+// SessionUsage.CostUSD compatibility field, or nil when hasCost is
+// false. It is the single place that performs the microdollars-to-
+// dollars conversion, so the SQLite, PostgreSQL, and DuckDB session
+// usage paths and the subagent rollup combiner all report an
+// identical value for the same cost.
+func CostUSDFromCost(hasCost bool, cost money.Money) *float64 {
+	if !hasCost {
+		return nil
+	}
+	usd := float64(cost.Microdollars) / microdollarsPerDollar
+	return &usd
 }
 
 // NoTokenData reports whether a daily-usage total carries neither token
@@ -45,7 +65,7 @@ func NoTokenData(t UsageTotals) bool {
 		t.OutputTokens == 0 &&
 		t.CacheCreationTokens == 0 &&
 		t.CacheReadTokens == 0 &&
-		t.TotalCost == 0 &&
+		t.TotalCost.Microdollars == 0 &&
 		t.CopilotAICredits == 0
 }
 
@@ -80,6 +100,9 @@ type UsageFilter struct {
 	// TopSessionsSort ranks GetTopSessionsByCost results: ""/"cost"
 	// (default) or "tokens". Ignored by other usage queries.
 	TopSessionsSort string
+	// TopSessionsTokenTypes selects the counters used for token ranking.
+	// The zero value means all token types.
+	TopSessionsTokenTypes UsageTokenTypes
 }
 
 // ProjectFilterLabels returns exact include labels when present, otherwise it
@@ -397,7 +420,7 @@ SELECT
 		WHEN json_valid(m.token_usage) THEN COALESCE(CAST(json_extract(m.token_usage, '$.reasoning_tokens') AS INTEGER), 0)
 		ELSE 0
 	END AS reasoning_tokens,
-	NULL AS cost_usd,
+	NULL AS cost_microdollars,
 	'' AS cost_status,
 	'' AS cost_source,
 	m.claude_message_id,
@@ -431,7 +454,7 @@ SELECT
 	ue.cache_creation_input_tokens,
 	ue.cache_read_input_tokens,
 	ue.reasoning_tokens,
-	ue.cost_usd,
+	ue.cost_microdollars,
 	ue.cost_status,
 	ue.cost_source,
 	'' AS claude_message_id,
@@ -480,7 +503,7 @@ SELECT
 		WHEN json_valid(m.token_usage) THEN COALESCE(CAST(json_extract(m.token_usage, '$.reasoning_tokens') AS INTEGER), 0)
 		ELSE 0
 	END AS reasoning_tokens,
-	NULL AS cost_usd,
+	NULL AS cost_microdollars,
 	'' AS cost_source,
 	m.claude_message_id,
 	m.claude_request_id,
@@ -507,7 +530,7 @@ SELECT
 	ue.cache_creation_input_tokens,
 	ue.cache_read_input_tokens,
 	ue.reasoning_tokens,
-	ue.cost_usd,
+	ue.cost_microdollars,
 	ue.cost_source,
 	'' AS claude_message_id,
 	'' AS claude_request_id,
@@ -539,7 +562,7 @@ SELECT
 		WHEN json_valid(m.token_usage) THEN COALESCE(CAST(json_extract(m.token_usage, '$.reasoning_tokens') AS INTEGER), 0)
 		ELSE 0
 	END AS reasoning_tokens,
-	NULL AS cost_usd,
+	NULL AS cost_microdollars,
 	'' AS cost_source,
 	m.claude_message_id,
 	m.claude_request_id,
@@ -565,7 +588,7 @@ SELECT
 	ue.cache_creation_input_tokens,
 	ue.cache_read_input_tokens,
 	ue.reasoning_tokens,
-	ue.cost_usd,
+	ue.cost_microdollars,
 	ue.cost_source,
 	'' AS claude_message_id,
 	'' AS claude_request_id,
@@ -624,7 +647,7 @@ usage_event_timestamp_rows AS MATERIALIZED (
 			ue.cache_creation_input_tokens,
 			ue.cache_read_input_tokens,
 			ue.reasoning_tokens,
-			ue.cost_usd,
+			ue.cost_microdollars,
 			ue.cost_source,
 		ue.dedup_key
 	FROM usage_events ue
@@ -673,7 +696,7 @@ type usageScanRow struct {
 	cacheCreationInputTokens int
 	cacheReadInputTokens     int
 	reasoningTokens          int
-	costUSD                  sql.NullFloat64
+	cost                     sql.NullInt64
 	costStatus               string
 	costSource               string
 	claudeMessageID          string
@@ -698,12 +721,13 @@ type dailyUsageScanRow struct {
 	ts                       string
 	model                    string
 	tokenJSON                string
+	webSearchRequests        sql.NullInt64
 	inputTokens              int
 	outputTokens             int
 	cacheCreationInputTokens int
 	cacheReadInputTokens     int
 	reasoningTokens          int
-	costUSD                  sql.NullFloat64
+	cost                     sql.NullInt64
 	costSource               string
 	claudeMessageID          string
 	claudeRequestID          string
@@ -735,7 +759,7 @@ SELECT
 	u.cache_creation_input_tokens,
 	u.cache_read_input_tokens,
 	u.reasoning_tokens,
-	u.cost_usd,
+	u.cost_microdollars,
 	u.cost_status,
 	u.cost_source,
 	u.claude_message_id,
@@ -766,34 +790,84 @@ func dailyUsageRowSelectFromRows(rowsSQL string) string {
 	return dailyUsageRowSelectFromRowsWithMachine(rowsSQL, false)
 }
 
+// dailyUsageRowColumns names the per-row sources the daily usage select
+// reads: the session a row is attributed to, its billed web-search count,
+// and the session metadata reported alongside it.
+type dailyUsageRowColumns struct {
+	session   string
+	webSearch string
+	project   string
+	agent     string
+	machine   string
+}
+
 func dailyUsageRowSelectFromRowsWithMachine(
 	rowsSQL string, includeMachine bool,
 ) string {
+	return dailyUsageRowSelectFromRowsWithColumns(
+		rowsSQL, includeMachine, dailyUsageRowColumns{
+			session: "u.session_id",
+			webSearch: `CASE
+		WHEN u.usage_source = 'message' THEN MAX(COALESCE(CASE
+			WHEN json_valid(u.token_usage) THEN CAST(json_extract(
+				u.token_usage, '$.server_tool_use.web_search_requests'
+			) AS INTEGER)
+			ELSE agentsview_usage_web_search_requests(u.token_usage)
+		END, 0), 0)
+		ELSE 0
+	END`,
+			project: "u.project",
+			agent:   "u.agent",
+			machine: "u.machine",
+		})
+}
+
+// dailyUsageRowSelectFromSnapshotRowsWithMachine reads rows produced by
+// snapshotRankedDailyUsageRowsSQL, which already carry the attributed
+// session, its metadata, and the partition-wide web-search count (NULL
+// for rows that were not ranked, which the scanner parses in Go).
+func dailyUsageRowSelectFromSnapshotRowsWithMachine(
+	rowsSQL string, includeMachine bool,
+) string {
+	return dailyUsageRowSelectFromRowsWithColumns(
+		rowsSQL, includeMachine, dailyUsageRowColumns{
+			session:   "u.snapshot_attribution_session_id",
+			webSearch: "u.snapshot_web_search_requests",
+			project:   "u.snapshot_project",
+			agent:     "u.snapshot_agent",
+			machine:   "u.snapshot_machine",
+		})
+}
+
+func dailyUsageRowSelectFromRowsWithColumns(
+	rowsSQL string, includeMachine bool, cols dailyUsageRowColumns,
+) string {
 	machineColumn := ""
 	if includeMachine {
-		machineColumn = ",\n\tu.machine"
+		machineColumn = ",\n\t" + cols.machine + " AS machine"
 	}
 	return `
 SELECT
-	u.session_id,
+	` + cols.session + `,
 	u.message_ordinal,
 	u.usage_source,
 	u.ts,
 	u.model,
 	u.token_usage,
+	` + cols.webSearch + ` AS web_search_requests,
 	u.input_tokens,
 		u.output_tokens,
 		u.cache_creation_input_tokens,
 		u.cache_read_input_tokens,
-		u.reasoning_tokens,
-		u.cost_usd,
-		u.cost_source,
+	u.reasoning_tokens,
+	u.cost_microdollars,
+	u.cost_source,
 	u.claude_message_id,
 	u.claude_request_id,
 	u.source_uuid,
 	u.usage_dedup_key,
-	u.project,
-	u.agent` + machineColumn + `
+	` + cols.project + ` AS project,
+	` + cols.agent + ` AS agent` + machineColumn + `
 FROM (` + rowsSQL + `) u
 WHERE 1=1`
 }
@@ -949,7 +1023,16 @@ func usageRowQuery(f UsageFilter) (string, []any) {
 }
 
 func topSessionsUsageRowQuery(f UsageFilter) (string, []any) {
-	return usageRowQuery(f)
+	bounds := usageBoundsForFilter(f)
+	rowsSQL, rowsArgs := usageRowsSQLForBounds(
+		usageSnapshotInputFilter(f), bounds)
+	rowsSQL, args := snapshotRankedDailyUsageRowsSQL(
+		rowsSQL, rowsArgs, f, bounds)
+	return dailyUsageRowSelectFromSnapshotRowsWithMachine(rowsSQL, false), args
+}
+
+func usageSnapshotInputFilter(f UsageFilter) UsageFilter {
+	return UsageFilter{From: f.From, To: f.To, Timezone: f.Timezone}
 }
 
 const dailyCursorUsageRowsSQLTemplate = `
@@ -965,7 +1048,7 @@ SELECT
 	cu.cache_write_tokens AS cache_creation_input_tokens,
 	cu.cache_read_tokens AS cache_read_input_tokens,
 	0 AS reasoning_tokens,
-	cu.charged_cents / 100.0 AS cost_usd,
+	cu.charged_microdollars AS cost_microdollars,
 	'cursor-reported' AS cost_source,
 	'' AS claude_message_id,
 	'' AS claude_request_id,
@@ -1027,7 +1110,8 @@ func cursorUsageRowsSQLForBounds(
 func dailyUsageRowsSQLForBounds(
 	f UsageFilter, b usageBounds, hasCursorTable bool,
 ) (string, []any) {
-	sessionRowsSQL, sessionArgs := usageRowsSQLForBounds(f, b)
+	sessionRowsSQL, sessionArgs := usageRowsSQLForBounds(
+		usageSnapshotInputFilter(f), b)
 	if !hasCursorTable {
 		return sessionRowsSQL, sessionArgs
 	}
@@ -1040,6 +1124,231 @@ func dailyUsageRowsSQLForBounds(
 	args = append(args, sessionArgs...)
 	args = append(args, cursorArgs...)
 	return rowsSQL, args
+}
+
+func exactUsageUTCWindow(f UsageFilter) usageBounds {
+	loc := f.location()
+	var out usageBounds
+	if f.From != "" {
+		if from, err := time.ParseInLocation("2006-01-02", f.From, loc); err == nil {
+			out.from = from.UTC().Format(time.RFC3339Nano)
+		}
+	}
+	if f.To != "" {
+		if to, err := time.ParseInLocation("2006-01-02", f.To, loc); err == nil {
+			out.to = to.AddDate(0, 0, 1).UTC().Format(time.RFC3339Nano)
+		}
+	}
+	return out
+}
+
+// snapshotRankedDailyUsageRowsSQL wraps rowsSQL so that each Claude request
+// (claude_message_id, claude_request_id) contributes one row: the greatest
+// output snapshot, attributed to the session that streamed the request
+// first, carrying the maximum billed web-search count across its snapshots.
+// Rows without complete Claude request identity bypass the ranking.
+//
+// Only requests that appear more than once are ranked. usage_snapshot_dups
+// finds them with an index-only pass over messages, usage_snapshot_ranked
+// runs the window functions over just those rows, and every other row
+// passes through with itself as attribution and a NULL web-search count that
+// the scanner parses from token_usage in Go. Ranking every row through the
+// window functions cost two to five times the underlying scan, because
+// SQLite sorts and materializes the full-width rows once per window.
+//
+// rowsArgs are the placeholders of rowsSQL; the returned args carry them in
+// position with the ranking's own placeholders. Callers finish with
+// dailyUsageRowSelectFromSnapshotRowsWithMachine.
+func snapshotRankedDailyUsageRowsSQL(
+	rowsSQL string, rowsArgs []any, f UsageFilter, b usageBounds,
+) (string, []any) {
+	windowWhere, windowArgs := usageSnapshotWindowWhere(f)
+	dupsSQL, dupsArgs := usageSnapshotDuplicateRequestsSQL(b)
+	claudeRowsSQL, claudeArgs := usageSnapshotClaudeMessageRowsSQL(b)
+	filterWhere := "1=1"
+	var filterArgs []any
+	filterWhere, filterArgs = f.appendUsageSourceFilterClauses(
+		filterWhere, filterArgs, "survivor.model")
+	filterWhere, filterArgs = f.appendUsageSessionFilterClauses(
+		filterWhere, filterArgs)
+	survivorFilter := ""
+	if filterWhere != "1=1" {
+		survivorFilter = `
+		LEFT JOIN sessions s
+			ON s.id = survivor.snapshot_attribution_session_id
+		WHERE survivor.snapshot_attribution_session_id = ''
+			OR (` + filterWhere + `)`
+	}
+	outputTokens := fmt.Sprintf(`MIN(MAX(COALESCE(CASE
+						WHEN json_valid(u.token_usage) THEN CAST(json_extract(
+							u.token_usage, '$.output_tokens') AS INTEGER)
+						ELSE agentsview_usage_output_tokens(u.token_usage)
+					END, 0), 0), %d)`, MaxPlausibleTokens)
+	webSearchRequests := `MAX(COALESCE(CASE
+					WHEN json_valid(u.token_usage) THEN CAST(json_extract(
+						u.token_usage, '$.server_tool_use.web_search_requests'
+					) AS INTEGER)
+					ELSE agentsview_usage_web_search_requests(u.token_usage)
+				END, 0), 0)`
+
+	args := make([]any, 0,
+		len(dupsArgs)+len(claudeArgs)+2*len(windowArgs)+
+			len(rowsArgs)+len(filterArgs))
+	args = append(args, dupsArgs...)
+	args = append(args, claudeArgs...)
+	args = append(args, windowArgs...)
+	args = append(args, rowsArgs...)
+	args = append(args, windowArgs...)
+	args = append(args, filterArgs...)
+	return fmt.Sprintf(`
+		WITH usage_snapshot_dups AS (%[1]s),
+		usage_snapshot_ranked AS (
+			SELECT u.session_id, u.message_ordinal,
+				FIRST_VALUE(u.session_id) OVER attribution
+					AS snapshot_attribution_session_id,
+				FIRST_VALUE(u.project) OVER attribution AS snapshot_project,
+				FIRST_VALUE(u.agent) OVER attribution AS snapshot_agent,
+				FIRST_VALUE(u.machine) OVER attribution AS snapshot_machine,
+				ROW_NUMBER() OVER ranking AS snapshot_rank,
+				MAX(%[5]s) OVER (
+					ranking ROWS BETWEEN UNBOUNDED PRECEDING
+						AND UNBOUNDED FOLLOWING
+				) AS snapshot_web_search_requests
+			FROM (%[2]s) u
+			WHERE %[3]s
+			WINDOW attribution AS (
+				PARTITION BY u.claude_message_id, u.claude_request_id
+				ORDER BY julianday(u.ts) IS NULL ASC,
+					julianday(u.ts) ASC, u.session_id ASC,
+					COALESCE(u.message_ordinal, -1) ASC,
+					CASE WHEN julianday(u.ts) IS NULL THEN u.ts ELSE '' END ASC
+			), ranking AS (
+				PARTITION BY u.claude_message_id, u.claude_request_id
+				ORDER BY %[4]s DESC,
+					julianday(u.ts) IS NULL ASC, julianday(u.ts) DESC,
+					u.session_id DESC, COALESCE(u.message_ordinal, -1) DESC,
+					CASE WHEN julianday(u.ts) IS NULL THEN u.ts ELSE '' END DESC
+			)
+		),
+		usage_snapshot_survivors AS (
+			SELECT u.*,
+				COALESCE(r.snapshot_attribution_session_id, u.session_id)
+					AS snapshot_attribution_session_id,
+				COALESCE(r.snapshot_project, u.project) AS snapshot_project,
+				COALESCE(r.snapshot_agent, u.agent) AS snapshot_agent,
+				COALESCE(r.snapshot_machine, u.machine) AS snapshot_machine,
+				r.snapshot_web_search_requests
+			FROM (%[6]s) u
+			LEFT JOIN usage_snapshot_ranked r
+				ON u.usage_source = 'message'
+				AND r.session_id = u.session_id
+				AND r.message_ordinal = u.message_ordinal
+			WHERE %[3]s
+				AND (r.snapshot_rank IS NULL OR r.snapshot_rank = 1)
+		)
+		SELECT survivor.*
+		FROM usage_snapshot_survivors survivor%[7]s`,
+		dupsSQL, claudeRowsSQL, windowWhere, outputTokens,
+		webSearchRequests, rowsSQL, survivorFilter), args
+}
+
+// usageSnapshotWindowWhere restricts rows to the filter's exact UTC window
+// so snapshots outside the requested dates neither win a partition nor
+// reach the scanner. Rows whose timestamp julianday cannot parse fall back
+// to a date-prefix comparison, mirroring the scanner's local-date filter.
+func usageSnapshotWindowWhere(f UsageFilter) (string, []any) {
+	window := exactUsageUTCWindow(f)
+	where := "1=1"
+	var args []any
+	if window.from != "" {
+		where += `
+			AND (
+				julianday(u.ts) >= julianday(?)
+				OR (julianday(u.ts) IS NULL AND substr(u.ts, 1, 10) >= ?)
+			)`
+		args = append(args, window.from, f.From)
+	}
+	if window.to != "" {
+		where += `
+			AND (
+				julianday(u.ts) < julianday(?)
+				OR (julianday(u.ts) IS NULL AND substr(u.ts, 1, 10) <= ?)
+			)`
+		args = append(args, window.to, f.To)
+	}
+	return where, args
+}
+
+// usageSnapshotClaudeIdentity selects the message rows that carry complete
+// Claude request identity and could enter the usage row source.
+const usageSnapshotClaudeIdentity = usageMessageSourceEligibility + `
+	AND m.claude_message_id != ''
+	AND m.claude_request_id != ''`
+
+// usageSnapshotDuplicateRequestsSQL lists the Claude requests that appear on
+// more than one eligible message. It over-approximates the ranked set (it
+// ignores session eligibility and the fallback session bounds), which only
+// sends extra rows through the ranking; the ranking itself applies the exact
+// row-source predicates. Bounded filters seek idx_messages_usage_covering
+// per timestamp branch so the pass stays proportional to the window;
+// unbounded filters read idx_messages_claude_snapshot in partition order.
+func usageSnapshotDuplicateRequestsSQL(b usageBounds) (string, []any) {
+	const key = `m.claude_message_id, m.claude_request_id`
+	if !b.bounded() {
+		return `
+			SELECT ` + key + `
+			FROM messages m
+			WHERE ` + usageSnapshotClaudeIdentity + `
+			GROUP BY ` + key + `
+			HAVING COUNT(*) > 1`, nil
+	}
+	timestampWhere, args := appendUsageColumnBounds(
+		usageSnapshotClaudeIdentity, "m.timestamp", b, nil)
+	return `
+			SELECT claude_message_id, claude_request_id
+			FROM (
+				SELECT ` + key + `
+				FROM messages m
+				WHERE ` + timestampWhere + `
+				UNION ALL
+				SELECT ` + key + `
+				FROM messages m
+				WHERE ` + usageSnapshotClaudeIdentity + `
+					AND m.timestamp IS NULL
+				UNION ALL
+				SELECT ` + key + `
+				FROM messages m
+				WHERE ` + usageSnapshotClaudeIdentity + `
+					AND m.timestamp = ''
+			)
+			GROUP BY claude_message_id, claude_request_id
+			HAVING COUNT(*) > 1`, args
+}
+
+// usageSnapshotClaudeMessageRowsSQL produces the row-source shape for the
+// messages of duplicated Claude requests, using the same eligibility and
+// bounds as usageRowsSQLForBounds's message branches so the ranked rows are
+// exactly the row source's Claude rows for those requests.
+func usageSnapshotClaudeMessageRowsSQL(b usageBounds) (string, []any) {
+	where := usageMessageEligibility + `
+	AND m.claude_message_id != ''
+	AND m.claude_request_id != ''
+	AND (m.claude_message_id, m.claude_request_id) IN (
+		SELECT claude_message_id, claude_request_id FROM usage_snapshot_dups
+	)`
+	var args []any
+	if b.bounded() {
+		timestampWhere, timestampArgs := appendUsageColumnBounds(
+			"m.timestamp IS NOT NULL AND m.timestamp != ''",
+			"m.timestamp", b, nil)
+		fallbackWhere, fallbackArgs := appendUsageColumnBounds(
+			"NULLIF(m.timestamp, '') IS NULL", "s.started_at", b, nil)
+		where += `
+	AND ((` + timestampWhere + `) OR (` + fallbackWhere + `))`
+		args = append(args, timestampArgs...)
+		args = append(args, fallbackArgs...)
+	}
+	return fmt.Sprintf(dailyUsageMessageRowsSQLTemplate, "messages", where), args
 }
 
 func scanUsageRow(rows *sql.Rows) (usageScanRow, error) {
@@ -1056,7 +1365,7 @@ func scanUsageRow(rows *sql.Rows) (usageScanRow, error) {
 		&r.cacheCreationInputTokens,
 		&r.cacheReadInputTokens,
 		&r.reasoningTokens,
-		&r.costUSD,
+		&r.cost,
 		&r.costStatus,
 		&r.costSource,
 		&r.claudeMessageID,
@@ -1091,12 +1400,13 @@ func scanDailyUsageRowWithMachine(
 		&r.ts,
 		&r.model,
 		&r.tokenJSON,
+		&r.webSearchRequests,
 		&r.inputTokens,
 		&r.outputTokens,
 		&r.cacheCreationInputTokens,
 		&r.cacheReadInputTokens,
 		&r.reasoningTokens,
-		&r.costUSD,
+		&r.cost,
 		&r.costSource,
 		&r.claudeMessageID,
 		&r.claudeRequestID,
@@ -1196,6 +1506,136 @@ func isUsageTokenCounterKey(key string) bool {
 	default:
 		return false
 	}
+}
+
+// usageServerToolUseKey is the nested object Anthropic reports server tool
+// use under, and usageWebSearchRequestsKey the billed web search count
+// inside it. Only Anthropic's wire format uses these names, so their
+// presence is what identifies a row as carrying Anthropic web search spend.
+const (
+	usageServerToolUseKey     = "server_tool_use"
+	usageWebSearchRequestsKey = "web_search_requests"
+)
+
+// parseUsageWebSearchRequests reads server_tool_use.web_search_requests out
+// of a stored token_usage blob. It is a separate scan from
+// parseUsageTokenCountersWithReasoning because the value is nested and is
+// not a token count: it must never be clamped or summed as tokens. Blobs
+// without the key exit on a substring check before any parsing.
+func parseUsageWebSearchRequests(tokenJSON string) int {
+	if !strings.Contains(tokenJSON, usageServerToolUseKey) {
+		return 0
+	}
+	serverToolUse, ok := usageObjectRawValue(tokenJSON, usageServerToolUseKey)
+	if !ok {
+		return 0
+	}
+	requests, ok := usageObjectInt(serverToolUse, usageWebSearchRequestsKey)
+	if !ok || requests < 0 {
+		return 0
+	}
+	return requests
+}
+
+// usageObjectRawValue returns the raw JSON text of want's value in a
+// top-level JSON object.
+func usageObjectRawValue(
+	tokenJSON, want string,
+) (string, bool) {
+	i := skipJSONSpace(tokenJSON, 0)
+	if i >= len(tokenJSON) || tokenJSON[i] != '{' {
+		return "", false
+	}
+	i++
+	for i < len(tokenJSON) {
+		i = skipJSONSpace(tokenJSON, i)
+		if i >= len(tokenJSON) || tokenJSON[i] == '}' {
+			return "", false
+		}
+		if tokenJSON[i] == ',' {
+			i++
+			continue
+		}
+		if tokenJSON[i] != '"' {
+			return "", false
+		}
+		key, next, ok := parseJSONString(tokenJSON, i)
+		if !ok {
+			return "", false
+		}
+		i = skipJSONSpace(tokenJSON, next)
+		if i >= len(tokenJSON) || tokenJSON[i] != ':' {
+			return "", false
+		}
+		i = skipJSONSpace(tokenJSON, i+1)
+		valueNext, ok := skipJSONValue(tokenJSON, i)
+		if !ok || valueNext <= i {
+			return "", false
+		}
+		if key == want {
+			return tokenJSON[i:valueNext], true
+		}
+		i = valueNext
+	}
+	return "", false
+}
+
+// usageObjectInt reads want's integer value out of a flat JSON object.
+func usageObjectInt(obj, want string) (int, bool) {
+	i := skipJSONSpace(obj, 0)
+	if i >= len(obj) || obj[i] != '{' {
+		return 0, false
+	}
+	i++
+	for i < len(obj) {
+		i = skipJSONSpace(obj, i)
+		if i >= len(obj) || obj[i] == '}' {
+			return 0, false
+		}
+		if obj[i] == ',' {
+			i++
+			continue
+		}
+		if obj[i] != '"' {
+			return 0, false
+		}
+		key, next, ok := parseJSONString(obj, i)
+		if !ok {
+			return 0, false
+		}
+		i = skipJSONSpace(obj, next)
+		if i >= len(obj) || obj[i] != ':' {
+			return 0, false
+		}
+		i = skipJSONSpace(obj, i+1)
+		if key == want {
+			value, _, ok := parseUsageTokenInt(obj, i)
+			return value, ok
+		}
+		valueNext, ok := skipJSONValue(obj, i)
+		if !ok || valueNext <= i {
+			return 0, false
+		}
+		i = valueNext
+	}
+	return 0, false
+}
+
+// usageRowWebSearchRequests returns how many billed Anthropic server-side
+// web searches a usage row reports. Only per-message rows carry a usage
+// blob; usage events never report server tool use.
+func usageRowWebSearchRequests(usageSource, tokenJSON string) int {
+	if usageSource != "message" {
+		return 0
+	}
+	return parseUsageWebSearchRequests(tokenJSON)
+}
+
+func dailyUsageRowWebSearchRequests(r dailyUsageScanRow) int {
+	if r.webSearchRequests.Valid {
+		return max(int(r.webSearchRequests.Int64), 0)
+	}
+	return usageRowWebSearchRequests(r.usageSource, r.tokenJSON)
 }
 
 func skipJSONSpace(tokenJSON string, i int) int {
@@ -1442,17 +1882,11 @@ func clampedUsageTokenCountersWithReasoning(
 		ClampPlausibleTokens(int64(reasoningTok))
 }
 
-// usageLookupModel returns the model name to price a usage row with.
-// Date-ambiguous Kimi aliases (kimi-for-coding, daimon-kimi-code,
-// daimon-kimi-messages) resolve to their canonical model for the row's
-// timestamp (K2.6 before pricing.KimiModelEraCutoff, K3 at/after it);
-// every other model passes through unchanged. Pricing lookups and
-// records both use the returned name, so the pricing block reports the
-// canonical model whose rates actually produced the cost.
+// usageLookupModel returns the canonical model used to price a usage row.
+// Kimi runtime aliases resolve to their fixed or timestamp-selected model;
+// all other model names pass through unchanged.
 func usageLookupModel(model, ts string) string {
-	if canonical := pricingpkg.CanonicalModelForTimestamp(
-		model, ts,
-	); canonical != "" {
+	if canonical := pricingpkg.CanonicalModelForTimestamp(model, ts); canonical != "" {
 		return canonical
 	}
 	return model
@@ -1460,8 +1894,85 @@ func usageLookupModel(model, ts string) string {
 
 func dailyUsageAmounts(
 	r dailyUsageScanRow, pricing *export.PricingResolver,
-) (inputTok, outputTok, cacheCrTok, cacheRdTok int, cost, savings float64) {
-	reasoningTok := r.reasoningTokens
+) (
+	inputTok, outputTok, cacheCrTok, cacheRdTok int,
+	cost, savings money.Money,
+	err error,
+) {
+	reasoningTok := 0
+	inputTok, outputTok, cacheCrTok, cacheRdTok, reasoningTok =
+		dailyUsageRowTokens(r)
+
+	pricedModel, lookup := pricing.Resolve(
+		r.model, usageLookupModel(r.model, r.ts))
+	rates := lookup.Rates
+	requestScoped := usageRowIsRequestScoped(r.usageSource, r.messageOrdinal)
+	if r.cost.Valid && r.costSource != CopilotReportedCostSource {
+		cost = money.Money{Microdollars: r.cost.Int64}
+		pricing.RecordResolvedReported(r.model, pricedModel, lookup)
+	} else {
+		cost, err = rates.CostForTokensScoped(
+			requestScoped,
+			inputTok, outputTok, reasoningTok, cacheCrTok, cacheRdTok)
+		if err != nil {
+			return 0, 0, 0, 0, money.Money{}, money.Money{},
+				fmt.Errorf("pricing usage row for model %q: %w", r.model, err)
+		}
+		// Anthropic bills server-side web search per request on top of
+		// tokens; see sessionRowCost for why a reported cost skips it.
+		cost, err = export.AddWebSearchFee(
+			cost, dailyUsageRowWebSearchRequests(r))
+		if err != nil {
+			return 0, 0, 0, 0, money.Money{}, money.Money{},
+				fmt.Errorf("pricing usage row for model %q: %w", r.model, err)
+		}
+		recordComputedUsagePricing(
+			pricing,
+			r.model,
+			pricedModel,
+			lookup,
+			requestScoped,
+			inputTok,
+			cacheCrTok,
+			cacheRdTok,
+		)
+	}
+
+	selectedRates := rates
+	if requestScoped {
+		selectedRates = rates.RatesForTokens(inputTok, cacheCrTok, cacheRdTok)
+	}
+	readRate, err := money.Sub(
+		selectedRates.InputPerMTok,
+		selectedRates.CacheReadPerMTok,
+	)
+	if err != nil {
+		return 0, 0, 0, 0, money.Money{}, money.Money{},
+			fmt.Errorf("deriving cache read rate for model %q: %w", r.model, err)
+	}
+	creationRate, err := money.Sub(
+		selectedRates.InputPerMTok,
+		selectedRates.CacheWritePerMTok,
+	)
+	if err != nil {
+		return 0, 0, 0, 0, money.Money{}, money.Money{},
+			fmt.Errorf("deriving cache creation rate for model %q: %w", r.model, err)
+	}
+	savings, err = money.SignedCostPerMillion([]money.RatedTokens{
+		{Tokens: int64(cacheRdTok), Rate: readRate},
+		{Tokens: int64(cacheCrTok), Rate: creationRate},
+	})
+	if err != nil {
+		return 0, 0, 0, 0, money.Money{}, money.Money{},
+			fmt.Errorf("pricing cache savings for model %q: %w", r.model, err)
+	}
+	return
+}
+
+func dailyUsageRowTokens(
+	r dailyUsageScanRow,
+) (inputTok, outputTok, cacheCrTok, cacheRdTok, reasoningTok int) {
+	reasoningTok = r.reasoningTokens
 	if r.usageSource == "message" {
 		inputTok, outputTok, cacheCrTok, cacheRdTok, reasoningTok =
 			clampedUsageTokenCountersWithReasoning(r.tokenJSON)
@@ -1472,25 +1983,43 @@ func dailyUsageAmounts(
 				r.inputTokens, r.outputTokens,
 				r.cacheCreationInputTokens, r.cacheReadInputTokens)
 	}
-
-	lookupModel := usageLookupModel(r.model, r.ts)
-	lookup := pricing.Lookup(lookupModel)
-	rates := lookup.Rates
-	if r.costUSD.Valid && r.costSource != CopilotReportedCostSource {
-		cost = r.costUSD.Float64
-		pricing.RecordReported(lookupModel, lookup)
-	} else {
-		cost = rates.CostForTokens(
-			inputTok, outputTok, reasoningTok, cacheCrTok, cacheRdTok)
-		pricing.RecordComputed(lookupModel, lookup)
-	}
-
-	readDelta := float64(cacheRdTok) *
-		(rates.InputPerMTok - rates.CacheReadPerMTok) / 1_000_000
-	crDelta := float64(cacheCrTok) *
-		(rates.InputPerMTok - rates.CacheWritePerMTok) / 1_000_000
-	savings = readDelta + crDelta
 	return
+}
+
+func usageRowIsRequestScoped(
+	usageSource string, messageOrdinal sql.NullInt64,
+) bool {
+	return UsageSourceIsRequestScoped(usageSource) || messageOrdinal.Valid
+}
+
+// UsageSourceIsRequestScoped reports whether a usage source represents one
+// provider request even when the provider cannot attach it to a message.
+func UsageSourceIsRequestScoped(source string) bool {
+	return source == "message" ||
+		source == "goose-request" ||
+		source == "deepseek-harness"
+}
+
+func recordComputedUsagePricing(
+	pricing *export.PricingResolver,
+	reportedModel, pricedModel string,
+	lookup export.PricingLookup,
+	requestScoped bool,
+	inputTokens, cacheWriteTokens, cacheReadTokens int,
+) {
+	if requestScoped {
+		pricing.RecordResolvedComputedRequest(
+			reportedModel,
+			pricedModel,
+			lookup,
+			inputTokens,
+			cacheWriteTokens,
+			cacheReadTokens,
+		)
+		return
+	}
+	pricing.RecordResolvedComputedAggregate(
+		reportedModel, pricedModel, lookup)
 }
 
 type usageDedupToken struct {
@@ -1579,7 +2108,7 @@ type DailyUsageEntry struct {
 	OutputTokens        int                `json:"outputTokens"`
 	CacheCreationTokens int                `json:"cacheCreationTokens"`
 	CacheReadTokens     int                `json:"cacheReadTokens"`
-	TotalCost           float64            `json:"totalCost"`
+	TotalCost           money.Money        `json:"totalCost"`
 	ModelsUsed          []string           `json:"modelsUsed"`
 	ModelBreakdowns     []ModelBreakdown   `json:"modelBreakdowns"`
 	ProjectBreakdowns   []ProjectBreakdown `json:"projectBreakdowns"`
@@ -1610,53 +2139,53 @@ func (e DailyUsageEntry) MarshalJSON() ([]byte, error) {
 
 // ModelBreakdown holds per-model token and cost breakdown.
 type ModelBreakdown struct {
-	ModelName           string  `json:"modelName"`
-	InputTokens         int     `json:"inputTokens"`
-	OutputTokens        int     `json:"outputTokens"`
-	CacheCreationTokens int     `json:"cacheCreationTokens"`
-	CacheReadTokens     int     `json:"cacheReadTokens"`
-	Cost                float64 `json:"cost"`
+	ModelName           string      `json:"modelName"`
+	InputTokens         int         `json:"inputTokens"`
+	OutputTokens        int         `json:"outputTokens"`
+	CacheCreationTokens int         `json:"cacheCreationTokens"`
+	CacheReadTokens     int         `json:"cacheReadTokens"`
+	Cost                money.Money `json:"cost"`
 }
 
 // ProjectBreakdown is the per-project slice of a day's usage.
 type ProjectBreakdown struct {
-	ProjectKey          string  `json:"project_key"`
-	Project             string  `json:"project"`
-	InputTokens         int     `json:"inputTokens"`
-	OutputTokens        int     `json:"outputTokens"`
-	CacheCreationTokens int     `json:"cacheCreationTokens"`
-	CacheReadTokens     int     `json:"cacheReadTokens"`
-	Cost                float64 `json:"cost"`
+	ProjectKey          string      `json:"project_key"`
+	Project             string      `json:"project"`
+	InputTokens         int         `json:"inputTokens"`
+	OutputTokens        int         `json:"outputTokens"`
+	CacheCreationTokens int         `json:"cacheCreationTokens"`
+	CacheReadTokens     int         `json:"cacheReadTokens"`
+	Cost                money.Money `json:"cost"`
 }
 
 // AgentBreakdown is the per-agent slice of a day's usage.
 type AgentBreakdown struct {
-	Agent               string  `json:"agent"`
-	InputTokens         int     `json:"inputTokens"`
-	OutputTokens        int     `json:"outputTokens"`
-	CacheCreationTokens int     `json:"cacheCreationTokens"`
-	CacheReadTokens     int     `json:"cacheReadTokens"`
-	Cost                float64 `json:"cost"`
+	Agent               string      `json:"agent"`
+	InputTokens         int         `json:"inputTokens"`
+	OutputTokens        int         `json:"outputTokens"`
+	CacheCreationTokens int         `json:"cacheCreationTokens"`
+	CacheReadTokens     int         `json:"cacheReadTokens"`
+	Cost                money.Money `json:"cost"`
 }
 
 // MachineBreakdown is the per-source-machine slice of a day's usage.
 type MachineBreakdown struct {
-	MachineName         string  `json:"machineName"`
-	InputTokens         int     `json:"inputTokens"`
-	OutputTokens        int     `json:"outputTokens"`
-	CacheCreationTokens int     `json:"cacheCreationTokens"`
-	CacheReadTokens     int     `json:"cacheReadTokens"`
-	Cost                float64 `json:"cost"`
+	MachineName         string      `json:"machineName"`
+	InputTokens         int         `json:"inputTokens"`
+	OutputTokens        int         `json:"outputTokens"`
+	CacheCreationTokens int         `json:"cacheCreationTokens"`
+	CacheReadTokens     int         `json:"cacheReadTokens"`
+	Cost                money.Money `json:"cost"`
 }
 
 // UsageTotals holds aggregate token and cost totals.
 type UsageTotals struct {
-	InputTokens         int     `json:"inputTokens"`
-	OutputTokens        int     `json:"outputTokens"`
-	CacheCreationTokens int     `json:"cacheCreationTokens"`
-	CacheReadTokens     int     `json:"cacheReadTokens"`
-	TotalCost           float64 `json:"totalCost"`
-	CopilotAICredits    float64 `json:"copilotAICredits,omitempty"`
+	InputTokens         int         `json:"inputTokens"`
+	OutputTokens        int         `json:"outputTokens"`
+	CacheCreationTokens int         `json:"cacheCreationTokens"`
+	CacheReadTokens     int         `json:"cacheReadTokens"`
+	TotalCost           money.Money `json:"totalCost"`
+	CopilotAICredits    float64     `json:"copilotAICredits,omitempty"`
 	// CacheSavings is the net dollar delta vs an uncached run:
 	// cache reads save (input_rate - cache_read_rate) per token,
 	// cache creations cost (input_rate - cache_creation_rate)
@@ -1664,7 +2193,7 @@ type UsageTotals struct {
 	// above the input rate). Computed from per-model rates so
 	// mixed-model workloads get the right number, not a fixed
 	// Sonnet proxy.
-	CacheSavings float64 `json:"cacheSavings"`
+	CacheSavings money.Money `json:"cacheSavings"`
 }
 
 // DailyUsageResult wraps the daily entries and totals.
@@ -1715,49 +2244,48 @@ func (db *DB) loadPricingMap(
 func (db *DB) loadPricingMapFrom(
 	ctx context.Context, q sessionExportQuerier,
 ) ([]export.EffectivePricingRow, error) {
-	rows, err := q.QueryContext(ctx,
-		`SELECT model_pattern,
-			input_per_mtok, output_per_mtok,
-			cache_creation_per_mtok, cache_read_per_mtok,
-			updated_at
-		 FROM model_pricing
-		 WHERE model_pattern NOT LIKE '\_%' ESCAPE '\'`)
+	prices, err := listModelPricingFrom(ctx, q)
 	if err != nil {
 		return nil, err
 	}
-	defer rows.Close()
 
 	fallback := fallbackRateMap()
 	out := make(map[string]export.ModelRates)
-	for rows.Next() {
-		var p ModelPricing
-		if err := rows.Scan(
-			&p.ModelPattern,
-			&p.InputPerMTok, &p.OutputPerMTok,
-			&p.CacheCreationPerMTok, &p.CacheReadPerMTok,
-			&p.UpdatedAt,
-		); err != nil {
-			return nil, err
+	for _, p := range prices {
+		if strings.HasPrefix(p.ModelPattern, "_") {
+			continue
 		}
 		rates := modelPricingRates(p)
 		rates.Source = modelPricingSource(p, fallback)
 		out[p.ModelPattern] = rates
 	}
-	if err := rows.Err(); err != nil {
-		return nil, err
-	}
 
+	if len(out) == 0 {
+		for model, rates := range db.emptyCatalogPricing {
+			rates.Bands = append([]export.PricingBand(nil), rates.Bands...)
+			out[model] = rates
+		}
+	}
 	for model, cp := range db.customPricing {
 		rates := export.ModelRates{
-			InputPerMTok:      cp.Input,
-			OutputPerMTok:     cp.Output,
-			CacheWritePerMTok: cp.CacheCreation,
-			CacheReadPerMTok:  cp.CacheRead,
+			InputPerMTok: money.Money{
+				Microdollars: cp.InputMicrodollarsPerMTok,
+			},
+			OutputPerMTok: money.Money{
+				Microdollars: cp.OutputMicrodollarsPerMTok,
+			},
+			CacheWritePerMTok: money.Money{
+				Microdollars: cp.CacheCreationMicrodollarsPerMTok,
+			},
+			CacheReadPerMTok: money.Money{
+				Microdollars: cp.CacheReadMicrodollarsPerMTok,
+			},
 		}
 		rates.Source = customPricingSource()
-		if source, ok := db.customPricingSources[model]; ok {
-			rates.Source = source
-		}
+		out[model] = rates
+	}
+	for model, rates := range db.effectivePricing {
+		rates.Bands = append([]export.PricingBand(nil), rates.Bands...)
 		out[model] = rates
 	}
 
@@ -1778,6 +2306,7 @@ func fallbackRateMap() map[string]export.ModelRates {
 			CacheWritePerMTok: p.CacheCreationPerMTok,
 			CacheReadPerMTok:  p.CacheReadPerMTok,
 			Source:            export.PricingRowSourceEmbedded,
+			Bands:             catalogPricingBands(p.Bands),
 		}
 		out[p.ModelPattern] = rates
 	}
@@ -1798,7 +2327,42 @@ func modelPricingRates(p ModelPricing) export.ModelRates {
 		CacheWritePerMTok: p.CacheCreationPerMTok,
 		CacheReadPerMTok:  p.CacheReadPerMTok,
 		UpdatedAt:         updatedAt,
+		Bands:             storedPricingBands(p.Bands),
 	}
+}
+
+func catalogPricingBands(bands []pricingpkg.PricingBand) []export.PricingBand {
+	out := make([]export.PricingBand, len(bands))
+	for i, band := range bands {
+		out[i] = export.PricingBand{
+			AboveInputTokens:  band.AboveInputTokens,
+			InputPerMTok:      band.InputPerMTok,
+			OutputPerMTok:     band.OutputPerMTok,
+			CacheWritePerMTok: band.CacheCreationPerMTok,
+			CacheReadPerMTok:  band.CacheReadPerMTok,
+		}
+	}
+	return out
+}
+
+func storedPricingBands(bands []PricingBand) []export.PricingBand {
+	out := make([]export.PricingBand, len(bands))
+	for i, band := range bands {
+		var updatedAt *time.Time
+		if parsed, err := time.Parse(time.RFC3339Nano, band.UpdatedAt); err == nil {
+			t := parsed.UTC()
+			updatedAt = &t
+		}
+		out[i] = export.PricingBand{
+			AboveInputTokens:  band.AboveInputTokens,
+			InputPerMTok:      band.InputPerMTok,
+			OutputPerMTok:     band.OutputPerMTok,
+			CacheWritePerMTok: band.CacheCreationPerMTok,
+			CacheReadPerMTok:  band.CacheReadPerMTok,
+			UpdatedAt:         updatedAt,
+		}
+	}
+	return out
 }
 
 func modelPricingSource(
@@ -1808,10 +2372,27 @@ func modelPricingSource(
 		rates.InputPerMTok == p.InputPerMTok &&
 		rates.OutputPerMTok == p.OutputPerMTok &&
 		rates.CacheWritePerMTok == p.CacheCreationPerMTok &&
-		rates.CacheReadPerMTok == p.CacheReadPerMTok {
+		rates.CacheReadPerMTok == p.CacheReadPerMTok &&
+		exportPricingBandsEqual(rates.Bands, storedPricingBands(p.Bands)) {
 		return export.PricingRowSourceEmbedded
 	}
 	return export.PricingRowSourceFetched
+}
+
+func exportPricingBandsEqual(a, b []export.PricingBand) bool {
+	if len(a) != len(b) {
+		return false
+	}
+	for i := range a {
+		if a[i].AboveInputTokens != b[i].AboveInputTokens ||
+			a[i].InputPerMTok != b[i].InputPerMTok ||
+			a[i].OutputPerMTok != b[i].OutputPerMTok ||
+			a[i].CacheWritePerMTok != b[i].CacheWritePerMTok ||
+			a[i].CacheReadPerMTok != b[i].CacheReadPerMTok {
+			return false
+		}
+	}
+	return true
 }
 
 func pricingMapRows(
@@ -1858,8 +2439,12 @@ func (db *DB) GetDailyUsage(
 	// long-lived sessions that span date boundaries are included.
 	// Pad by +/-14h to cover all timezone offsets; the actual
 	// date filtering happens post-query via localDate.
-	query, args := dailyUsageRowsSQLForBounds(f, usageBoundsForFilter(f), db.hasCursorUsageTable())
-	query = dailyUsageRowSelectFromRowsWithMachine(query, f.Breakdowns)
+	bounds := usageBoundsForFilter(f)
+	query, rowsArgs := dailyUsageRowsSQLForBounds(
+		f, bounds, db.hasCursorUsageTable())
+	query, args := snapshotRankedDailyUsageRowsSQL(query, rowsArgs, f, bounds)
+	query = dailyUsageRowSelectFromSnapshotRowsWithMachine(
+		query, f.Breakdowns)
 	query += ` ORDER BY u.ts ASC, u.session_id ASC,
 		COALESCE(u.message_ordinal, -1) ASC`
 
@@ -1870,28 +2455,19 @@ func (db *DB) GetDailyUsage(
 	}
 	defer rows.Close()
 
-	// 4-tuple key for per-(date, project, agent, model) accumulation.
-	type accumKey struct {
-		date    string
-		project string
-		agent   string
-		machine string
-		model   string
-	}
 	type bucket struct {
-		inputTok      int
-		outputTok     int
-		cacheCr       int
-		cacheRd       int
-		cost          float64
-		aggregateCost float64
+		inputTok  int
+		outputTok int
+		cacheCr   int
+		cacheRd   int
+		cost      money.Money
 	}
 	type sessionCost struct {
-		estimated     map[accumKey]float64
-		authoritative *float64
+		estimated     map[usageCostAllocationKey]money.Money
+		authoritative *money.Money
 	}
 
-	accum := make(map[accumKey]*bucket)
+	accum := make(map[usageCostAllocationKey]*bucket)
 	sessionCosts := make(map[string]sessionCost)
 	useAuthoritativeCost := f.Model == "" && f.ExcludeModel == ""
 
@@ -1907,7 +2483,7 @@ func (db *DB) GetDailyUsage(
 	// at the message level instead of deriving from totals
 	// later because the rate mix varies per workload and a
 	// single fallback rate would misreport mixed-model periods.
-	var totalSavings float64
+	var totalSavings money.Money
 
 	for rows.Next() {
 		r, scanErr := scanDailyUsageRowWithMachine(rows, f.Breakdowns)
@@ -1923,7 +2499,6 @@ func (db *DB) GetDailyUsage(
 		if f.To != "" && date > f.To {
 			continue
 		}
-
 		// Dedup AFTER the date filter so out-of-range rows
 		// (pulled in by the ±14h timezone padding) don't mark
 		// a key as seen and suppress the in-range duplicate.
@@ -1949,11 +2524,18 @@ func (db *DB) GetDailyUsage(
 			projectLabels[r.project] = struct{}{}
 		}
 
-		inputTok, outputTok, cacheCrTok, cacheRdTok, cost, savings :=
+		inputTok, outputTok, cacheCrTok, cacheRdTok, cost, savings, priceErr :=
 			dailyUsageAmounts(r, rateResolver)
-		totalSavings += savings
+		if priceErr != nil {
+			return DailyUsageResult{}, priceErr
+		}
+		totalSavings, priceErr = money.Add(totalSavings, savings)
+		if priceErr != nil {
+			return DailyUsageResult{}, fmt.Errorf(
+				"summing daily usage cache savings: %w", priceErr)
+		}
 
-		key := accumKey{
+		key := usageCostAllocationKey{
 			date: date, project: r.project,
 			agent: r.agent, machine: r.machine, model: r.model,
 		}
@@ -1969,13 +2551,16 @@ func (db *DB) GetDailyUsage(
 
 		sc := sessionCosts[r.sessionID]
 		if sc.estimated == nil {
-			sc.estimated = make(map[accumKey]float64)
+			sc.estimated = make(map[usageCostAllocationKey]money.Money)
 		}
-		sc.estimated[key] += cost
+		sc.estimated[key], priceErr = money.Add(sc.estimated[key], cost)
+		if priceErr != nil {
+			return DailyUsageResult{}, fmt.Errorf(
+				"summing daily usage session cost: %w", priceErr)
+		}
 		if useAuthoritativeCost &&
-			r.costSource == CopilotReportedCostSource &&
-			r.costUSD.Valid {
-			v := r.costUSD.Float64
+			r.costSource == CopilotReportedCostSource && r.cost.Valid {
+			v := money.Money{Microdollars: r.cost.Int64}
 			sc.authoritative = &v
 			rateResolver.RecordUnattributedReported()
 		}
@@ -1985,7 +2570,6 @@ func (db *DB) GetDailyUsage(
 		return DailyUsageResult{},
 			fmt.Errorf("iterating daily usage rows: %w", err)
 	}
-
 	sessionIDs := make([]string, 0, len(sessionCosts))
 	for sessionID := range sessionCosts {
 		sessionIDs = append(sessionIDs, sessionID)
@@ -1994,39 +2578,18 @@ func (db *DB) GetDailyUsage(
 	for _, sessionID := range sessionIDs {
 		sc := sessionCosts[sessionID]
 		if sc.authoritative != nil {
-			keys := make([]accumKey, 0, len(sc.estimated))
-			for key := range sc.estimated {
-				keys = append(keys, key)
-			}
-			sort.Slice(keys, func(i, j int) bool {
-				a, b := keys[i], keys[j]
-				if a.date != b.date {
-					return a.date < b.date
-				}
-				if a.project != b.project {
-					return a.project < b.project
-				}
-				if a.agent != b.agent {
-					return a.agent < b.agent
-				}
-				if a.machine != b.machine {
-					return a.machine < b.machine
-				}
-				return a.model < b.model
-			})
-			weights := make([]float64, len(keys))
-			for i, key := range keys {
-				weights[i] = sc.estimated[key]
-			}
-			costs := export.AllocateCostByWeight(*sc.authoritative, weights)
-			for i, key := range keys {
+			costs := allocateUsageCostByKey(*sc.authoritative, sc.estimated)
+			for key, cost := range costs {
 				b := accum[key]
 				if b == nil {
 					b = &bucket{}
 					accum[key] = b
 				}
-				b.cost += costs[i]
-				b.aggregateCost += costs[i]
+				b.cost, err = money.Add(b.cost, cost)
+				if err != nil {
+					return DailyUsageResult{}, fmt.Errorf(
+						"summing allocated daily usage cost: %w", err)
+				}
 			}
 		} else {
 			for key, cost := range sc.estimated {
@@ -2035,8 +2598,11 @@ func (db *DB) GetDailyUsage(
 					b = &bucket{}
 					accum[key] = b
 				}
-				b.cost += cost
-				b.aggregateCost += cost
+				b.cost, err = money.Add(b.cost, cost)
+				if err != nil {
+					return DailyUsageResult{}, fmt.Errorf(
+						"summing estimated daily usage cost: %w", err)
+				}
 			}
 		}
 	}
@@ -2053,12 +2619,11 @@ func (db *DB) GetDailyUsage(
 			model string
 		}
 		type modelAccum struct {
-			inputTok      int
-			outputTok     int
-			cacheCr       int
-			cacheRd       int
-			cost          float64
-			aggregateCost float64
+			inputTok  int
+			outputTok int
+			cacheCr   int
+			cacheRd   int
+			cost      money.Money
 		}
 		dm := make(map[dateModelKey]*modelAccum)
 		for key, b := range accum {
@@ -2072,8 +2637,11 @@ func (db *DB) GetDailyUsage(
 			ma.outputTok += b.outputTok
 			ma.cacheCr += b.cacheCr
 			ma.cacheRd += b.cacheRd
-			ma.cost += b.cost
-			ma.aggregateCost += b.aggregateCost
+			ma.cost, err = money.Add(ma.cost, b.cost)
+			if err != nil {
+				return DailyUsageResult{}, fmt.Errorf(
+					"summing daily model cost: %w", err)
+			}
 		}
 
 		type dayData struct {
@@ -2120,8 +2688,8 @@ func (db *DB) GetDailyUsage(
 				}
 				ci := left.cost
 				cj := right.cost
-				if ci != cj {
-					return ci > cj
+				if ci.Microdollars != cj.Microdollars {
+					return ci.Microdollars > cj.Microdollars
 				}
 				return modelNames[i] < modelNames[j]
 			})
@@ -2138,7 +2706,11 @@ func (db *DB) GetDailyUsage(
 				entry.OutputTokens += ma.outputTok
 				entry.CacheCreationTokens += ma.cacheCr
 				entry.CacheReadTokens += ma.cacheRd
-				entry.TotalCost += ma.aggregateCost
+				entry.TotalCost, err = money.Add(entry.TotalCost, ma.cost)
+				if err != nil {
+					return DailyUsageResult{}, fmt.Errorf(
+						"summing daily entry cost: %w", err)
+				}
 				mbd = append(mbd, ModelBreakdown{
 					ModelName:           m,
 					InputTokens:         ma.inputTok,
@@ -2155,7 +2727,11 @@ func (db *DB) GetDailyUsage(
 			totals.OutputTokens += entry.OutputTokens
 			totals.CacheCreationTokens += entry.CacheCreationTokens
 			totals.CacheReadTokens += entry.CacheReadTokens
-			totals.TotalCost += entry.TotalCost
+			totals.TotalCost, err = money.Add(totals.TotalCost, entry.TotalCost)
+			if err != nil {
+				return DailyUsageResult{}, fmt.Errorf(
+					"summing daily usage total: %w", err)
+			}
 		}
 
 		if daily == nil {
@@ -2165,7 +2741,7 @@ func (db *DB) GetDailyUsage(
 
 		var aiCredits float64
 		for key, b := range accum {
-			aiCredits += AICreditsFromCost(key.agent, b.aggregateCost)
+			aiCredits += AICreditsFromCost(key.agent, b.cost)
 		}
 		if aiCredits > 0 {
 			totals.CopilotAICredits = aiCredits
@@ -2222,8 +2798,11 @@ func (db *DB) GetDailyUsage(
 		cur.outputTok += b.outputTok
 		cur.cacheCr += b.cacheCr
 		cur.cacheRd += b.cacheRd
-		cur.cost += b.cost
-		cur.aggregateCost += b.aggregateCost
+		cur.cost, err = money.Add(cur.cost, b.cost)
+		if err != nil {
+			return DailyUsageResult{}, fmt.Errorf(
+				"summing daily model breakdown cost: %w", err)
+		}
 		dm.models[key.model] = cur
 
 		cur = dm.projects[key.project]
@@ -2231,7 +2810,11 @@ func (db *DB) GetDailyUsage(
 		cur.outputTok += b.outputTok
 		cur.cacheCr += b.cacheCr
 		cur.cacheRd += b.cacheRd
-		cur.cost += b.aggregateCost
+		cur.cost, err = money.Add(cur.cost, b.cost)
+		if err != nil {
+			return DailyUsageResult{}, fmt.Errorf(
+				"summing daily project breakdown cost: %w", err)
+		}
 		dm.projects[key.project] = cur
 
 		cur = dm.agents[key.agent]
@@ -2239,7 +2822,11 @@ func (db *DB) GetDailyUsage(
 		cur.outputTok += b.outputTok
 		cur.cacheCr += b.cacheCr
 		cur.cacheRd += b.cacheRd
-		cur.cost += b.aggregateCost
+		cur.cost, err = money.Add(cur.cost, b.cost)
+		if err != nil {
+			return DailyUsageResult{}, fmt.Errorf(
+				"summing daily agent breakdown cost: %w", err)
+		}
 		dm.agents[key.agent] = cur
 
 		cur = dm.machines[key.machine]
@@ -2247,7 +2834,11 @@ func (db *DB) GetDailyUsage(
 		cur.outputTok += b.outputTok
 		cur.cacheCr += b.cacheCr
 		cur.cacheRd += b.cacheRd
-		cur.cost += b.aggregateCost
+		cur.cost, err = money.Add(cur.cost, b.cost)
+		if err != nil {
+			return DailyUsageResult{}, fmt.Errorf(
+				"summing daily machine breakdown cost: %w", err)
+		}
 		dm.machines[key.machine] = cur
 	}
 
@@ -2277,8 +2868,8 @@ func (db *DB) GetDailyUsage(
 			right := dm.models[modelNames[j]]
 			ci := left.cost
 			cj := right.cost
-			if ci != cj {
-				return ci > cj
+			if ci.Microdollars != cj.Microdollars {
+				return ci.Microdollars > cj.Microdollars
 			}
 			return modelNames[i] < modelNames[j]
 		})
@@ -2295,7 +2886,11 @@ func (db *DB) GetDailyUsage(
 			entry.OutputTokens += b.outputTok
 			entry.CacheCreationTokens += b.cacheCr
 			entry.CacheReadTokens += b.cacheRd
-			entry.TotalCost += b.aggregateCost
+			entry.TotalCost, err = money.Add(entry.TotalCost, b.cost)
+			if err != nil {
+				return DailyUsageResult{}, fmt.Errorf(
+					"summing daily breakdown entry cost: %w", err)
+			}
 			mbd = append(mbd, ModelBreakdown{
 				ModelName:           m,
 				InputTokens:         b.inputTok,
@@ -2321,8 +2916,8 @@ func (db *DB) GetDailyUsage(
 			})
 		}
 		sort.Slice(pbd, func(i, j int) bool {
-			if pbd[i].Cost != pbd[j].Cost {
-				return pbd[i].Cost > pbd[j].Cost
+			if pbd[i].Cost.Microdollars != pbd[j].Cost.Microdollars {
+				return pbd[i].Cost.Microdollars > pbd[j].Cost.Microdollars
 			}
 			return pbd[i].Project < pbd[j].Project
 		})
@@ -2342,8 +2937,8 @@ func (db *DB) GetDailyUsage(
 			})
 		}
 		sort.Slice(abd, func(i, j int) bool {
-			if abd[i].Cost != abd[j].Cost {
-				return abd[i].Cost > abd[j].Cost
+			if abd[i].Cost.Microdollars != abd[j].Cost.Microdollars {
+				return abd[i].Cost.Microdollars > abd[j].Cost.Microdollars
 			}
 			return abd[i].Agent < abd[j].Agent
 		})
@@ -2363,8 +2958,8 @@ func (db *DB) GetDailyUsage(
 			})
 		}
 		sort.Slice(machineBreakdowns, func(i, j int) bool {
-			if machineBreakdowns[i].Cost != machineBreakdowns[j].Cost {
-				return machineBreakdowns[i].Cost > machineBreakdowns[j].Cost
+			if machineBreakdowns[i].Cost.Microdollars != machineBreakdowns[j].Cost.Microdollars {
+				return machineBreakdowns[i].Cost.Microdollars > machineBreakdowns[j].Cost.Microdollars
 			}
 			return machineBreakdowns[i].MachineName < machineBreakdowns[j].MachineName
 		})
@@ -2376,7 +2971,11 @@ func (db *DB) GetDailyUsage(
 		totals.OutputTokens += entry.OutputTokens
 		totals.CacheCreationTokens += entry.CacheCreationTokens
 		totals.CacheReadTokens += entry.CacheReadTokens
-		totals.TotalCost += entry.TotalCost
+		totals.TotalCost, err = money.Add(totals.TotalCost, entry.TotalCost)
+		if err != nil {
+			return DailyUsageResult{}, fmt.Errorf(
+				"summing daily breakdown total: %w", err)
+		}
 	}
 
 	if daily == nil {
@@ -2424,26 +3023,30 @@ func (db *DB) GetDailyUsage(
 
 // TopSessionEntry is one row in the "top sessions by cost" result.
 type TopSessionEntry struct {
-	SessionID   string  `json:"sessionId"`
-	DisplayName string  `json:"displayName"`
-	Agent       string  `json:"agent"`
-	Project     string  `json:"project"`
-	StartedAt   string  `json:"startedAt"`
-	TotalTokens int     `json:"totalTokens"`
-	Cost        float64 `json:"cost"`
+	SessionID           string      `json:"sessionId"`
+	DisplayName         string      `json:"displayName"`
+	Agent               string      `json:"agent"`
+	Project             string      `json:"project"`
+	StartedAt           string      `json:"startedAt"`
+	InputTokens         int         `json:"inputTokens"`
+	OutputTokens        int         `json:"outputTokens"`
+	CacheCreationTokens int         `json:"cacheCreationTokens"`
+	CacheReadTokens     int         `json:"cacheReadTokens"`
+	TotalTokens         int         `json:"totalTokens"`
+	Cost                money.Money `json:"cost"`
 }
 
-// TopSessionsSortCost and TopSessionsSortTokens select ranking for
-// GetTopSessionsByCost. Empty TopSessionsSort is treated as cost.
+// TopSessionsSortCost and TopSessionsSortTokens select top-session ranking.
 const (
 	TopSessionsSortCost   = "cost"
 	TopSessionsSortTokens = "tokens"
 )
 
-// SortAndLimitTopSessions ranks entries by cost (default) or tokens,
-// then applies limit. Ties break by SessionID ascending for stability.
+// SortAndLimitTopSessions ranks entries by cost (default) or tokens, then
+// applies the bounded limit. Ties break by session ID for stable results.
 func SortAndLimitTopSessions(
 	result []TopSessionEntry, limit int, sortBy string,
+	tokenTypes UsageTokenTypes,
 ) []TopSessionEntry {
 	if limit <= 0 {
 		limit = 20
@@ -2454,22 +3057,34 @@ func SortAndLimitTopSessions(
 	byTokens := strings.EqualFold(sortBy, TopSessionsSortTokens)
 	sort.Slice(result, func(i, j int) bool {
 		if byTokens {
-			if result[i].TotalTokens != result[j].TotalTokens {
-				return result[i].TotalTokens > result[j].TotalTokens
+			left := tokenTypes.Total(
+				result[i].InputTokens,
+				result[i].OutputTokens,
+				result[i].CacheCreationTokens,
+				result[i].CacheReadTokens,
+			)
+			right := tokenTypes.Total(
+				result[j].InputTokens,
+				result[j].OutputTokens,
+				result[j].CacheCreationTokens,
+				result[j].CacheReadTokens,
+			)
+			if left != right {
+				return left > right
 			}
-		} else if result[i].Cost != result[j].Cost {
-			return result[i].Cost > result[j].Cost
+		} else if result[i].Cost.Microdollars != result[j].Cost.Microdollars {
+			return result[i].Cost.Microdollars > result[j].Cost.Microdollars
 		}
 		return result[i].SessionID < result[j].SessionID
 	})
 	if len(result) > limit {
-		result = result[:limit]
+		return result[:limit]
 	}
 	return result
 }
 
-// GetTopSessionsByCost returns sessions ranked by total cost
-// (or by total tokens when f.TopSessionsSort is "tokens")
+// GetTopSessionsByCost returns sessions ranked by total cost, or by total
+// tokens when f.TopSessionsSort is "tokens",
 // over the filter range. Default limit 20, max 100.
 func (db *DB) GetTopSessionsByCost(
 	ctx context.Context, f UsageFilter, limit int,
@@ -2499,9 +3114,13 @@ func (db *DB) GetTopSessionsByCost(
 	loc := f.location()
 
 	type sessAccum struct {
+		inputTokens       int
+		outputTokens      int
+		cacheCreateTokens int
+		cacheReadTokens   int
 		totalTokens       int
-		cost              float64
-		authoritativeCost *float64
+		cost              money.Money
+		authoritativeCost *money.Money
 	}
 
 	accum := make(map[string]*sessAccum)
@@ -2528,7 +3147,6 @@ func (db *DB) GetTopSessionsByCost(
 		if f.To != "" && date > f.To {
 			continue
 		}
-
 		// Dedup AFTER the date filter, matching GetDailyUsage,
 		// so out-of-range rows pulled in by the ±14h padding
 		// don't claim a key and suppress the in-range duplicate.
@@ -2542,8 +3160,11 @@ func (db *DB) GetTopSessionsByCost(
 			seen[key] = struct{}{}
 		}
 
-		inputTok, outputTok, cacheCrTok, cacheRdTok, cost, _ :=
+		inputTok, outputTok, cacheCrTok, cacheRdTok, cost, _, priceErr :=
 			dailyUsageAmounts(r, rateResolver)
+		if priceErr != nil {
+			return nil, priceErr
+		}
 
 		sa, ok := accum[r.sessionID]
 		if !ok {
@@ -2551,13 +3172,18 @@ func (db *DB) GetTopSessionsByCost(
 			accum[r.sessionID] = sa
 			order = append(order, r.sessionID)
 		}
-		sa.totalTokens += inputTok + outputTok +
-			cacheCrTok + cacheRdTok
-		sa.cost += cost
+		sa.inputTokens += inputTok
+		sa.outputTokens += outputTok
+		sa.cacheCreateTokens += cacheCrTok
+		sa.cacheReadTokens += cacheRdTok
+		sa.totalTokens += inputTok + outputTok + cacheCrTok + cacheRdTok
+		sa.cost, priceErr = money.Add(sa.cost, cost)
+		if priceErr != nil {
+			return nil, fmt.Errorf("summing top-session cost: %w", priceErr)
+		}
 		if f.Model == "" && f.ExcludeModel == "" &&
-			r.costSource == CopilotReportedCostSource &&
-			r.costUSD.Valid {
-			v := r.costUSD.Float64
+			r.costSource == CopilotReportedCostSource && r.cost.Valid {
+			v := money.Money{Microdollars: r.cost.Int64}
 			sa.authoritativeCost = &v
 		}
 	}
@@ -2565,7 +3191,6 @@ func (db *DB) GetTopSessionsByCost(
 		return nil,
 			fmt.Errorf("iterating top sessions rows: %w", err)
 	}
-
 	result := make([]TopSessionEntry, 0, len(order))
 	for _, id := range order {
 		sa, ok := accum[id]
@@ -2573,10 +3198,14 @@ func (db *DB) GetTopSessionsByCost(
 			continue
 		}
 		result = append(result, TopSessionEntry{
-			SessionID:   id,
-			DisplayName: id,
-			TotalTokens: sa.totalTokens,
-			Cost: func() float64 {
+			SessionID:           id,
+			DisplayName:         id,
+			InputTokens:         sa.inputTokens,
+			OutputTokens:        sa.outputTokens,
+			CacheCreationTokens: sa.cacheCreateTokens,
+			CacheReadTokens:     sa.cacheReadTokens,
+			TotalTokens:         sa.totalTokens,
+			Cost: func() money.Money {
 				if sa.authoritativeCost != nil {
 					return *sa.authoritativeCost
 				}
@@ -2585,7 +3214,9 @@ func (db *DB) GetTopSessionsByCost(
 		})
 	}
 
-	result = SortAndLimitTopSessions(result, limit, f.TopSessionsSort)
+	result = SortAndLimitTopSessions(
+		result, limit, f.TopSessionsSort, f.TopSessionsTokenTypes,
+	)
 
 	sessionIDs := make([]string, len(result))
 	for i := range result {
@@ -2610,48 +3241,99 @@ func (db *DB) GetTopSessionsByCost(
 // SessionUsage is the per-session token + cost summary returned by
 // the `session usage` command. Cost is an estimate from the
 // model_pricing catalog unless an agent reported cost directly
-// (usage_events.cost_usd). CostUSD is non-zero only when HasCost is
+// (usage_events.cost_microdollars). Cost is non-zero only when HasCost is
 // true; a partial total (some models unpriced) is never emitted.
 type SessionUsage struct {
-	SessionID         string                       `json:"session_id"`
-	Agent             string                       `json:"agent"`
-	Project           string                       `json:"project"`
-	TotalOutputTokens int                          `json:"total_output_tokens"`
-	PeakContextTokens int                          `json:"peak_context_tokens"`
-	HasTokenData      bool                         `json:"has_token_data"`
-	CostUSD           float64                      `json:"cost_usd"`
-	HasCost           bool                         `json:"has_cost"`
-	CostSource        export.CostSource            `json:"cost_source,omitempty"`
-	AICredits         float64                      `json:"ai_credits,omitempty"`
-	Models            []string                     `json:"models"`
-	UnpricedModels    []string                     `json:"unpriced_models,omitempty"`
-	BreakdownCount    int                          `json:"breakdown_count"`
-	Breakdown         []SessionUsageBreakdownEntry `json:"breakdown"`
+	SessionID         string      `json:"session_id"`
+	Agent             string      `json:"agent"`
+	Project           string      `json:"project"`
+	TotalOutputTokens int         `json:"total_output_tokens"`
+	PeakContextTokens int         `json:"peak_context_tokens"`
+	HasTokenData      bool        `json:"has_token_data"`
+	Cost              money.Money `json:"cost"`
+	HasCost           bool        `json:"has_cost"`
+	// CostUSD is a deprecated compatibility alias for
+	// Cost.Microdollars/1e6, kept during a deprecation window for
+	// consumers (such as roborev) still reading the pre-v0.39
+	// cost_usd field. It is present exactly when HasCost is true and
+	// always equals Cost expressed in dollars; it will be removed in
+	// a future release. New consumers should read cost.microdollars.
+	CostUSD        *float64          `json:"cost_usd,omitempty"`
+	CostSource     export.CostSource `json:"cost_source,omitempty"`
+	AICredits      float64           `json:"ai_credits,omitempty"`
+	Models         []string          `json:"models"`
+	UnpricedModels []string          `json:"unpriced_models,omitempty"`
+	BreakdownCount int               `json:"breakdown_count"`
+	// SubagentCount is how many subagent descendant sessions were folded
+	// into this result. It is zero (and omitted) for own-session results,
+	// which is what GetSessionUsage always returns; only the
+	// presentation-time combining in internal/service sets it.
+	SubagentCount int                          `json:"subagent_count,omitempty"`
+	Breakdown     []SessionUsageBreakdownEntry `json:"breakdown"`
 }
 
 type SessionUsageBreakdownEntry struct {
-	Ordinal                  int     `json:"ordinal"`
-	MessageOrdinal           *int    `json:"message_ordinal,omitempty"`
-	Source                   string  `json:"source"`
-	Label                    string  `json:"label"`
-	Timestamp                string  `json:"timestamp"`
-	Model                    string  `json:"model"`
-	InputTokens              int     `json:"input_tokens"`
-	OutputTokens             int     `json:"output_tokens"`
-	CacheCreationInputTokens int     `json:"cache_creation_input_tokens"`
-	CacheReadInputTokens     int     `json:"cache_read_input_tokens"`
-	CostUSD                  float64 `json:"cost_usd"`
-	HasCost                  bool    `json:"has_cost"`
+	Ordinal        int    `json:"ordinal"`
+	MessageOrdinal *int   `json:"message_ordinal,omitempty"`
+	Source         string `json:"source"`
+	Label          string `json:"label"`
+	Timestamp      string `json:"timestamp"`
+	Model          string `json:"model"`
+	// SubagentSessionID names the subagent descendant session this row
+	// came from. Empty (and omitted) for the queried session's own rows,
+	// so `source` keeps its existing meaning.
+	SubagentSessionID        string `json:"subagent_session_id,omitempty"`
+	InputTokens              int    `json:"input_tokens"`
+	OutputTokens             int    `json:"output_tokens"`
+	CacheCreationInputTokens int    `json:"cache_creation_input_tokens"`
+	CacheReadInputTokens     int    `json:"cache_read_input_tokens"`
+	// WebSearchRequests is how many Anthropic server-side web searches
+	// this row was billed for, at export.WebSearchRequestMicrodollars
+	// each. Omitted when the row performed none, which is every row for
+	// every provider that does not report server tool use.
+	WebSearchRequests int         `json:"web_search_requests,omitempty"`
+	Cost              money.Money `json:"cost"`
+	HasCost           bool        `json:"has_cost"`
+}
+
+// SessionUsageBreakdownLabel renders a breakdown row's human label. It is
+// shared so every backend (and the presentation-time subagent combiner)
+// produces the same label for the same row.
+func SessionUsageBreakdownLabel(messageOrdinal *int, source string) string {
+	if messageOrdinal != nil {
+		if source == "message" {
+			return fmt.Sprintf("Prompt %d", *messageOrdinal+1)
+		}
+		return fmt.Sprintf("Step %d", *messageOrdinal+1)
+	}
+	if source != "" {
+		return source
+	}
+	return "usage"
 }
 
 // sessionRowCost computes one usage row's cost and reports whether
 // it was priced and whether it contributes to the estimate. A row
-// contributes when it carries an explicit cost or any tokens. It does
-// an explicit map lookup so callers can distinguish "unpriced" from
-// "$0".
+// contributes when it carries an explicit cost, any tokens, or any billed
+// web search requests. It does an explicit map lookup so callers can
+// distinguish "unpriced" from "$0".
+//
+// The web search fee is added on top of the token cost, and only when the
+// row's cost is computed: an explicitly reported cost is authoritative for
+// the whole row and is assumed to already settle its server tool use. An
+// unpriced model still gets the fee, because the fee is a known amount of
+// real spend regardless of what the model's token rates are; priced stays
+// false so the row is still reported as an incomplete estimate.
 func sessionRowCost(
 	r usageScanRow, pricing *export.PricingResolver,
-) (cost float64, priced, contributes bool) {
+) (cost money.Money, priced, contributes bool, err error) {
+	return sessionRowCostWithWebSearchRequests(
+		r, usageRowWebSearchRequests(r.usageSource, r.tokenJSON), pricing)
+}
+
+func sessionRowCostWithWebSearchRequests(
+	r usageScanRow, webSearches int, pricing *export.PricingResolver,
+) (cost money.Money, priced, contributes bool, err error) {
 	var inTok, outTok, crTok, rdTok int
 	reasoningTok := r.reasoningTokens
 	if r.usageSource == "message" {
@@ -2663,33 +3345,57 @@ func sessionRowCost(
 			r.inputTokens, r.outputTokens,
 			r.cacheCreationInputTokens, r.cacheReadInputTokens)
 	}
-
-	if r.costUSD.Valid {
-		lookupModel := usageLookupModel(r.model, r.ts)
-		pricing.RecordReported(lookupModel, pricing.Lookup(lookupModel))
-		return r.costUSD.Float64, true, true
+	pricedModel, lookup := pricing.Resolve(
+		r.model, usageLookupModel(r.model, r.ts))
+	if r.cost.Valid {
+		pricing.RecordResolvedReported(r.model, pricedModel, lookup)
+		return money.Money{Microdollars: r.cost.Int64}, true, true, nil
 	}
-	if inTok == 0 && outTok == 0 && reasoningTok == 0 &&
-		crTok == 0 && rdTok == 0 {
-		return 0, true, false
+	if !activity.UsageDataContributes(
+		false, inTok, outTok, reasoningTok, crTok, rdTok, webSearches,
+	) {
+		return money.Money{}, true, false, nil
 	}
-	lookupModel := usageLookupModel(r.model, r.ts)
-	lookup := pricing.Lookup(lookupModel)
 	if !lookup.OK {
-		pricing.RecordComputed(lookupModel, lookup)
-		return 0, false, true
+		pricing.RecordResolvedComputed(r.model, pricedModel, lookup)
+		fee, feeErr := export.WebSearchFee(webSearches)
+		if feeErr != nil {
+			return money.Money{}, false, false, feeErr
+		}
+		return fee, false, true, nil
 	}
-	cost = lookup.Rates.CostForTokens(
+	requestScoped := usageRowIsRequestScoped(r.usageSource, r.messageOrdinal)
+	cost, err = lookup.Rates.CostForTokensScoped(
+		requestScoped,
 		inTok, outTok, reasoningTok, crTok, rdTok)
-	pricing.RecordComputed(lookupModel, lookup)
-	return cost, true, true
+	if err != nil {
+		return money.Money{}, false, false,
+			fmt.Errorf("pricing session usage for model %q: %w", r.model, err)
+	}
+	cost, err = export.AddWebSearchFee(cost, webSearches)
+	if err != nil {
+		return money.Money{}, false, false,
+			fmt.Errorf("pricing session usage for model %q: %w", r.model, err)
+	}
+	recordComputedUsagePricing(
+		pricing,
+		r.model,
+		pricedModel,
+		lookup,
+		requestScoped,
+		inTok,
+		crTok,
+		rdTok,
+	)
+	return cost, true, true, nil
 }
 
-func sessionUsageBreakdownEntry(
+func sessionUsageBreakdownEntryWithWebSearchRequests(
 	r usageScanRow,
 	ordinal int,
-	cost float64,
+	cost money.Money,
 	priced bool,
+	webSearches int,
 ) SessionUsageBreakdownEntry {
 	var inTok, outTok, crTok, rdTok int
 	if r.usageSource == "message" {
@@ -2711,7 +3417,8 @@ func sessionUsageBreakdownEntry(
 		OutputTokens:             outTok,
 		CacheCreationInputTokens: crTok,
 		CacheReadInputTokens:     rdTok,
-		CostUSD:                  cost,
+		WebSearchRequests:        webSearches,
+		Cost:                     cost,
 		HasCost:                  priced,
 	}
 	if r.messageOrdinal.Valid {
@@ -2722,16 +3429,8 @@ func sessionUsageBreakdownEntry(
 }
 
 func sessionUsageBreakdownLabel(r usageScanRow) string {
-	if r.messageOrdinal.Valid {
-		if r.usageSource == "message" {
-			return fmt.Sprintf("Prompt %d", r.messageOrdinal.Int64+1)
-		}
-		return fmt.Sprintf("Step %d", r.messageOrdinal.Int64+1)
-	}
-	if r.usageSource != "" {
-		return r.usageSource
-	}
-	return "usage"
+	return SessionUsageBreakdownLabel(
+		nullInt64Pointer(r.messageOrdinal), r.usageSource)
 }
 
 // GetSessionUsage returns one session's token totals and cost
@@ -2772,8 +3471,8 @@ func (db *DB) GetSessionUsage(
 	}
 	defer rows.Close()
 
-	var cost float64
-	var authoritativeCost *float64
+	var cost money.Money
+	var authoritativeCost *money.Money
 	var hasComputedCost, hasReportedCost bool
 	contributing := false
 	allPriced := true
@@ -2782,12 +3481,47 @@ func (db *DB) GetSessionUsage(
 	breakdown := make([]SessionUsageBreakdownEntry, 0)
 	breakdownCount := 0
 
-	seen := make(map[usageDedupToken]struct{})
-
+	var usageRows []usageScanRow
 	for rows.Next() {
 		r, scanErr := scanUsageRow(rows)
 		if scanErr != nil {
 			return nil, fmt.Errorf("scanning session usage row: %w", scanErr)
+		}
+		usageRows = append(usageRows, r)
+	}
+	if err := rows.Err(); err != nil {
+		return nil, fmt.Errorf("iterating session usage rows: %w", err)
+	}
+	snapshotRows := make([]activity.UsageRow, len(usageRows))
+	for i, r := range usageRows {
+		var outputTokens int
+		if r.usageSource == "message" {
+			_, outputTokens, _, _ = clampedUsageTokenCounters(r.tokenJSON)
+		} else {
+			_, outputTokens, _, _ = usageEventRowTokens(
+				r.usageSource,
+				r.inputTokens, r.outputTokens,
+				r.cacheCreationInputTokens, r.cacheReadInputTokens)
+		}
+		snapshotRows[i] = activity.UsageRow{
+			SessionID:      r.sessionID,
+			Timestamp:      r.ts,
+			MessageOrdinal: usageRowMessageOrdinal(r.messageOrdinal),
+			OutputTokens:   outputTokens,
+			WebSearchRequests: usageRowWebSearchRequests(
+				r.usageSource, r.tokenJSON),
+			ClaudeMessageID: r.claudeMessageID,
+			ClaudeRequestID: r.claudeRequestID,
+		}
+	}
+	snapshotMask, _, snapshotWebSearchRequests :=
+		activity.ClaudeSnapshotSurvivorSelection(snapshotRows)
+	deduplicatedOutputTokens := 0
+	seen := make(map[usageDedupToken]struct{})
+	for i, r := range usageRows {
+		if !snapshotMask[i] {
+			deduplicatedOutputTokens += snapshotRows[i].OutputTokens
+			continue
 		}
 		if key, ok := usageDedupTokenForRow(
 			r.usageSource, r.agent, r.claudeMessageID,
@@ -2800,48 +3534,54 @@ func (db *DB) GetSessionUsage(
 		}
 
 		costRow := r
-		authoritative := r.costSource == CopilotReportedCostSource && r.costUSD.Valid
+		authoritative := r.costSource == CopilotReportedCostSource && r.cost.Valid
 		if authoritative {
-			v := r.costUSD.Float64
+			v := money.Money{Microdollars: r.cost.Int64}
 			authoritativeCost = &v
-			costRow.costUSD = sql.NullFloat64{}
+			costRow.cost = sql.NullInt64{}
 		}
-		c, priced, contributes := sessionRowCost(costRow, rateResolver)
+		c, priced, contributes, priceErr := sessionRowCostWithWebSearchRequests(
+			costRow, snapshotWebSearchRequests[i], rateResolver)
+		if priceErr != nil {
+			return nil, priceErr
+		}
 		if !contributes {
 			continue
 		}
 		contributing = true
 		modelsSet[r.model] = struct{}{}
 		if !authoritative {
-			if r.costUSD.Valid {
+			if r.cost.Valid {
 				hasReportedCost = true
 			} else {
 				hasComputedCost = true
 			}
 		}
 		if priced {
-			cost += c
+			cost, priceErr = money.Add(cost, c)
+			if priceErr != nil {
+				return nil, fmt.Errorf("summing session usage cost: %w", priceErr)
+			}
 		} else {
 			allPriced = false
 			unpricedSet[r.model] = struct{}{}
 		}
 		breakdownCount++
 		if includeBreakdown {
-			breakdown = append(breakdown, sessionUsageBreakdownEntry(
-				r, breakdownCount, c, priced))
+			breakdown = append(breakdown,
+				sessionUsageBreakdownEntryWithWebSearchRequests(
+					r, breakdownCount, c, priced,
+					snapshotWebSearchRequests[i]))
 		}
 	}
-	if err := rows.Err(); err != nil {
-		return nil, fmt.Errorf("iterating session usage rows: %w", err)
-	}
 	if authoritativeCost != nil && len(breakdown) > 0 {
-		weights := make([]float64, len(breakdown))
+		weights := make([]money.Money, len(breakdown))
 		for i := range breakdown {
-			weights[i] = breakdown[i].CostUSD
+			weights[i] = breakdown[i].Cost
 		}
 		costs := export.AllocateCostByWeight(*authoritativeCost, weights)
 		for i := range breakdown {
-			breakdown[i].CostUSD = costs[i]
+			breakdown[i].Cost = costs[i]
 			breakdown[i].HasCost = true
 		}
 	}
@@ -2850,7 +3590,7 @@ func (db *DB) GetSessionUsage(
 		SessionID:         sess.ID,
 		Agent:             sess.Agent,
 		Project:           sess.Project,
-		TotalOutputTokens: sess.TotalOutputTokens,
+		TotalOutputTokens: max(sess.TotalOutputTokens-deduplicatedOutputTokens, 0),
 		PeakContextTokens: sess.PeakContextTokens,
 		HasTokenData:      sess.HasTotalOutputTokens || sess.HasPeakContextTokens,
 		Models:            sortedSetKeys(modelsSet),
@@ -2858,17 +3598,17 @@ func (db *DB) GetSessionUsage(
 		BreakdownCount:    breakdownCount,
 		Breakdown:         breakdown,
 	}
-	if authoritativeCost != nil {
-		out.CostUSD = *authoritativeCost
-		out.CostSource = export.CostSourceReported
-	} else if out.HasCost {
-		out.CostUSD = cost
-		out.CostSource = export.CombinedCostSource(
-			hasComputedCost, hasReportedCost)
-	}
 	if out.HasCost {
-		out.AICredits = AICreditsFromCost(sess.Agent, out.CostUSD)
+		if authoritativeCost != nil {
+			out.Cost = *authoritativeCost
+			out.CostSource = export.CostSourceReported
+		} else {
+			out.Cost = cost
+			out.CostSource = export.CombinedCostSource(hasComputedCost, hasReportedCost)
+		}
+		out.AICredits = AICreditsFromCost(sess.Agent, out.Cost)
 	}
+	out.CostUSD = CostUSDFromCost(out.HasCost, out.Cost)
 	if len(unpricedSet) > 0 {
 		out.UnpricedModels = sortedSetKeys(unpricedSet)
 	}
@@ -2925,7 +3665,7 @@ func NewUsageSessionCounts(
 func (db *DB) GetUsageSessionCounts(
 	ctx context.Context, f UsageFilter,
 ) (UsageSessionCounts, error) {
-	query, args := usageRowQuery(f)
+	query, args := topSessionsUsageRowQuery(f)
 	// Deterministic ordering so the Claude dedup winner — the
 	// session that "owns" a shared message — is stable across
 	// runs. Matches GetDailyUsage / GetTopSessionsByCost so all

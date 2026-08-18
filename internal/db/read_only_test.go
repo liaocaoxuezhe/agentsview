@@ -11,6 +11,7 @@ import (
 	_ "github.com/mattn/go-sqlite3"
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
+	"go.kenn.io/agentsview/internal/money"
 )
 
 func tempDBPath(t *testing.T, name string) string {
@@ -81,6 +82,7 @@ func requireOpenReadOnlyFails(
 	require.Error(t, err)
 	require.Nil(t, readonly)
 	assert.Contains(t, err.Error(), contains)
+	assert.True(t, IsSchemaUpgradeRequired(err))
 }
 
 func requireReadOnlyOp(t *testing.T, name string, op func() error) {
@@ -94,10 +96,10 @@ func requireReadOnlyOp(t *testing.T, name string, op func() error) {
 func testModelPricing(pattern string) ModelPricing {
 	return ModelPricing{
 		ModelPattern:         pattern,
-		InputPerMTok:         1,
-		OutputPerMTok:        2,
-		CacheCreationPerMTok: 3,
-		CacheReadPerMTok:     4,
+		InputPerMTok:         money.MustParseDollars("1"),
+		OutputPerMTok:        money.MustParseDollars("2"),
+		CacheCreationPerMTok: money.MustParseDollars("3"),
+		CacheReadPerMTok:     money.MustParseDollars("4"),
 	}
 }
 
@@ -268,8 +270,15 @@ func TestOpenReadOnlyWriteMethodsReturnErrReadOnly(t *testing.T) {
 
 func TestOpenReadOnlyRejectsMissingMigratedColumn(t *testing.T) {
 	path := createClosedTestDB(t, tempDBPath(t, "sessions.db"), nil)
-	execRawSQLite(t, path, "ALTER TABLE sessions DROP COLUMN display_name")
-	requireOpenReadOnlyFails(t, path, "schema missing sessions.display_name")
+	// deletion_cause has no index and is deliberately excluded from the
+	// artifact_sessions_update_queue trigger's change-detection list (it is
+	// sync bookkeeping, not export-relevant), so SQLite's trigger/index-aware
+	// column-drop guard does not block removing it here. A column that the
+	// trigger references (e.g. display_name) or that is indexed (e.g.
+	// local_modified_at) cannot be dropped with DROP COLUMN while that
+	// trigger or index exists.
+	execRawSQLite(t, path, "ALTER TABLE sessions DROP COLUMN deletion_cause")
+	requireOpenReadOnlyFails(t, path, "schema missing sessions.deletion_cause")
 }
 
 func TestReadOnlySchemaCompatibilityRejectsMissingReadColumn(t *testing.T) {
@@ -293,6 +302,7 @@ func TestReadOnlySchemaCompatibilityRejectsMissingReadColumn(t *testing.T) {
 		{"worktree mapping", "worktree_project_mappings", "updated_at"},
 		{"pg sync state", "pg_sync_state", "value"},
 		{"model pricing", "model_pricing", "updated_at"},
+		{"pricing band", "model_pricing_bands", "input_microdollars_per_mtok"},
 		{"secret finding", "secret_findings", "rules_version"},
 		{"recall entry", "recall_entries", "uncertainty"},
 		{"recall evidence", "recall_evidence", "snippet"},
@@ -324,6 +334,7 @@ func TestOpenReadOnlyRejectsMissingReadTable(t *testing.T) {
 		{"secret_findings", "id"},
 		{"pg_sync_state", "key"},
 		{"model_pricing", "model_pattern"},
+		{"model_pricing_bands", "model_pattern"},
 		{"recall_query_events", "id"},
 		{"recall_query_exposures", "query_id"},
 		{"recall_extract_generations", "fingerprint"},

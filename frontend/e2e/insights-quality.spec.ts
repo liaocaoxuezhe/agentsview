@@ -30,8 +30,10 @@ const cannedInsight = {
   created_at: "2026-05-26T12:00:00Z",
 };
 
-test.describe("Insights quality rollout", () => {
-  test.describe.configure({ timeout: COLD_WEBKIT_TEST_TIMEOUT_MS });
+test.describe("Generated insights", () => {
+  if (process.env.CI !== "true") {
+    test.describe.configure({ timeout: COLD_WEBKIT_TEST_TIMEOUT_MS });
+  }
 
   test.beforeEach(async ({ page }) => {
     await page.route("**/api/v1/projects*", (route) =>
@@ -80,7 +82,7 @@ test.describe("Insights quality rollout", () => {
     );
   });
 
-  test("renders saved deterministic quality recommendation metadata", async ({
+  test("renders saved generated report metadata", async ({
     page,
   }) => {
     await page.addInitScript(() => {
@@ -104,17 +106,14 @@ test.describe("Insights quality rollout", () => {
       route.fulfill({ json: { insights: [cannedInsight] } }),
     );
 
-    await page.goto("/insights");
+    await page.goto("/recall?tab=generated");
 
     const archive = page.getByRole("region", {
-      name: "Generated Insights Archive",
+      name: "Generated insights",
     });
     const savedInsight = archive.getByRole("button", {
       name: /Prompt Maturity global/,
     });
-    await expect(
-      page.getByRole("heading", { name: "Quality Patterns" }),
-    ).toBeVisible();
     await archive.getByTitle("Select generator").click();
     await expect(
       archive.getByRole("option", { name: "Codex", exact: true }),
@@ -131,16 +130,17 @@ test.describe("Insights quality rollout", () => {
     await page.keyboard.press("Escape");
     await expect(savedInsight).toBeVisible();
     await savedInsight.click({ force: true });
-    await expect(page).toHaveURL(/\/insights\?.*insight=42/);
+    await expect(page).toHaveURL(/\/recall\?.*insight=42/);
     const selectedInsightUrl = new URL(page.url());
-    expect(selectedInsightUrl.pathname).toBe("/insights");
+    expect(selectedInsightUrl.pathname).toBe("/recall");
+    expect(selectedInsightUrl.searchParams.get("tab")).toBe("generated");
     expect(selectedInsightUrl.searchParams.get("insight")).toBe("42");
     expect(selectedInsightUrl.searchParams.get("window_days")).toBeNull();
     expect(selectedInsightUrl.searchParams.get("date_from")).toBeNull();
     expect(selectedInsightUrl.searchParams.get("date_to")).toBeNull();
 
     await expect(
-      page.locator(".generated-detail .badge", {
+      page.locator(".generated-detail .generated-badge", {
         hasText: "Prompt Maturity",
       }),
     ).toBeVisible();
@@ -184,13 +184,14 @@ test.describe("Insights quality rollout", () => {
     );
     const copiedUrl = new URL(copied!);
     expect(copiedUrl.origin).toBe(selectedInsightUrl.origin);
-    expect(copiedUrl.pathname).toBe("/insights");
+    expect(copiedUrl.pathname).toBe("/recall");
+    expect(copiedUrl.searchParams.get("tab")).toBe("generated");
     expect(copiedUrl.searchParams.get("insight")).toBe("42");
     expect(copiedUrl.searchParams.get("window_days")).toBeNull();
     expect(copiedUrl.searchParams.get("date_from")).toBeNull();
     expect(copiedUrl.searchParams.get("date_to")).toBeNull();
 
-    await page.goto("/insights?insight=42");
+    await page.goto("/recall?tab=generated&insight=42");
     await expect(
       page
         .locator(".generated-detail")
@@ -214,16 +215,16 @@ test.describe("Insights quality rollout", () => {
       }),
     );
 
-    await page.goto("/insights");
+    await page.goto("/recall?tab=generated");
 
     await expect(
-      page.getByRole("heading", { name: "Generated Insights Archive" }),
+      page.getByRole("heading", { name: "Generated insights" }),
     ).toBeVisible();
     await expect(
       page.getByText("No generated insights saved."),
     ).toBeVisible();
     const generate = page
-      .getByRole("region", { name: "Generated Insights Archive" })
+      .getByRole("region", { name: "Generated insights" })
       .getByRole("button", { name: "Generate" });
     await expect(generate).toHaveAttribute(
       "title",
@@ -271,13 +272,17 @@ test.describe("Insights quality rollout", () => {
       });
     });
 
-    await page.goto("/insights");
+    await page.goto("/recall?tab=generated");
 
     const archive = page.getByRole("region", {
-      name: "Generated Insights Archive",
+      name: "Generated insights",
     });
     await archive.getByTitle("Select template").click();
-    await archive.getByRole("option", { name: "Model and Cost" }).click();
+    const templateFilter = archive.getByRole("combobox", {
+      name: "Filter templates...",
+    });
+    await templateFilter.fill("Model and Cost");
+    await templateFilter.press("Enter");
     await archive.getByRole("button", { name: "Generate" }).click();
 
     await expect(

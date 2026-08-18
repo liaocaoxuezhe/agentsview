@@ -870,23 +870,23 @@ func TestSessionDateFilterIncludesOverlappingSessions(t *testing.T) {
 	d := testDB(t)
 
 	insertSession(t, d, "before", "proj", func(s *Session) {
-		s.StartedAt = new("2024-06-15T08:00:00Z")
-		s.EndedAt = new("2024-06-15T09:00:00Z")
+		s.StartedAt = new("2024-06-16T02:00:00Z")
+		s.EndedAt = new("2024-06-16T03:59:59Z")
 		s.MessageCount = 2
 	})
 	insertSession(t, d, "spanning", "proj", func(s *Session) {
-		s.StartedAt = new("2024-06-15T23:00:00Z")
+		s.StartedAt = new("2024-06-16T03:00:00Z")
 		s.EndedAt = new("2024-06-16T10:00:00Z")
 		s.MessageCount = 2
 	})
 	insertSession(t, d, "open", "proj", func(s *Session) {
-		s.StartedAt = new("2024-06-15T22:00:00Z")
+		s.StartedAt = new("2024-06-16T02:00:00Z")
 		s.MessageCount = 2
 	})
-	seedMessage(t, d, "open", 1, "user", "2024-06-16T11:00:00Z", "")
+	seedMessage(t, d, "open", 1, "user", "2024-06-17T03:59:59Z", "")
 	insertSession(t, d, "after", "proj", func(s *Session) {
-		s.StartedAt = new("2024-06-17T08:00:00Z")
-		s.EndedAt = new("2024-06-17T09:00:00Z")
+		s.StartedAt = new("2024-06-17T04:00:00Z")
+		s.EndedAt = new("2024-06-17T05:00:00Z")
 		s.MessageCount = 2
 	})
 	insertSession(t, d, "child", "proj", func(s *Session) {
@@ -903,24 +903,33 @@ func TestSessionDateFilterIncludesOverlappingSessions(t *testing.T) {
 		want   []string
 	}{
 		{
-			name:   "ExactDate",
-			filter: SessionFilter{Date: "2024-06-16"},
-			want:   []string{"spanning", "open"},
+			name: "ExactDate",
+			filter: SessionFilter{
+				Date: "2024-06-16", Timezone: "America/New_York",
+			},
+			want: []string{"spanning", "open"},
 		},
 		{
-			name:   "DateRange",
-			filter: SessionFilter{DateFrom: "2024-06-16", DateTo: "2024-06-16"},
-			want:   []string{"spanning", "open"},
+			name: "DateRange",
+			filter: SessionFilter{
+				DateFrom: "2024-06-16", DateTo: "2024-06-16",
+				Timezone: "America/New_York",
+			},
+			want: []string{"spanning", "open"},
 		},
 		{
-			name:   "DateFrom",
-			filter: SessionFilter{DateFrom: "2024-06-16"},
-			want:   []string{"spanning", "open", "after"},
+			name: "DateFrom",
+			filter: SessionFilter{
+				DateFrom: "2024-06-16", Timezone: "America/New_York",
+			},
+			want: []string{"spanning", "open", "after"},
 		},
 		{
-			name:   "DateTo",
-			filter: SessionFilter{DateTo: "2024-06-15"},
-			want:   []string{"before", "spanning", "open"},
+			name: "DateTo",
+			filter: SessionFilter{
+				DateTo: "2024-06-15", Timezone: "America/New_York",
+			},
+			want: []string{"before", "spanning", "open"},
 		},
 	}
 
@@ -931,7 +940,7 @@ func TestSessionDateFilterIncludesOverlappingSessions(t *testing.T) {
 	}
 
 	index, err := d.GetSidebarSessionIndex(context.Background(), SessionFilter{
-		Date: "2024-06-16",
+		Date: "2024-06-16", Timezone: "America/New_York",
 	})
 	require.NoError(t, err, "GetSidebarSessionIndex")
 	requireSidebarIndexIDs(t, index.Sessions, []string{
@@ -1292,6 +1301,47 @@ func TestSidebarSessionIndexIncludesChildrenForMatchingRoot(t *testing.T) {
 	})
 	requireNoError(t, err, "GetSidebarSessionIndex")
 	requireSidebarIndexIDs(t, index.Sessions, []string{"root", "sub", "fork"})
+}
+
+func TestSidebarSessionIndexTotalCountsCanonicalRoots(t *testing.T) {
+	d := testDB(t)
+
+	insertSession(t, d, "root", "alpha", func(s *Session) {
+		s.MessageCount = 10
+		s.UserMessageCount = 5
+	})
+	insertSession(t, d, "sub", "child-source", func(s *Session) {
+		s.MessageCount = 2
+		s.UserMessageCount = 1
+		s.ParentSessionID = new("root")
+		s.RelationshipType = "subagent"
+	})
+	insertSession(t, d, "fork", "child-source", func(s *Session) {
+		s.MessageCount = 2
+		s.UserMessageCount = 1
+		s.ParentSessionID = new("sub")
+		s.RelationshipType = "fork"
+	})
+	insertSession(t, d, "orphan", "alpha", func(s *Session) {
+		s.MessageCount = 2
+		s.UserMessageCount = 1
+		s.ParentSessionID = new("missing-parent")
+		s.RelationshipType = "subagent"
+	})
+	insertSession(t, d, "unrelated", "beta", func(s *Session) {
+		s.MessageCount = 5
+		s.UserMessageCount = 2
+	})
+
+	index, err := d.GetSidebarSessionIndex(context.Background(), SessionFilter{
+		Project: "alpha",
+	})
+	require.NoError(t, err, "GetSidebarSessionIndex")
+	requireSidebarIndexIDs(t, index.Sessions, []string{
+		"root", "sub", "fork", "orphan",
+	})
+	assert.Equal(t, 2, index.Total,
+		"only the matching root and promoted orphan are canonical roots")
 }
 
 func TestSidebarSessionIndexPagedExcludesAutomatedDescendants(t *testing.T) {

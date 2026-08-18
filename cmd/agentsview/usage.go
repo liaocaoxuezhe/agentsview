@@ -17,6 +17,7 @@ import (
 	"go.kenn.io/agentsview/internal/config"
 	"go.kenn.io/agentsview/internal/db"
 	"go.kenn.io/agentsview/internal/export"
+	"go.kenn.io/agentsview/internal/money"
 	"go.kenn.io/agentsview/internal/parser"
 	"go.kenn.io/agentsview/internal/pricing"
 	"go.kenn.io/agentsview/internal/pricingrefresh"
@@ -218,9 +219,21 @@ func noTokenDataNote(agent string, totals db.UsageTotals) string {
 }
 
 type UsageStatuslineConfig struct {
+	JSON    bool
 	Agent   string
 	Offline bool
 	NoSync  bool
+}
+
+// usageStatuslineReport is the machine-readable form of the statusline. It
+// carries the same facts as the human line and nothing more: today's cost,
+// the day it covers, and the agent filter that produced it. Cost stays a
+// money.Money so callers read exact microdollars instead of scraping the
+// formatted string.
+type usageStatuslineReport struct {
+	Date  string      `json:"date"`
+	Cost  money.Money `json:"cost"`
+	Agent string      `json:"agent,omitempty"`
 }
 
 func runUsageStatusline(cfg UsageStatuslineConfig) {
@@ -255,7 +268,28 @@ func runUsageStatusline(cfg UsageStatuslineConfig) {
 		os.Exit(1)
 	}
 
+	if cfg.JSON {
+		printUsageStatuslineJSON(result, cfg.Agent, today)
+		return
+	}
+
 	printUsageStatusline(result, cfg.Agent)
+}
+
+func printUsageStatuslineJSON(
+	result db.DailyUsageResult, agent, date string,
+) {
+	enc := json.NewEncoder(os.Stdout)
+	enc.SetIndent("", "  ")
+	report := usageStatuslineReport{
+		Date:  date,
+		Cost:  result.Totals.TotalCost,
+		Agent: agent,
+	}
+	if err := enc.Encode(report); err != nil {
+		fmt.Fprintf(os.Stderr, "error: %v\n", err)
+		os.Exit(1)
+	}
 }
 
 func printUsageStatusline(result db.DailyUsageResult, agent string) {
@@ -311,7 +345,10 @@ func ensureFreshData(
 	if database.NeedsResync() {
 		engine := sync.NewEngine(database, sync.EngineConfig{
 			AgentDirs:          appCfg.AgentDirs,
+			SourceMachines:     appCfg.SourceMachines,
+			DisabledAgents:     appCfg.DisabledAgents,
 			IncludeCwdPrefixes: appCfg.SyncIncludeCwdPrefixes,
+			ScanProtectedPaths: appCfg.ScanProtectedPaths,
 			Machine:            appCfg.LocalMachineName,
 		})
 		defer engine.Close()
@@ -335,7 +372,10 @@ func ensureFreshData(
 
 	engine := sync.NewEngine(database, sync.EngineConfig{
 		AgentDirs:          appCfg.AgentDirs,
+		SourceMachines:     appCfg.SourceMachines,
+		DisabledAgents:     appCfg.DisabledAgents,
 		IncludeCwdPrefixes: appCfg.SyncIncludeCwdPrefixes,
+		ScanProtectedPaths: appCfg.ScanProtectedPaths,
 		Machine:            appCfg.LocalMachineName,
 	})
 	defer engine.Close()
@@ -374,8 +414,7 @@ func printSyncSummaryStderr(stats sync.SyncStats, t time.Time) {
 	}
 }
 
-// seedPricing ensures fallback rates are present in
-// model_pricing, then kicks off a background LiteLLM refresh.
+// seedPricing ensures fallback rates are present in model_pricing.
 //
 // Fallback rates are only upserted when the stored seed
 // version differs from pricing.SeedVersion (or is
@@ -385,22 +424,15 @@ func printSyncSummaryStderr(stats sync.SyncStats, t time.Time) {
 // the supplemental alias version, so curated alias additions
 // (see internal/pricing/supplemental.go) also reach existing
 // databases without a resync.
-func seedPricing(database *db.DB) {
-	if err := pricingrefresh.SeedFallback(database); err != nil {
+func seedPricing(
+	database *db.DB,
+	runner pricingRefreshExclusiveRunner,
+) {
+	err := runPricingExclusive(runner, func() error {
+		return pricingrefresh.SeedFallback(database)
+	})
+	if err != nil {
 		log.Printf("pricing seed: %v", err)
-	}
-	go refreshPricingFromLiteLLM(database)
-}
-
-// refreshPricingFromLiteLLM fetches the upstream LiteLLM
-// catalog and upserts it over whatever is in the table. Called
-// from a goroutine after the synchronous fallback seed so a
-// slow or failing fetch never blocks server startup.
-func refreshPricingFromLiteLLM(database *db.DB) {
-	if err := pricingrefresh.Refresh(
-		database, pricing.FetchLiteLLMPricing,
-	); err != nil {
-		log.Printf("pricing refresh: %v", err)
 	}
 }
 
@@ -427,26 +459,61 @@ func ensureUsagePricing(
 func applyFallbackPricing(
 	database *db.DB, custom map[string]config.CustomModelRate,
 ) {
-	rates := make(map[string]config.CustomModelRate)
-	sources := make(map[string]export.PricingRowSource)
+	database.SetEffectivePricing(fallbackPricingRates(custom))
+}
+
+func applyEmptyCatalogPricing(
+	database *db.DB, custom map[string]config.CustomModelRate,
+) {
+	database.SetEmptyCatalogPricing(fallbackPricingRates(custom))
+}
+
+func fallbackPricingRates(
+	custom map[string]config.CustomModelRate,
+) map[string]export.ModelRates {
+	rates := make(map[string]export.ModelRates)
 	for _, p := range pricing.FallbackPricing() {
 		// These keys are the same concrete model-pattern keys that the
 		// model_pricing table stores. SQLite usage lookups run the merged map
 		// through pricing.Resolve, so normalized/canonical aliases still match
 		// when this read-only path cannot seed model_pricing rows.
-		rates[p.ModelPattern] = config.CustomModelRate{
-			Input:         p.InputPerMTok,
-			Output:        p.OutputPerMTok,
-			CacheCreation: p.CacheCreationPerMTok,
-			CacheRead:     p.CacheReadPerMTok,
+		bands := make([]export.PricingBand, len(p.Bands))
+		for i, band := range p.Bands {
+			bands[i] = export.PricingBand{
+				AboveInputTokens:  band.AboveInputTokens,
+				InputPerMTok:      band.InputPerMTok,
+				OutputPerMTok:     band.OutputPerMTok,
+				CacheWritePerMTok: band.CacheCreationPerMTok,
+				CacheReadPerMTok:  band.CacheReadPerMTok,
+			}
 		}
-		sources[p.ModelPattern] = export.PricingRowSourceEmbedded
+		rates[p.ModelPattern] = export.ModelRates{
+			InputPerMTok:      p.InputPerMTok,
+			OutputPerMTok:     p.OutputPerMTok,
+			CacheWritePerMTok: p.CacheCreationPerMTok,
+			CacheReadPerMTok:  p.CacheReadPerMTok,
+			Source:            export.PricingRowSourceEmbedded,
+			Bands:             bands,
+		}
 	}
 	for model, rate := range custom {
-		rates[model] = rate
-		sources[model] = export.PricingRowSourceCustom
+		rates[model] = export.ModelRates{
+			InputPerMTok: money.Money{
+				Microdollars: rate.InputMicrodollarsPerMTok,
+			},
+			OutputPerMTok: money.Money{
+				Microdollars: rate.OutputMicrodollarsPerMTok,
+			},
+			CacheWritePerMTok: money.Money{
+				Microdollars: rate.CacheCreationMicrodollarsPerMTok,
+			},
+			CacheReadPerMTok: money.Money{
+				Microdollars: rate.CacheReadMicrodollarsPerMTok,
+			},
+			Source: export.PricingRowSourceCustom,
+		}
 	}
-	database.SetEffectivePricing(rates, sources)
+	return rates
 }
 
 func fetchHTTPDailyUsage(
@@ -589,11 +656,8 @@ func localTimezone() string {
 // matching conventional currency display. Non-zero values
 // under half a cent would otherwise round to "$0.00" and
 // read as "free", so they render as "<$0.01" instead.
-func fmtCost(v float64) string {
-	if v > 0 && v < 0.005 {
-		return "<$0.01"
-	}
-	return fmt.Sprintf("$%.2f", v)
+func fmtCost(v money.Money) string {
+	return money.FormatUSD(v, money.DisplayCents)
 }
 
 func joinModels(models []string) string {

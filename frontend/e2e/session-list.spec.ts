@@ -4,9 +4,9 @@ import { clickNavTab } from "./helpers/nav";
 
 // Test-fixture assumptions: project-alpha has 2 sessions,
 // project-beta has 3, project-duration has 1 (the duration UX
-// showcase), project-edits has 1 (the recent-edits fixture),
-// totalling 10 sessions across all projects.
-const TOTAL_SESSIONS = 10;
+// showcase), project-edits has 1 (the recent-edits fixture), and the
+// project-reclassification fixture has 2, totalling 12 sessions.
+const TOTAL_SESSIONS = 12;
 const ALPHA_SESSIONS = 2;
 const BETA_SESSIONS = 3;
 const SLOW_SESSION_RESPONSE_MS = 5_500;
@@ -119,8 +119,8 @@ test.describe("Session list", () => {
     expect(expectedFrom).toMatch(/^\d{4}-\d{2}-\d{2}$/);
     expect(expectedTo).toMatch(/^\d{4}-\d{2}-\d{2}$/);
 
-    await clickNavTab(page, "Insights");
-    await expect(page).toHaveURL(/\/insights/);
+    await clickNavTab(page, "Quality");
+    await expect(page).toHaveURL(/\/quality/);
 
     const requestPromise = page.waitForRequest((request) =>
       new URL(request.url()).pathname.endsWith(
@@ -150,6 +150,10 @@ test.describe("Session list", () => {
     const expectedTo = selectedUrl.searchParams.get("date_to");
 
     await page.getByRole("button", { name: "Settings" }).click();
+    await page
+      .getByRole("navigation", { name: "Settings" })
+      .locator("button", { hasText: "Date ranges" })
+      .click();
     await page
       .getByRole("switch", { name: "Link date ranges across pages" })
       .check();
@@ -205,6 +209,10 @@ test.describe("Session list", () => {
     await page.locator(".kit-date-range-picker__trigger").click();
     await page.getByRole("button", { name: "90d", exact: true }).click();
     await page.getByRole("button", { name: "Settings" }).click();
+    await page
+      .getByRole("navigation", { name: "Settings" })
+      .locator("button", { hasText: "Date ranges" })
+      .click();
     await page
       .getByRole("switch", { name: "Link date ranges across pages" })
       .check();

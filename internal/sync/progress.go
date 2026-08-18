@@ -1,6 +1,9 @@
 package sync
 
-import gosync "sync"
+import (
+	gosync "sync"
+	"time"
+)
 
 // Phase describes the current sync phase.
 type Phase string
@@ -18,20 +21,27 @@ const (
 	PhaseDone             Phase = "done"
 )
 
+const defaultProgressStallAfter = 5 * time.Minute
+
 // Progress reports sync progress to listeners.
 type Progress struct {
-	Phase           Phase  `json:"phase"`
-	Detail          string `json:"detail,omitempty"`
-	Hint            string `json:"hint,omitempty"`
-	Resync          bool   `json:"resync,omitempty"`
-	CurrentProject  string `json:"current_project,omitempty"`
-	ProjectsTotal   int    `json:"projects_total"`
-	ProjectsDone    int    `json:"projects_done"`
-	SessionsTotal   int    `json:"sessions_total"`
-	SessionsDone    int    `json:"sessions_done"`
-	MessagesIndexed int    `json:"messages_indexed"`
-	BytesDone       int64  `json:"bytes_done,omitempty"`
-	BytesTotal      int64  `json:"bytes_total,omitempty"`
+	Phase             Phase     `json:"phase"`
+	Detail            string    `json:"detail,omitempty"`
+	Hint              string    `json:"hint,omitempty"`
+	Resync            bool      `json:"resync,omitempty"`
+	StartedAt         time.Time `json:"started_at,omitzero"`
+	UpdatedAt         time.Time `json:"updated_at,omitzero"`
+	Stalled           bool      `json:"stalled,omitempty"`
+	CurrentProject    string    `json:"current_project,omitempty"`
+	ProjectsTotal     int       `json:"projects_total"`
+	ProjectsDone      int       `json:"projects_done"`
+	SessionsTotal     int       `json:"sessions_total"`
+	SessionsDone      int       `json:"sessions_done"`
+	MessagesIndexed   int       `json:"messages_indexed"`
+	BytesDone         int64     `json:"bytes_done,omitempty"`
+	BytesTotal        int64     `json:"bytes_total,omitempty"`
+	FallbackProviders int       `json:"fallback_providers,omitempty"`
+	FallbackSources   int       `json:"fallback_sources,omitempty"`
 }
 
 // SyncResult describes the outcome of syncing a single session.
@@ -59,6 +69,10 @@ type SyncStats struct {
 	Warnings       []string            `json:"warnings,omitempty"`
 	Aborted        bool                `json:"aborted,omitempty"`
 	RebuildPhases  []RebuildPhaseStats `json:"rebuild_phases,omitempty"`
+	// Tombstoned counts committed session removals that are not ordinary sync
+	// writes. It remains meaningful on a partially failed or aborted pass: a
+	// later retry cannot rediscover an already-tombstoned row to notify clients.
+	Tombstoned int `json:"tombstoned,omitempty"`
 
 	// Anomalies aggregates per-run parser/sanitizer anomaly signals
 	// surfaced in the CLI sync summary. These are live per-run counters
@@ -67,12 +81,12 @@ type SyncStats struct {
 	Anomalies AnomalyStats `json:"anomalies,omitzero"`
 
 	filesOK int // unexported: file-level success counter
-	// sourceMissingTombstoned counts stored virtual members tombstoned
-	// during this run because their member source vanished from a
-	// still-existing shared container. Changed-path syncs use it to emit
-	// a sessions event even when nothing else was written.
-	sourceMissingTombstoned int
-	filesDiscovered         int // file-based total, excludes DB-backed agents
+	// sourceMissingArchiveMembers carries members discovered in the original
+	// archive while a full resync writes into its replacement. Orphan copy must
+	// materialize them before the rebuild can apply the same guarded tombstone
+	// transition used by an in-place sync.
+	sourceMissingArchiveMembers []sourceMissingMember
+	filesDiscovered             int // file-based total, excludes DB-backed agents
 	// nonContainerDiscovered counts discovered files that are not part of
 	// a self-preserving container store (OpenCode-format storage and its
 	// SQLite virtual paths). The resync empty-discovery guard uses it so a
@@ -83,6 +97,12 @@ type SyncStats struct {
 	parserExcludedFiles    int // file-level intentional parser exclusions
 	parserExcludedIDs      []string
 	providerFailures       int // authoritative discoveries that did not complete
+	// ArchiveRebuilt records a completed full-resync database swap. A rebuild
+	// can preserve/copy durable corpus rows while syncing zero session files,
+	// so downstream refresh consumers cannot infer it from Synced. It is not
+	// serialized in sync API responses; parent-side worker coordination sets it
+	// only after the replacement archive has been installed successfully.
+	ArchiveRebuilt bool `json:"-"`
 	// cwdFilteredSessions counts sessions vetoed by the
 	// sync_include_cwd_prefixes allow-list. The resync abort guard uses
 	// it so a run where every discovered session is filtered reads as
@@ -95,6 +115,11 @@ type SyncStats struct {
 	cwdFilteredFiles int
 }
 
+func (s SyncStats) shouldEmitSync() bool {
+	return s.Tombstoned > 0 ||
+		(!s.Aborted && (s.Synced > 0 || s.ArchiveRebuilt))
+}
+
 // AnomalyStats aggregates parser-output anomaly signals observed during a
 // single sync run. It surfaces numbers that already exist or are already
 // computed but were previously discarded: per-agent parser malformed-line
@@ -102,6 +127,8 @@ type SyncStats struct {
 // the central validateAndSanitize pass. It is a per-run summary only; no
 // new persisted columns back it.
 type AnomalyStats struct {
+	UnsupportedSourceLayoutsByAgent map[string]int `json:"unsupported_source_layouts_by_agent,omitempty"`
+	UnsupportedSourceLayoutsTotal   int            `json:"unsupported_source_layouts_total,omitempty"`
 	// MalformedLinesByAgent maps an agent type to the total number of
 	// parser malformed lines reported by sessions of that agent in this
 	// run. Only non-zero agents are present.
@@ -160,10 +187,22 @@ func (s SanitizeStats) IsZero() bool {
 // IsZero reports whether the run observed no anomalies at all, so the CLI
 // summary can omit the anomaly section entirely on clean runs.
 func (a AnomalyStats) IsZero() bool {
-	return a.MalformedLinesTotal == 0 &&
+	return a.UnsupportedSourceLayoutsTotal == 0 &&
+		a.MalformedLinesTotal == 0 &&
 		a.UnknownSchemaSessionsTotal == 0 &&
 		a.GenMetadataWithoutUsageTotal == 0 &&
 		a.Sanitize.IsZero()
+}
+
+func (a *AnomalyStats) RecordUnsupportedSourceLayouts(agent string, n int) {
+	if n <= 0 {
+		return
+	}
+	if a.UnsupportedSourceLayoutsByAgent == nil {
+		a.UnsupportedSourceLayoutsByAgent = make(map[string]int)
+	}
+	a.UnsupportedSourceLayoutsByAgent[agent] += n
+	a.UnsupportedSourceLayoutsTotal += n
 }
 
 // RecordMalformedLines attributes n parser malformed lines to the given
@@ -220,6 +259,9 @@ func (a *AnomalyStats) addSanitize(v validationStats) {
 
 // merge folds another AnomalyStats into the receiver.
 func (a *AnomalyStats) merge(o AnomalyStats) {
+	for agent, n := range o.UnsupportedSourceLayoutsByAgent {
+		a.RecordUnsupportedSourceLayouts(agent, n)
+	}
 	for agent, n := range o.MalformedLinesByAgent {
 		a.RecordMalformedLines(agent, n)
 	}
@@ -249,7 +291,8 @@ type anomalyAccumulator struct {
 	// malformedFiles tracks source paths whose malformed-line count has
 	// already been recorded this run, so a file that forks into several
 	// sessions counts its malformed lines once. Reset each run.
-	malformedFiles map[string]bool
+	malformedFiles     map[string]bool
+	unsupportedSources map[string]bool
 }
 
 // reset clears the accumulator at the start of a sync run.
@@ -257,7 +300,21 @@ func (a *anomalyAccumulator) reset() {
 	a.mu.Lock()
 	a.stats = AnomalyStats{}
 	a.malformedFiles = nil
+	a.unsupportedSources = nil
 	a.mu.Unlock()
+}
+
+func (a *anomalyAccumulator) recordUnsupportedSourceLayout(agent, source string) {
+	a.mu.Lock()
+	defer a.mu.Unlock()
+	if a.unsupportedSources == nil {
+		a.unsupportedSources = make(map[string]bool)
+	}
+	if a.unsupportedSources[source] {
+		return
+	}
+	a.unsupportedSources[source] = true
+	a.stats.RecordUnsupportedSourceLayouts(agent, 1)
 }
 
 // recordMalformedLines accumulates an agent's parser malformed-line count for

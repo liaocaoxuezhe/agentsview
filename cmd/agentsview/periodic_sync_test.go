@@ -2,6 +2,7 @@ package main
 
 import (
 	"context"
+	"errors"
 	"os"
 	"path/filepath"
 	"testing"
@@ -22,21 +23,26 @@ func TestScheduledReconcileTargetsSelectsOnlyOptedInProviders(t *testing.T) {
 	aiderDir := filepath.Join(home, "aider")
 	coworkDir := filepath.Join(home, "cowork")
 	claudeDir := filepath.Join(home, "claude")
+	omnigentDir := filepath.Join(home, "omnigent")
 	require.NoError(t, os.MkdirAll(aiderDir, 0o755))
 	require.NoError(t, os.MkdirAll(coworkDir, 0o755))
 	require.NoError(t, os.MkdirAll(claudeDir, 0o755))
+	require.NoError(t, os.MkdirAll(omnigentDir, 0o755))
 
 	cfg := config.Config{
 		AgentDirs: map[parser.AgentType][]string{
-			parser.AgentAider:  {aiderDir},
-			parser.AgentCowork: {coworkDir},
-			parser.AgentClaude: {claudeDir},
+			parser.AgentAider:    {aiderDir},
+			parser.AgentCowork:   {coworkDir},
+			parser.AgentClaude:   {claudeDir},
+			parser.AgentOmnigent: {omnigentDir},
 		},
 	}
 	targets := scheduledReconcileTargets(cfg)
-	require.Len(t, targets, 1, "only the opted-in provider is scheduled")
+	require.Len(t, targets, 2, "only opted-in providers are scheduled")
 	assert.Equal(t, parser.AgentAider, targets[0].Agent)
 	assert.Equal(t, []string{aiderDir}, targets[0].Roots)
+	assert.Equal(t, parser.AgentOmnigent, targets[1].Agent)
+	assert.Equal(t, []string{omnigentDir}, targets[1].Roots)
 }
 
 func TestScheduledReconcileDefersUnavailableOptedInRoots(t *testing.T) {
@@ -220,4 +226,35 @@ func TestRunScheduledSyncPassCallsPerAgent(t *testing.T) {
 	require.Len(t, engine.calls, 1)
 	assert.Equal(t, parser.AgentAider, engine.calls[0].Agent)
 	assert.Equal(t, []string{"/a"}, engine.calls[0].Roots)
+}
+
+func TestRunScheduledSyncPassLogsLifecycle(t *testing.T) {
+	tests := []struct {
+		name        string
+		err         error
+		wantOutcome string
+	}{
+		{name: "completed", wantOutcome: "completed"},
+		{name: "failed", err: errors.New("provider unavailable"), wantOutcome: "failed"},
+	}
+
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			logs := captureLogOutput(t)
+			engine := &fakeScheduledEngine{err: tc.err}
+			runScheduledSyncPass(context.Background(), engine,
+				[]scheduledReconcileTarget{{
+					Agent: parser.AgentAider, Roots: []string{"/a"},
+				}},
+			)
+
+			output := logs.String()
+			assert.Contains(t, output,
+				"scheduled reconciliation started: targets=1")
+			assert.Contains(t, output,
+				"scheduled reconciliation finished: targets=1")
+			assert.Contains(t, output, "duration=")
+			assert.Contains(t, output, "outcome="+tc.wantOutcome)
+		})
+	}
 }

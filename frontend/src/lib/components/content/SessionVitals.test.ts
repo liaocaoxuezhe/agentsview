@@ -8,7 +8,7 @@ import {
   vi,
 } from "vitest";
 import { mount, tick, unmount } from "svelte";
-import { cleanup, render } from "@testing-library/svelte";
+import { cleanup, fireEvent, render, screen } from "@testing-library/svelte";
 import type { Session } from "../../api/types/core.js";
 import type { SessionTiming } from "../../api/types/timing.js";
 
@@ -64,8 +64,22 @@ describe("SessionVitals", () => {
 
   beforeEach(() => {
     mocks.fetchSessionTiming.mockReset().mockResolvedValue(mocks.timing);
+    vi.stubGlobal("fetch", vi.fn(async (input: RequestInfo | URL) => {
+      const url = String(input);
+      if (url.includes("/api/v1/recall/entries?")) {
+        return new Response(
+          JSON.stringify({ entries: [], trusted_only: false }),
+          { status: 200, headers: { "Content-Type": "application/json" } },
+        );
+      }
+      return new Response(
+        JSON.stringify({ error: "not mocked" }),
+        { status: 500, headers: { "Content-Type": "application/json" } },
+      );
+    }));
     sessionTiming.reset();
     ui.vitalsOpen = true;
+    ui.vitalsCallsExpanded = true;
   });
 
   afterEach(() => {
@@ -126,11 +140,30 @@ describe("SessionVitals", () => {
     expect(
       document.querySelector('[title="agentsview"]'),
     ).not.toBeNull();
+  });
+
+  it("reveals the full worktree path in a tooltip", async () => {
+    component = mount(SessionVitals, {
+      target: document.body,
+      props: { sessionId: traceSession.id, session: traceSession },
+    });
+    await tick();
+    await tick();
+
+    const worktreeValue = document.querySelector<HTMLElement>(
+      ".context-value--path",
+    );
+    expect(worktreeValue).not.toBeNull();
+
+    const trigger = worktreeValue!.closest<HTMLElement>(
+      ".kit-tooltip-trigger",
+    );
+    expect(trigger).not.toBeNull();
+    await fireEvent.mouseEnter(trigger!);
+
     expect(
-      document.querySelector(
-        '[title="/repos/agentsview/.worktrees/trace-context"]',
-      ),
-    ).not.toBeNull();
+      (await screen.findByRole("tooltip")).textContent?.trim(),
+    ).toBe(traceSession.cwd);
   });
 
   it("keeps trace context visible when timing fails to load", async () => {
@@ -179,6 +212,176 @@ describe("SessionVitals", () => {
     worktreeCopy!.click();
     await Promise.resolve();
     expect(writeText).toHaveBeenNthCalledWith(2, traceSession.cwd);
+  });
+
+  it("shows distilled recall and jumps to its transcript evidence", async () => {
+    const fetchMock = vi.fn().mockResolvedValue(new Response(
+      JSON.stringify({
+        entries: [{
+          id: "recall-1",
+          type: "fact",
+          scope: "project",
+          status: "accepted",
+          review_state: "unreviewed_auto",
+          title: "Retry bounded background work",
+          body: "Background retries stop after one delayed attempt.",
+          source_session_id: "sess-1",
+          source_run_id: "generation-2026-07-23",
+          extractor_method: "turns-v1",
+          transferable: false,
+          provenance_ok: true,
+          created_at: "2026-07-23T10:00:00Z",
+          updated_at: "2026-07-23T10:00:00Z",
+          evidence: [{
+            id: 1,
+            entry_id: "recall-1",
+            session_id: "sess-1",
+            message_start_ordinal: 12,
+            message_end_ordinal: 14,
+            snippet: "Bound the retry lifecycle.",
+          }],
+        }],
+        trusted_only: false,
+      }),
+      { status: 200, headers: { "Content-Type": "application/json" } },
+    ));
+    vi.stubGlobal("fetch", fetchMock);
+    const scroll = vi.spyOn(ui, "scrollToOrdinal");
+    component = mount(SessionVitals, {
+      target: document.body,
+      props: { sessionId: "sess-1", session: traceSession },
+    });
+
+    await vi.waitFor(() => {
+      expect(fetchMock).toHaveBeenCalledWith(
+        expect.stringContaining(
+          "/api/v1/recall/entries?source_session_id=sess-1",
+        ),
+        expect.objectContaining({ signal: expect.any(AbortSignal) }),
+      );
+    });
+    await vi.waitFor(() => {
+      expect(document.body.textContent).toContain(
+        "Retry bounded background work",
+      );
+    });
+    expect(document.body.textContent).toContain(
+      "Background retries stop after one delayed attempt.",
+    );
+    expect(document.body.textContent).toContain("fact");
+    expect(document.body.textContent).toContain("unreviewed_auto");
+    expect(document.body.textContent).toContain("generation-2026-07-23");
+
+    const evidenceButton = Array.from(
+      document.querySelectorAll<HTMLButtonElement>("button"),
+    ).find((button) => button.textContent?.includes("12–14"));
+    expect(evidenceButton).toBeDefined();
+    evidenceButton!.click();
+
+    expect(scroll).toHaveBeenCalledWith(12, "sess-1");
+    scroll.mockRestore();
+  });
+
+  it("labels revoked recall provenance and does not link its evidence", async () => {
+    const fetchMock = vi.fn().mockResolvedValue(new Response(
+      JSON.stringify({
+        entries: [{
+          id: "recall-revoked",
+          type: "fact",
+          scope: "project",
+          status: "accepted",
+          review_state: "unreviewed_auto",
+          title: "Outdated transcript claim",
+          body: "This entry no longer has valid source provenance.",
+          source_session_id: "sess-1",
+          source_run_id: "generation-revoked",
+          extractor_method: "turns-v1",
+          transferable: false,
+          provenance_ok: false,
+          created_at: "2026-07-23T10:00:00Z",
+          updated_at: "2026-07-23T10:00:00Z",
+          evidence: [{
+            id: 2,
+            entry_id: "recall-revoked",
+            session_id: "sess-1",
+            message_start_ordinal: 21,
+            message_end_ordinal: 23,
+            snippet: "This source range was revoked.",
+          }],
+        }],
+        trusted_only: false,
+      }),
+      { status: 200, headers: { "Content-Type": "application/json" } },
+    ));
+    vi.stubGlobal("fetch", fetchMock);
+    component = mount(SessionVitals, {
+      target: document.body,
+      props: { sessionId: "sess-1", session: traceSession },
+    });
+
+    await vi.waitFor(() => {
+      expect(document.body.textContent).toContain("Outdated transcript claim");
+    });
+    expect(document.body.textContent).toContain("Provenance revoked");
+    expect(document.body.textContent).toContain("Messages 21–23");
+    const evidenceButton = Array.from(
+      document.querySelectorAll<HTMLButtonElement>("button"),
+    ).find((button) => button.textContent?.includes("21–23"));
+    expect(evidenceButton).toBeUndefined();
+  });
+
+  it("shows an empty Recall state for a session without distilled entries", async () => {
+    component = mount(SessionVitals, {
+      target: document.body,
+      props: { sessionId: "sess-1", session: traceSession },
+    });
+
+    await vi.waitFor(() => {
+      expect(document.body.textContent).toContain(
+        m.session_recall_empty(),
+      );
+    });
+  });
+
+  it("collapses and restores the Calls detail while keeping its summary", async () => {
+    mocks.fetchSessionTiming.mockResolvedValue(timingWithCall());
+    component = mount(SessionVitals, {
+      target: document.body,
+      props: { sessionId: "sess-1", session: undefined },
+    });
+    await tick();
+    await tick();
+
+    const disclosure = document.querySelector<HTMLButtonElement>(
+      'button[aria-expanded="true"]',
+    );
+    expect(disclosure).not.toBeNull();
+    expect(disclosure?.textContent).toContain(
+      m.session_vitals_calls(),
+    );
+    expect(document.querySelector(".scale-axis")).not.toBeNull();
+    expect(document.querySelector(".calls")).not.toBeNull();
+
+    disclosure!.click();
+    await tick();
+
+    expect(disclosure?.getAttribute("aria-expanded")).toBe("false");
+    expect(disclosure?.textContent).toContain(
+      m.session_vitals_calls_summary({
+        count: 1,
+        countLabel: "1",
+        runningCount: 0,
+      }),
+    );
+    expect(document.querySelector(".scale-axis")).toBeNull();
+    expect(document.querySelector(".calls")).toBeNull();
+
+    disclosure!.click();
+    await tick();
+
+    expect(disclosure?.getAttribute("aria-expanded")).toBe("true");
+    expect(document.querySelector(".scale-axis")).not.toBeNull();
+    expect(document.querySelector(".calls")).not.toBeNull();
   });
 
   it("aborts a pending sub-agent timing read when collapsed", async () => {
@@ -282,6 +485,33 @@ describe("SessionVitals", () => {
     expect(signals[0]?.aborted).toBe(true);
   });
 });
+
+function timingWithCall(): SessionTiming {
+  return {
+    ...mocks.timing,
+    tool_duration_ms: 400,
+    tool_call_count: 1,
+    turns: [
+      {
+        message_id: 1,
+        ordinal: 1,
+        started_at: "2026-07-14T12:00:00Z",
+        duration_ms: 400,
+        primary_category: "Bash",
+        calls: [
+          {
+            tool_use_id: "call-1",
+            tool_name: "Bash",
+            category: "Bash",
+            duration_ms: 400,
+            is_parallel: false,
+            input_preview: "go test ./...",
+          },
+        ],
+      },
+    ],
+  };
+}
 
 function parentTimingWithSubagent(): SessionTiming {
   return {

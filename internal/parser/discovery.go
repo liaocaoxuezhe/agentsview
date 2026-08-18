@@ -54,14 +54,18 @@ type DiscoveredFile struct {
 	Path        string
 	Project     string    // pre-extracted project name
 	Agent       AgentType // which agent this file belongs to
-	Machine     string    // source machine (set for s3:// sources; empty = host machine)
+	Machine     string    // source machine override; empty = engine default
 	SourceSize  int64     // source object size for s3:// sources
 	SourceMtime int64     // source object mtime for s3:// sources, UnixNano
 	// SourceFingerprint is a durable object fingerprint for s3:// sources.
 	SourceFingerprint string
-	ForceParse        bool       // caller requires a full source reparse
-	ProviderSource    *SourceRef // provider-owned source identity, when known
-	ProviderProcess   bool       // true when this caller may parse via ProviderSource
+	ForceParse        bool // caller requires freshness bypass
+	// ForceFullParse also disables append-only processing so a materialized
+	// replacement cannot be mistaken for bytes appended to the stored source.
+	// A durable skip-cache entry may suppress it after a previous attempt.
+	ForceFullParse  bool
+	ProviderSource  *SourceRef // provider-owned source identity, when known
+	ProviderProcess bool       // true when this caller may parse via ProviderSource
 }
 
 // OpenCodeSourceMode identifies the usable OpenCode storage
@@ -501,6 +505,68 @@ func ClaudeProjectSessionFiles(projectsDir string) []DiscoveredFile {
 	return files
 }
 
+// ClaudeSubagentTranscriptPaths returns candidate subagent transcripts to
+// refresh before querying the Claude session stored at sessionPath, sorted by
+// path. Root sessions scan their own subagents tree. A subagent scans its
+// enclosing root's tree so newly written nested descendants can be linked;
+// relationship traversal later limits usage aggregation to the queried
+// session's descendants. An s3:// session lists the equivalent prefix and
+// returns object URIs. Returns nil for a non-Claude path, a path with no such
+// directory, or an empty path.
+func ClaudeSubagentTranscriptPaths(sessionPath string) []string {
+	if sessionPath == "" || !strings.HasSuffix(sessionPath, ".jsonl") {
+		return nil
+	}
+	if strings.HasPrefix(sessionPath, "s3://") {
+		return claudeS3SubagentTranscriptPaths(sessionPath)
+	}
+	stem := strings.TrimSuffix(filepath.Base(sessionPath), ".jsonl")
+	if stem == "" {
+		return nil
+	}
+	subagentsDir := filepath.Join(filepath.Dir(sessionPath), stem, "subagents")
+	if strings.HasPrefix(stem, "agent-") {
+		subagentsDir = claudeEnclosingSubagentsDir(sessionPath)
+		if subagentsDir == "" {
+			return nil
+		}
+	}
+	cleanSessionPath := filepath.Clean(sessionPath)
+	var paths []string
+	_ = filepath.WalkDir(
+		subagentsDir,
+		func(path string, entry os.DirEntry, err error) error {
+			if err != nil || entry.IsDir() {
+				return nil
+			}
+			name := entry.Name()
+			if !strings.HasPrefix(name, "agent-") ||
+				!strings.HasSuffix(name, ".jsonl") {
+				return nil
+			}
+			if filepath.Clean(path) == cleanSessionPath {
+				return nil
+			}
+			paths = append(paths, path)
+			return nil
+		},
+	)
+	sort.Strings(paths)
+	return paths
+}
+
+func claudeEnclosingSubagentsDir(sessionPath string) string {
+	for dir := filepath.Dir(sessionPath); ; dir = filepath.Dir(dir) {
+		if filepath.Base(dir) == "subagents" {
+			return dir
+		}
+		parent := filepath.Dir(dir)
+		if parent == dir {
+			return ""
+		}
+	}
+}
+
 // claudeFindSourceFile finds the original JSONL file for a Claude
 // session ID by searching all project directories. It is the
 // provider-owned lookup body used by the Claude provider source set's
@@ -710,6 +776,23 @@ func IsValidSessionID(id string) bool {
 	}
 	for _, c := range id {
 		if !isAlphanumOrDashUnderscore(c) {
+			return false
+		}
+	}
+	return true
+}
+
+// IsValidQoderSessionID reports whether id is a valid Qoder session
+// identifier. Qoder session IDs use the same alphanumeric/dash/underscore
+// charset as other agents, but the SharedClientCache layout (see
+// qoder_paths.go) appends dotted suffixes such as
+// "task-<uuid>.session.execution", so periods are also accepted here.
+func IsValidQoderSessionID(id string) bool {
+	if id == "" {
+		return false
+	}
+	for _, c := range id {
+		if !isAlphanum(c) && c != '-' && c != '_' && c != '.' {
 			return false
 		}
 	}

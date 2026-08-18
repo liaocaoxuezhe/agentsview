@@ -12,6 +12,8 @@ import (
 
 	"go.kenn.io/agentsview/internal/db"
 	duckdbsync "go.kenn.io/agentsview/internal/duckdb"
+	"go.kenn.io/agentsview/internal/export"
+	"go.kenn.io/agentsview/internal/money"
 )
 
 type sessionSpec struct {
@@ -73,17 +75,17 @@ func main() {
 	if err := database.UpsertModelPricing([]db.ModelPricing{
 		{
 			ModelPattern:         "claude-sonnet-4-20250514",
-			InputPerMTok:         3.0,
-			OutputPerMTok:        15.0,
-			CacheCreationPerMTok: 3.75,
-			CacheReadPerMTok:     0.30,
+			InputPerMTok:         money.Money{Microdollars: 3_000_000},
+			OutputPerMTok:        money.Money{Microdollars: 15_000_000},
+			CacheCreationPerMTok: money.Money{Microdollars: 3_750_000},
+			CacheReadPerMTok:     money.Money{Microdollars: 300_000},
 		},
 		{
 			ModelPattern:         "claude-opus-4-20250514",
-			InputPerMTok:         15.0,
-			OutputPerMTok:        75.0,
-			CacheCreationPerMTok: 18.75,
-			CacheReadPerMTok:     1.50,
+			InputPerMTok:         money.Money{Microdollars: 15_000_000},
+			OutputPerMTok:        money.Money{Microdollars: 75_000_000},
+			CacheCreationPerMTok: money.Money{Microdollars: 18_750_000},
+			CacheReadPerMTok:     money.Money{Microdollars: 1_500_000},
 		},
 	}); err != nil {
 		log.Fatalf("seeding model pricing: %v", err)
@@ -118,6 +120,12 @@ func main() {
 		log.Fatalf("creating recent-edits fixture: %v", err)
 	}
 
+	if err := createProjectReclassificationFixture(
+		database, base.Add(120*time.Hour),
+	); err != nil {
+		log.Fatalf("creating project-reclassification fixture: %v", err)
+	}
+
 	fmt.Printf("Fixture DB written to %s\n", *out)
 	if *duckDBOut != "" {
 		if err := writeDuckDBMirror(database, *duckDBOut); err != nil {
@@ -125,6 +133,80 @@ func main() {
 		}
 		fmt.Printf("Fixture DuckDB mirror written to %s\n", *duckDBOut)
 	}
+}
+
+func createProjectReclassificationFixture(
+	database *db.DB, start time.Time,
+) error {
+	const (
+		machine      = "remote-example-host"
+		project      = "wrong_branch_label"
+		worktreeRoot = "/srv/worktrees/github.com/example-org/sample-service/example-worktree"
+		model        = "claude-sonnet-4-20250514"
+	)
+	cwds := []struct {
+		suffix string
+		cwd    string
+	}{
+		{suffix: "root", cwd: worktreeRoot},
+		{suffix: "nested", cwd: worktreeRoot + "/cmd/server"},
+	}
+	ctx := context.Background()
+	for index, item := range cwds {
+		sessionID := "test-session-project-reclassification-" + item.suffix
+		startedAt := start.Add(time.Duration(index) * time.Hour)
+		endedAt := startedAt.Add(12 * time.Minute)
+		firstMessage := "Inspect the sample service worktree."
+		session := db.Session{
+			ID:               sessionID,
+			Project:          project,
+			Machine:          machine,
+			Agent:            "claude",
+			StartedAt:        new(startedAt.Format(time.RFC3339Nano)),
+			EndedAt:          new(endedAt.Format(time.RFC3339Nano)),
+			MessageCount:     2,
+			UserMessageCount: 1,
+			FirstMessage:     new(firstMessage),
+			Cwd:              item.cwd,
+		}
+		if err := database.UpsertSession(session); err != nil {
+			return fmt.Errorf(
+				"upserting project-reclassification session: %w", err,
+			)
+		}
+		if err := database.InsertMessages(generateMessages(
+			sessionID, session.MessageCount, startedAt, model,
+		)); err != nil {
+			return fmt.Errorf(
+				"inserting project-reclassification messages: %w", err,
+			)
+		}
+		if err := database.UpsertProjectIdentityObservation(
+			ctx,
+			export.ProjectIdentityObservation{
+				SessionID:            sessionID,
+				Project:              project,
+				Machine:              machine,
+				RootPath:             worktreeRoot,
+				RepositoryPath:       "/srv/worktrees/github.com/example-org/sample-service",
+				WorktreeName:         "example-worktree",
+				WorktreeRootPath:     worktreeRoot,
+				WorktreeRelationship: export.WorktreeLinked,
+				CheckoutState:        export.CheckoutBranch,
+				GitBranch:            "example-worktree",
+				ObservedAt:           startedAt,
+			},
+		); err != nil {
+			return fmt.Errorf(
+				"upserting project-reclassification identity: %w", err,
+			)
+		}
+		fmt.Printf(
+			"  %s: %d messages (project reclassification)\n",
+			sessionID, session.MessageCount,
+		)
+	}
+	return nil
 }
 
 func writeDuckDBMirror(database *db.DB, path string) error {
@@ -334,6 +416,19 @@ func generateMixedContentMessages(
 				),
 			)
 		}
+		if i == 3 {
+			const resultContent = "# Fixture output\n\n**safe** <script>alert(\"xss\")</script>"
+			msg.ToolCalls = []db.ToolCall{
+				{
+					ToolName:            "Read",
+					Category:            "Read",
+					ToolUseID:           "tu_mixed_read",
+					InputJSON:           `{"file_path":"/workspace/packages/agentsview/frontend/src/lib/components/content/ToolBlock.svelte"}`,
+					ResultContentLength: len(resultContent),
+					ResultContent:       resultContent,
+				},
+			}
+		}
 		msgs = append(msgs, msg)
 	}
 	return msgs
@@ -448,6 +543,7 @@ func createDurationShowcaseFixture(
 		Project:          project,
 		Machine:          "test-machine",
 		Agent:            "claude",
+		Cwd:              "/workspace/مشروع/.worktrees/שלוםfeaturewithalongcheckoutnamefortooltipwrappingwithoutbreakopportunities",
 		StartedAt:        new(t0.Format(time.RFC3339Nano)),
 		EndedAt:          new(endParent.Format(time.RFC3339Nano)),
 		MessageCount:     len(parentMessages),

@@ -15,7 +15,7 @@ export class UsageService {
    * @throws ApiError
    */
   public static getApiV1UsageComparison({
-    currentCost,
+    currentMicrodollars,
     from,
     to,
     timezone,
@@ -38,9 +38,9 @@ export class UsageService {
     sessionCounts = true,
   }: {
     /**
-     * Current period total cost
+     * Current period total cost in microdollars
      */
-    currentCost: number,
+    currentMicrodollars: number,
     /**
      * Range start date
      */
@@ -146,7 +146,7 @@ export class UsageService {
         'no_default_range': noDefaultRange,
         'breakdowns': breakdowns,
         'session_counts': sessionCounts,
-        'current_cost': currentCost,
+        'current_microdollars': currentMicrodollars,
       },
       errors: {
         400: `Bad Request`,
@@ -511,6 +511,7 @@ export class UsageService {
     sessionCounts = true,
     limit = 20,
     sort = 'cost',
+    tokenTypes,
   }: {
     /**
      * Range start date
@@ -597,9 +598,13 @@ export class UsageService {
      */
     limit?: number,
     /**
-     * Rank sessions by cost or total tokens
+     * Rank sessions by cost or selected token types
      */
     sort?: 'cost' | 'tokens',
+    /**
+     * Comma-separated token counters for token ranking: input, cache_write, cache_read, output
+     */
+    tokenTypes?: string,
   }): CancelablePromise<any[] | null> {
     return __request(OpenAPI, {
       method: 'GET',
@@ -627,6 +632,7 @@ export class UsageService {
         'session_counts': sessionCounts,
         'limit': limit,
         'sort': sort,
+        'token_types': tokenTypes,
       },
       errors: {
         400: `Bad Request`,

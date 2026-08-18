@@ -10,6 +10,7 @@ import (
 	"strings"
 
 	"github.com/spf13/cobra"
+	"go.kenn.io/agentsview/internal/activity"
 	"go.kenn.io/agentsview/internal/config"
 	"go.kenn.io/agentsview/internal/db"
 	"go.kenn.io/agentsview/internal/server"
@@ -296,6 +297,10 @@ func newOpenAPICommand() *cobra.Command {
 }
 
 func newSyncCommand() *cobra.Command {
+	return newSyncCommandWithRunner(runSync)
+}
+
+func newSyncCommandWithRunner(run func(SyncConfig)) *cobra.Command {
 	var cfg SyncConfig
 	cmd := &cobra.Command{
 		Use:   "sync",
@@ -315,6 +320,9 @@ func newSyncCommand() *cobra.Command {
 		SilenceUsage: true,
 		Args:         cobra.NoArgs,
 		PreRunE: func(cmd *cobra.Command, _ []string) error {
+			if err := validateArtifactSyncConfig(cfg); err != nil {
+				return err
+			}
 			if cfg.Host == "" {
 				if cmd.Flags().Changed("user") ||
 					cmd.Flags().Changed("port") {
@@ -326,7 +334,7 @@ func newSyncCommand() *cobra.Command {
 			return nil
 		},
 		Run: func(cmd *cobra.Command, args []string) {
-			runSync(cfg)
+			run(cfg)
 		},
 	}
 	cmd.Flags().BoolVar(
@@ -336,6 +344,12 @@ func newSyncCommand() *cobra.Command {
 	cmd.Flags().StringVar(
 		&cfg.Host, "host", "",
 		"SSH hostname for deprecated remote sync",
+	)
+	cmd.Flags().StringVar(
+		&cfg.Target,
+		"target",
+		"",
+		"Exchange normalized session artifacts with a trusted folder",
 	)
 	cmd.Flags().StringVar(
 		&cfg.User, "user", "",
@@ -444,7 +458,7 @@ func newImportCommand() *cobra.Command {
 			runImport(ImportConfig{Type: importType, Path: args[0]})
 		},
 	}
-	cmd.Flags().StringVar(&importType, "type", "", "Import type: claude-ai, chatgpt")
+	cmd.Flags().StringVar(&importType, "type", "", "Import type: claude-ai, chatgpt, gemini-apps")
 	_ = cmd.MarkFlagRequired("type")
 	return cmd
 }
@@ -537,9 +551,11 @@ func newUsageStatuslineCommand() *cobra.Command {
 		SilenceUsage: true,
 		Args:         cobra.NoArgs,
 		Run: func(cmd *cobra.Command, args []string) {
+			cfg.JSON = outputFormat(cmd) == "json"
 			runUsageStatusline(cfg)
 		},
 	}
+	registerFormatFlags(cmd.Flags())
 	cmd.Flags().StringVar(&cfg.Agent, "agent", "", "Filter by agent name")
 	cmd.Flags().BoolVar(&cfg.Offline, "offline", false, "Use fallback pricing only")
 	cmd.Flags().BoolVar(&cfg.NoSync, "no-sync", false, "Skip on-demand sync before querying")
@@ -582,6 +598,19 @@ func newActivityReportCommand() *cobra.Command {
 	cmd.Flags().StringVar(&cfg.Project, "project", "", "Filter by project")
 	cmd.Flags().StringVar(&cfg.Agent, "agent", "", "Filter by agent name")
 	cmd.Flags().StringVar(&cfg.Machine, "machine", "", "Filter by machine name")
+	cmd.Flags().IntVar(&cfg.SessionsLimit, "sessions-limit", activity.DefaultSessionPageLimit,
+		"Session rows per page (maximum 500)")
+	cmd.Flags().StringVar(&cfg.SessionsReportID, "sessions-report-id", "",
+		"Report ID paired with --sessions-cursor in daemon mode")
+	cmd.Flags().StringVar(&cfg.SessionsCursor, "sessions-cursor", "",
+		"Continue from an Activity session page cursor")
+	cmd.Flags().StringVar(&cfg.SessionsSort, "sessions-sort", "",
+		"Session sort (default agent_minutes): "+
+			"agent_minutes, cost, first_active, project, agent")
+	cmd.Flags().StringVar(&cfg.SessionsDirection, "sessions-direction", "",
+		"Session sort direction (default desc): asc or desc")
+	cmd.Flags().StringVar(&cfg.SessionsBucket, "sessions-bucket", "",
+		"Only sessions active in this zero-based bucket index")
 	registerFormatFlags(cmd.Flags())
 	cmd.Flags().BoolVar(&cfg.NoSync, "no-sync", false, "Skip on-demand sync before querying")
 	cmd.Flags().BoolVar(&cfg.Offline, "offline", false, "Use fallback pricing only")
@@ -887,6 +916,9 @@ func writeRootHelp(w io.Writer, root *cobra.Command) {
 	fmt.Fprintln(w, "  OMP_DIR                 OhMyPi sessions directory")
 	fmt.Fprintln(w, "  DEEPSEEK_TUI_SESSIONS_DIR")
 	fmt.Fprintln(w, "                          DeepSeek TUI sessions directory")
+	fmt.Fprintln(w, "  DEEPSEEK_HARNESS_SESSIONS_DIR")
+	fmt.Fprintln(w, "                          DeepSeek Harness sessions directory")
+	fmt.Fprintln(w, "  DSH_HOME                DeepSeek Harness home directory")
 	fmt.Fprintln(w, "  QCLAW_DIR               QClaw agents directory")
 	fmt.Fprintln(w, "  WORKBUDDY_PROJECTS_DIR  WorkBuddy projects directory")
 	fmt.Fprintln(w, "  PIEBALD_DIR             Piebald data directory")

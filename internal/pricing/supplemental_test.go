@@ -7,6 +7,7 @@ import (
 
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
+	"go.kenn.io/agentsview/internal/money"
 )
 
 // TestSupplementalPricing_KimiK3StaticAliases pins the curated static
@@ -26,10 +27,10 @@ func TestSupplementalPricing_KimiK3StaticAliases(t *testing.T) {
 	}
 
 	want := ModelPricing{
-		InputPerMTok:         3.00,
-		OutputPerMTok:        15.00,
-		CacheCreationPerMTok: 0,
-		CacheReadPerMTok:     0.30,
+		InputPerMTok:         money.MustParseDollars("3.00"),
+		OutputPerMTok:        money.MustParseDollars("15.00"),
+		CacheCreationPerMTok: money.Money{},
+		CacheReadPerMTok:     money.MustParseDollars("0.30"),
 	}
 	for _, model := range []string{
 		"k3",
@@ -58,6 +59,10 @@ func TestDateAliasedModels(t *testing.T) {
 	}, DateAliasedModels())
 }
 
+func TestKimiK26Aliases(t *testing.T) {
+	assert.Equal(t, []string{"k2d6-agent"}, KimiK26Aliases())
+}
+
 func TestCanonicalModelForDate(t *testing.T) {
 	pre := time.Date(2026, 7, 18, 23, 59, 59, 0, time.UTC)
 	at := time.Date(2026, 7, 19, 0, 0, 0, 0, time.UTC)
@@ -83,6 +88,9 @@ func TestCanonicalModelForDate(t *testing.T) {
 		{"daimon-kimi-messages after cutoff", "daimon-kimi-messages", post, KimiK3Canonical},
 		{"provider-prefixed alias before cutoff", "kimi-code/kimi-for-coding", pre, KimiK26Canonical},
 		{"provider-prefixed alias after cutoff", "kimi-code/kimi-for-coding", post, KimiK3Canonical},
+		{"explicit K2.6 agent alias before cutoff", "k2d6-agent", pre, KimiK26Canonical},
+		{"explicit K2.6 agent alias after cutoff", "k2d6-agent", post, KimiK26Canonical},
+		{"provider-prefixed explicit K2.6 alias", "daimon/k2d6-agent", post, KimiK26Canonical},
 		{"flat k3 alias is not date-ambiguous", "k3", pre, ""},
 		{"flat k3-agent alias is not date-ambiguous", "k3-agent", pre, ""},
 		{"canonical k2.6 model passes through", KimiK26Canonical, pre, ""},
@@ -111,6 +119,7 @@ func TestCanonicalModelForTimestamp(t *testing.T) {
 		{"offset timestamp at cutoff instant", "kimi-for-coding", "2026-07-18T20:00:00-04:00", KimiK3Canonical},
 		{"empty timestamp falls back to K3", "kimi-for-coding", "", KimiK3Canonical},
 		{"garbage timestamp falls back to K3", "kimi-for-coding", "not-a-time", KimiK3Canonical},
+		{"explicit K2.6 alias ignores timestamp", "k2d6-agent", "not-a-time", KimiK26Canonical},
 		{"non-alias passes through", "k3", "2026-07-18T12:00:00Z", ""},
 	}
 	for _, tt := range tests {
@@ -191,7 +200,8 @@ func TestSeedVersion_FoldsInSupplementalVersion(t *testing.T) {
 func TestSupplementalPricing_ReturnsCopy(t *testing.T) {
 	first := SupplementalPricing()
 	require.NotEmpty(t, first)
-	first[0].InputPerMTok = -1
-	assert.NotEqual(t, -1.0, SupplementalPricing()[0].InputPerMTok,
+	first[0].InputPerMTok = money.Money{Microdollars: -1}
+	assert.NotEqual(t, money.Money{Microdollars: -1},
+		SupplementalPricing()[0].InputPerMTok,
 		"SupplementalPricing must return an independent copy")
 }

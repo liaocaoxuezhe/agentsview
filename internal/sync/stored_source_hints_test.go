@@ -40,7 +40,11 @@ type hintRecordingProvider struct {
 }
 
 func (p *hintRecordingProvider) WatchPlan(context.Context) (parser.WatchPlan, error) {
-	return parser.WatchPlan{Roots: []parser.WatchRoot{{Path: p.Config.Roots[0]}}}, nil
+	roots := make([]parser.WatchRoot, 0, len(p.Config.Roots))
+	for _, root := range p.Config.Roots {
+		roots = append(roots, parser.WatchRoot{Path: root})
+	}
+	return parser.WatchPlan{Roots: roots}, nil
 }
 
 func (p *hintRecordingProvider) SourcesForChangedPath(
@@ -201,7 +205,7 @@ func TestClassifyProviderChangedPathPreservesHintDependentTombstones(t *testing.
 			setup: func(t *testing.T) (string, string, string) {
 				root := t.TempDir()
 				path, _ := writeProcessProviderDevinFixture(
-					t, root, "deleted", "reply", 1710000000000, 1710000005000,
+					t, root, "deleted", "reply", 1710000000, 1710000005,
 				)
 				conn, err := sql.Open("sqlite3", path)
 				require.NoError(t, err)

@@ -74,7 +74,10 @@ func syncService(
 	}
 	engine := sync.NewEngine(d, sync.EngineConfig{
 		AgentDirs:          cfg.AgentDirs,
+		SourceMachines:     cfg.SourceMachines,
+		DisabledAgents:     cfg.DisabledAgents,
 		IncludeCwdPrefixes: cfg.SyncIncludeCwdPrefixes,
+		ScanProtectedPaths: cfg.ScanProtectedPaths,
 		Machine:            cfg.LocalMachineName,
 	})
 	// Close the engine before the DB so pending debounced signal
