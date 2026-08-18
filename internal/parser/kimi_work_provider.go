@@ -15,6 +15,11 @@ import (
 // below requires this prefix on the session-directory component.
 const kimiWorkSessionDirPrefix = "conv-"
 
+// Kimi Work sessions without model metadata use the same date-ambiguous
+// internal alias reported by its daimon runtime. Pricing resolves this alias
+// to K2.6 before the model-era cutoff and K3 at or after it.
+const defaultKimiWorkModel = "daimon-kimi-code"
+
 // Kimi Work stores each conversation as a kimi-code kernel session, a
 // wire.jsonl transcript byte-identical to what the Kimi provider reads.
 // Parsing is shared with Kimi via parseKimiSession; this provider only
@@ -54,7 +59,9 @@ func newKimiWorkSourceSet(roots []string) JSONLSourceSet {
 func kimiWorkParseFile(
 	_ context.Context, path string, req ParseRequest,
 ) ([]ParseResult, []string, error) {
-	sess, msgs, err := parseKimiSession(path, req.Source.ProjectHint, req.Machine)
+	sess, msgs, err := parseKimiSessionWithFallbackModel(
+		path, req.Source.ProjectHint, req.Machine, defaultKimiWorkModel,
+	)
 	if err != nil {
 		return nil, nil, err
 	}

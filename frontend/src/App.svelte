@@ -60,10 +60,12 @@
   import UsagePage from "./lib/components/usage/UsagePage.svelte";
   import ActivityPage from "./lib/components/activity/ActivityPage.svelte";
   import TrendsPage from "./lib/components/trends/TrendsPage.svelte";
-  import InsightsPage from "./lib/components/insights/InsightsPage.svelte";
+  import RecallPage from "./lib/components/recall/RecallPage.svelte";
+  import QualityPage from "./lib/components/quality/QualityPage.svelte";
   import PinnedPage from "./lib/components/pinned/PinnedPage.svelte";
   import TrashPage from "./lib/components/trash/TrashPage.svelte";
   import RecentEditsPage from "./lib/components/recentedits/RecentEditsPage.svelte";
+  import DataPage from "./lib/components/data/DataPage.svelte";
   import SettingsPage from "./lib/components/settings/SettingsPage.svelte";
   import { sessions, filtersToParams } from "./lib/stores/sessions.svelte.js";
   import { messages } from "./lib/stores/messages.svelte.js";
@@ -97,7 +99,6 @@
   } from "./lib/stores/sessionRouteParams.js";
 
   let globalAuthToken: string = $state("");
-
   function handleGlobalAuth() {
     const token = globalAuthToken.trim();
     if (!token) return;
@@ -326,6 +327,7 @@
   // persistence would be lost after one reload.
   function sessionFilterRouteParams(): Record<string, string> {
     const params = filtersToParams(sessions.filters);
+    if (starred.filterOnly) params.starred = "true";
     if (sessions.dateFiltersWindowDays !== null) {
       params[SESSION_ANALYTICS_WINDOW_PARAM] = String(
         sessions.dateFiltersWindowDays,
@@ -381,6 +383,24 @@
 
   let lastDetailFilterParamsSignature: string | null = $state(null);
   let previousDateRestoreRoute: string | null = null;
+  let previousRootLanding = false;
+  let rootResetPending = $state(false);
+  let rootDetailOpened = false;
+  let rootDetailDateRestoreSuppressed = $state(false);
+  let rootDetailExitDateRestorePending = $state(false);
+  let previousSessionId: string | null = null;
+  let previousActiveSessionId: string | null = null;
+
+  function clearRootDetailDateRestoreSuppressed(): void {
+    rootDetailDateRestoreSuppressed = false;
+    rootDetailExitDateRestorePending = false;
+  }
+
+  function clearRootFilterProvenance(): void {
+    rootResetPending = false;
+    rootDetailOpened = false;
+    clearRootDetailDateRestoreSuppressed();
+  }
 
   // React to route changes: reload sessions and apply URL params.
   // Only apply URL deep-link params (initFromParams) when the URL
@@ -390,25 +410,104 @@
   $effect.pre(() => {
     const route = router.route;
     const params = router.params;
-    const enteringSessions =
+    const hasSessionFilterParams =
+      route === "sessions" && hasFilterParams(params);
+    const rootLanding = router.isRootPath && !hasSessionFilterParams;
+    const sessionFiltersDiverged = route !== "sessions" &&
+      Object.keys(sessionFilterRouteParams()).length > 0;
+    const enteringRootLanding = rootLanding && !previousRootLanding;
+    const leavingRootLanding =
+      previousRootLanding &&
+      route === "sessions" &&
+      !hasSessionFilterParams &&
+      !rootLanding;
+    const enteringSessionsRoute =
       route === "sessions" && previousDateRestoreRoute !== "sessions";
+    const leavingSessionsRoute =
+      previousDateRestoreRoute === "sessions" && route !== "sessions";
+    const wasRootLanding = previousRootLanding;
+    const wasSessionsRoute = previousDateRestoreRoute === "sessions";
     untrack(() => {
+      let effectiveParams = params;
       previousDateRestoreRoute = route;
+      previousRootLanding = rootLanding;
       const sid = router.sessionId;
+      const directRootToList = leavingRootLanding && sid === null;
+      const enteringSessions = enteringSessionsRoute || directRootToList;
+      const closingRootDetail =
+        rootDetailOpened && previousSessionId !== null && sid === null &&
+        route === "sessions";
+      const openingRootDerivedDetail =
+        rootResetPending && sid !== null && route === "sessions" &&
+        !hasSessionFilterParams &&
+        (wasRootLanding ||
+          (wasSessionsRoute && previousSessionId === null));
+      const enteringUnfilteredSessionDetail =
+        rootResetPending && !wasRootLanding && enteringSessionsRoute &&
+        route === "sessions" && sid !== null && !hasSessionFilterParams;
+      if (enteringRootLanding) {
+        sessions.resetFiltersForRoot();
+        rootResetPending = true;
+        rootDetailOpened = false;
+        rootDetailDateRestoreSuppressed = false;
+        rootDetailExitDateRestorePending = false;
+      } else if (enteringUnfilteredSessionDetail) {
+        sessions.restoreSavedFilters();
+        clearRootFilterProvenance();
+      } else if (
+        !rootLanding &&
+        !hasSessionFilterParams &&
+        route === "sessions" &&
+        sid === null &&
+        enteringSessions &&
+        rootResetPending &&
+        !rootDetailOpened
+      ) {
+        sessions.restoreSavedFilters();
+        clearRootFilterProvenance();
+      } else if (hasSessionFilterParams) {
+        if (rootResetPending) {
+          effectiveParams = sessionEntryDateParams(params) ?? params;
+          if (!filterParamsEqual(params, effectiveParams)) {
+            router.replaceParams(effectiveParams);
+          }
+        }
+        clearRootFilterProvenance();
+      } else if (rootResetPending && sessionFiltersDiverged) {
+        clearRootFilterProvenance();
+      }
+      if (leavingSessionsRoute) {
+        rootDetailOpened = false;
+        rootDetailDateRestoreSuppressed = false;
+        rootDetailExitDateRestorePending = false;
+      } else if (openingRootDerivedDetail) {
+        rootDetailOpened = true;
+        rootDetailDateRestoreSuppressed = true;
+        rootDetailExitDateRestorePending = false;
+      } else if (
+        closingRootDetail &&
+        !rootLanding &&
+        !hasSessionFilterParams
+      ) {
+        rootDetailOpened = false;
+        rootDetailDateRestoreSuppressed = true;
+        rootDetailExitDateRestorePending = true;
+      }
+      previousSessionId = sid;
       if (
         route === "sessions" &&
-        hasFilterParams(params) &&
+        hasFilterParams(effectiveParams) &&
         (!sid || enteringSessions)
       ) {
-        sessions.initFromParams(params);
+        sessions.initFromParams(effectiveParams);
       }
-      if (enteringSessions) {
-        const explicitState = sessionParamsToPanelDate(params);
+      if (enteringSessions && !rootLanding) {
+        const explicitState = sessionParamsToPanelDate(effectiveParams);
         if (explicitState) yokedDates.updateFromPanel(explicitState);
         const entryParams =
           explicitState?.mode === "rolling"
-            ? applySessionDateState(explicitState, params)
-            : sessionEntryDateParams(params);
+            ? applySessionDateState(explicitState, effectiveParams)
+            : sessionEntryDateParams(effectiveParams);
         if (entryParams) router.replaceParams(entryParams);
       }
       if (route === "sessions") {
@@ -416,6 +515,28 @@
       }
       sessions.loadProjects();
       sessions.loadAgents();
+    });
+  });
+
+  // The active session clears before the URL sync clears the routed id. Mark
+  // the root-detail exit before AnalyticsPage remounts for that transition.
+  $effect.pre(() => {
+    const activeSessionId = sessions.activeSessionId;
+    untrack(() => {
+      const activeSessionChanged =
+        previousActiveSessionId !== activeSessionId;
+      const hadActiveSession = previousActiveSessionId !== null;
+      previousActiveSessionId = activeSessionId;
+      if (
+        activeSessionChanged &&
+        hadActiveSession &&
+        activeSessionId === null &&
+        router.route === "sessions" &&
+        router.sessionId !== null &&
+        rootDetailDateRestoreSuppressed
+      ) {
+        rootDetailExitDateRestorePending = true;
+      }
     });
   });
 
@@ -566,14 +687,26 @@
   // the URL with localStorage-restored filters.
   $effect(() => {
     const route = router.route;
+    const rootLanding = router.isRootPath && !hasFilterParams(router.params);
+    const sessionFilterParams = sessionFilterRouteParams();
     const newParams = sessionRouteParamsForFilters(
-      sessionFilterRouteParams(),
+      sessionFilterParams,
       router.params,
     );
     untrack(() => {
       if (route !== "sessions") return;
       if (router.sessionId) return;
-      if (filterParamsEqual(router.params, newParams)) return;
+      if (rootLanding && Object.keys(sessionFilterParams).length === 0) {
+        return;
+      }
+      if (rootLanding) {
+        clearYokeForClearedSessionDates(newParams);
+        router.navigateToSessions(newParams);
+        return;
+      }
+      if (!router.isRootPath && filterParamsEqual(router.params, newParams)) {
+        return;
+      }
       clearYokeForClearedSessionDates(newParams);
       router.replaceParams(newParams);
     });
@@ -666,9 +799,13 @@
   <div class="page-scroll">
     <TrendsPage />
   </div>
-{:else if router.route === "insights"}
+{:else if router.route === "recall"}
   <div class="page-scroll">
-    <InsightsPage />
+    <RecallPage />
+  </div>
+{:else if router.route === "quality"}
+  <div class="page-scroll">
+    <QualityPage />
   </div>
 {:else if router.route === "pinned"}
   <div class="page-scroll">
@@ -682,8 +819,12 @@
   <div class="page-scroll">
     <RecentEditsPage />
   </div>
-{:else if router.route === "settings"}
+{:else if router.route === "data"}
   <div class="page-scroll">
+    <DataPage />
+  </div>
+{:else if router.route === "settings"}
+  <div class="page-scroll settings-page-host">
     <SettingsPage />
   </div>
 {:else}
@@ -701,7 +842,15 @@
         />
         <MessageList bind:this={messageListRef} />
       {:else}
-        <AnalyticsPage />
+        <AnalyticsPage
+          suppressSessionDateRestore={rootDetailDateRestoreSuppressed}
+          suppressSessionDateRefresh={rootResetPending}
+          onSessionDateRestoreSuppressed={
+            rootDetailExitDateRestorePending
+              ? clearRootDetailDateRestoreSuppressed
+              : undefined
+          }
+        />
       {/if}
     {/snippet}
 
@@ -780,6 +929,11 @@
     flex: 1;
     min-height: 0;
     overflow-y: auto;
+  }
+
+  .settings-page-host {
+    display: flex;
+    overflow: hidden;
   }
 
   /* kit-ui-check-ignore: undo toast carries an inline restore action; kit-ui FlashBanner only supports text+dismiss today, so replacing this would change the delete/undo workflow. */

@@ -13,6 +13,7 @@
     LinkIcon,
     SearchIcon,
     SquareTerminalIcon,
+    TriangleAlertIcon,
   } from "../../icons.js";
   import { onDestroy, onMount } from "svelte";
   import type { Session } from "../../api/types.js";
@@ -35,9 +36,12 @@
     entrypointBadge,
   } from "../../utils/agents.js";
   import { formatCost, formatTokenUsage } from "../../utils/format.js";
+  import type { Money } from "../../money.js";
   import { normalizeMessagePreview } from "../../utils/messages.js";
   import { getGradeStyle, getGradeLabel } from "../../utils/grade.js";
   import SignalPanel from "../content/SignalPanel.svelte";
+  import SessionFilterControl from "../filters/SessionFilterControl.svelte";
+  import SidebarToggleButton from "./SidebarToggleButton.svelte";
   import { sessions } from "../../stores/sessions.svelte.js";
   import { router } from "../../stores/router.svelte.js";
   import { insights } from "../../stores/insights.svelte.js";
@@ -71,6 +75,7 @@
   let showOpenMenu = $state(false);
   let openers: Opener[] = $state([]);
   let openFeedback = $state("");
+  let openFeedbackKind = $state<"success" | "error">("success");
   let feedbackTimer: ReturnType<typeof setTimeout> | undefined;
   let sessionDir = $state<string | null>(null);
   const openersRead = new LatestRead();
@@ -104,7 +109,7 @@
     output_tokens: number;
     cache_creation_input_tokens: number;
     cache_read_input_tokens: number;
-    cost_usd: number;
+    cost: Money;
     has_cost: boolean;
   }
 
@@ -164,7 +169,7 @@
       });
   });
 
-  let sessionCost = $state<number | null>(null);
+  let sessionCost = $state<Money | null>(null);
   let sessionCostIsRollup = $state(false);
   let sessionRollupSubagentCount = $state(0);
   let sessionUsageBreakdownCount = $state(0);
@@ -261,9 +266,9 @@
         sessionCostIsRollup =
           sessionRollupSubagentCount > 0 && res.has_rollup_cost === true;
         sessionCost = sessionCostIsRollup
-          ? (res.rollup_cost_usd ?? null)
+          ? (res.rollup_cost ?? null)
           : res.has_cost
-            ? res.cost_usd
+            ? res.cost
             : null;
         sessionUsageBreakdownCount = res.breakdown_count ?? 0;
       })
@@ -402,7 +407,7 @@
       `${formatTokenCount(entry.output_tokens)} out`,
     ];
     if (entry.has_cost) {
-      parts.push(formatCost(entry.cost_usd));
+      parts.push(formatCost(entry.cost));
     }
     return parts.filter(Boolean).join(" · ");
   }
@@ -440,7 +445,7 @@
   function handleAgentAnalysis() {
     if (!session) return;
     insights.generateForSession(session);
-    router.navigate("insights");
+    router.navigate("recall", { tab: "generated" });
   }
 
   function toggleMenu() {
@@ -487,8 +492,9 @@
     }
   }
 
-  function showFeedback(msg: string) {
+  function showFeedback(msg: string, kind: "success" | "error" = "success") {
     openFeedback = msg;
+    openFeedbackKind = kind;
     clearTimeout(feedbackTimer);
     feedbackTimer = setTimeout(() => { openFeedback = ""; }, 2000);
   }
@@ -515,9 +521,12 @@
       if (resp.command) {
         const cmd = formatResumeResponseCommand(session.agent, resp);
         const ok = cmd ? await copyToClipboard(cmd) : false;
-        showFeedback(ok
-          ? m.session_breadcrumb_command_copied()
-          : m.session_breadcrumb_failed());
+        showFeedback(
+          ok
+            ? m.session_breadcrumb_command_copied()
+            : m.session_breadcrumb_failed(),
+          ok ? "success" : "error",
+        );
         return;
       }
     } catch {
@@ -528,11 +537,14 @@
     });
     if (cmd) {
       const ok = await copyToClipboard(cmd);
-      showFeedback(ok
-        ? m.session_breadcrumb_command_copied()
-        : m.session_breadcrumb_failed());
+      showFeedback(
+        ok
+          ? m.session_breadcrumb_command_copied()
+          : m.session_breadcrumb_failed(),
+        ok ? "success" : "error",
+      );
     } else {
-      showFeedback(m.session_breadcrumb_not_supported());
+      showFeedback(m.session_breadcrumb_not_supported(), "error");
     }
   }
 
@@ -549,9 +561,12 @@
       if (resp.command) {
         const cmd = formatResumeResponseCommand(session.agent, resp);
         const ok = cmd ? await copyToClipboard(cmd) : false;
-        showFeedback(ok
-          ? m.session_breadcrumb_command_copied()
-          : m.session_breadcrumb_failed());
+        showFeedback(
+          ok
+            ? m.session_breadcrumb_command_copied()
+            : m.session_breadcrumb_failed(),
+          ok ? "success" : "error",
+        );
         return;
       }
     } catch {
@@ -562,24 +577,30 @@
     });
     if (cmd) {
       const ok = await copyToClipboard(cmd);
-      showFeedback(ok
-        ? m.session_breadcrumb_command_copied()
-        : m.session_breadcrumb_failed());
+      showFeedback(
+        ok
+          ? m.session_breadcrumb_command_copied()
+          : m.session_breadcrumb_failed(),
+        ok ? "success" : "error",
+      );
     } else {
-      showFeedback(m.session_breadcrumb_not_supported());
+      showFeedback(m.session_breadcrumb_not_supported(), "error");
     }
   }
 
   async function handleCopyFilePath() {
     showOpenMenu = false;
     if (!sessionDir) {
-      showFeedback(m.session_breadcrumb_no_path_available());
+      showFeedback(m.session_breadcrumb_no_path_available(), "error");
       return;
     }
     const ok = await copyToClipboard(sessionDir);
-    showFeedback(ok
-      ? m.session_breadcrumb_path_copied()
-      : m.session_breadcrumb_failed());
+    showFeedback(
+      ok
+        ? m.session_breadcrumb_path_copied()
+        : m.session_breadcrumb_failed(),
+      ok ? "success" : "error",
+    );
   }
 
   async function handleOpenIn(opener: Opener) {
@@ -595,7 +616,7 @@
         target: opener.name,
       }));
     } catch {
-      showFeedback(m.session_breadcrumb_failed_to_open());
+      showFeedback(m.session_breadcrumb_failed_to_open(), "error");
     }
   }
 
@@ -620,9 +641,12 @@
       if (resp.command) {
         const cmd = formatResumeResponseCommand(session.agent, resp);
         const ok = cmd ? await copyToClipboard(cmd) : false;
-        showFeedback(ok
-          ? m.session_breadcrumb_command_copied()
-          : m.session_breadcrumb_failed());
+        showFeedback(
+          ok
+            ? m.session_breadcrumb_command_copied()
+            : m.session_breadcrumb_failed(),
+          ok ? "success" : "error",
+        );
         return;
       }
     } catch {
@@ -633,11 +657,14 @@
     });
     if (cmd) {
       const ok = await copyToClipboard(cmd);
-      showFeedback(ok
-        ? m.session_breadcrumb_command_copied()
-        : m.session_breadcrumb_failed());
+      showFeedback(
+        ok
+          ? m.session_breadcrumb_command_copied()
+          : m.session_breadcrumb_failed(),
+        ok ? "success" : "error",
+      );
     } else {
-      showFeedback(m.session_breadcrumb_not_supported());
+      showFeedback(m.session_breadcrumb_not_supported(), "error");
     }
   }
 
@@ -740,6 +767,19 @@
 
 
 <div class="session-breadcrumb">
+  {#if !ui.isMobileViewport && !ui.sidebarOpen}
+    <div
+      class="sidebar-controls"
+      data-sidebar-focus-region="content"
+    >
+      <SidebarToggleButton placement="content" />
+      <SessionFilterControl
+        showDisplay={false}
+        showStarred={false}
+        align="left"
+      />
+    </div>
+  {/if}
   <button
     class="breadcrumb-link"
     onclick={onBack}
@@ -826,7 +866,8 @@
         <span class="open-group">
           <button
             class="resume-btn"
-            class:has-feedback={openFeedback !== ""}
+            class:has-feedback-success={openFeedback !== "" && openFeedbackKind === "success"}
+            class:has-feedback-error={openFeedback !== "" && openFeedbackKind === "error"}
             onclick={(e) => { e.stopPropagation(); showOpenMenu = !showOpenMenu; }}
             title={canResume
               ? m.session_breadcrumb_resume_session_in_terminal()
@@ -836,7 +877,11 @@
               : m.session_breadcrumb_session_actions()}
           >
             {#if openFeedback}
-              <CheckIcon size="11" strokeWidth="2.4" aria-hidden="true" />
+              {#if openFeedbackKind === "error"}
+                <TriangleAlertIcon size="11" strokeWidth="2.2" aria-hidden="true" />
+              {:else}
+                <CheckIcon size="11" strokeWidth="2.4" aria-hidden="true" />
+              {/if}
               {openFeedback}
             {:else}
               {canResume
@@ -1010,7 +1055,7 @@
                   </span>
                   {#if row.has_cost}
                     <span class="usage-breakdown-cost">
-                      {formatCost(row.cost_usd)}
+                      {formatCost(row.cost)}
                     </span>
                   {/if}
                 </div>
@@ -1121,6 +1166,12 @@
     flex-shrink: 0;
     font-size: 11px;
     color: var(--text-muted);
+  }
+
+  .sidebar-controls {
+    position: relative;
+    display: flex;
+    align-items: center;
   }
 
   .breadcrumb-link {
@@ -1290,8 +1341,12 @@
     background: var(--bg-surface-hover);
   }
 
-  .resume-btn.has-feedback {
+  .resume-btn.has-feedback-success {
     color: var(--accent-green, #2ea043);
+  }
+
+  .resume-btn.has-feedback-error {
+    color: var(--accent-red, #e55);
   }
 
   .open-menu {

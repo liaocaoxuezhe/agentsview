@@ -185,23 +185,29 @@ write-owner lock and exits when done.
 agentsview sync [flags]
 ```
 
-| Flag     | Default | Description                                    |
-| -------- | ------- | ---------------------------------------------- |
-| `--full` | `false` | Force a full resync regardless of data version |
-| `--host` |         | SSH hostname for deprecated remote sync        |
-| `--user` |         | SSH username for deprecated remote sync        |
-| `--port` | `22`    | SSH port for deprecated remote sync            |
+| Flag       | Default | Description                                         |
+| ---------- | ------- | --------------------------------------------------- |
+| `--full`   | `false` | Force a full resync regardless of data version      |
+| `--target` |         | Exchange normalized artifacts with a trusted folder |
+| `--host`   |         | SSH hostname for deprecated remote sync             |
+| `--user`   |         | SSH username for deprecated remote sync             |
+| `--port`   | `22`    | SSH port for deprecated remote sync                 |
 
 **Examples:**
 
 ```bash
 agentsview sync           # incremental sync and exit
 agentsview sync --full    # full resync and exit
+agentsview sync --target /path/to/shared-folder
 agentsview sync --host buildbox.local
 agentsview sync --host buildbox.local --user wes --port 2222
 ```
 
 After syncing, a summary of session and message counts is printed to stdout.
+With `--target`, AgentsView then performs one bounded normalized-artifact
+exchange. See [Artifact Folder Sync](/artifact-sync/) for the trust model,
+first-use requirements, and exclusions. `--target` cannot be combined with
+`--host`.
 
 When `--host` is set, AgentsView syncs only that remote host and fails fast on
 error. If the local daemon has a matching configured `[[remote_hosts]]` entry,
@@ -246,12 +252,14 @@ rebuilds FTS once, and atomically swaps the completed archive into place. SSH
 hosts run through their existing active-archive path only after that swap.
 
 `--full` reparses every discovered local and remote session, but it does not
-force unchanged HTTP mirror files to be transferred again. Manifest-capable
-spokes still send only changed files; older HTTP-capable spokes fall back to
-their existing full-archive endpoint. An HTTP preparation or contributor
-failure aborts the combined rebuild without replacing the active archive or
-running SSH. Ordinary incremental and post-swap SSH failures retain per-host
-reporting, and the command exits non-zero if any host failed. See
+force unchanged manifest-capable files to transfer again. Directory-scoped and
+verbatim curated content still use delta transfer. Windsurf's sanitized curated
+export remains a separate full-archive transfer on every sync. HTTP collectors
+and spokes must use the same remote-sync protocol version; incompatible peers
+fail before exchanging targets or archive data. An HTTP preparation or
+contributor failure aborts the combined rebuild without replacing the active
+archive or running SSH. Ordinary incremental and post-swap SSH failures retain
+per-host reporting, and the command exits non-zero if any host failed. See
 [Incremental Sync](/remote-access/#incremental-sync).
 
 `agentsview sync --host X` syncs one host, not the whole configured list. When
@@ -271,12 +279,21 @@ the list, since remote sessions are namespaced by host.
 
 During HTTP remote sync, the collector prints durable phase lines for resolving
 remote roots, fetching and comparing the manifest, transferring and extracting
-changed files, processing each contributor, rebuilding FTS, and swapping the
-database. Archive downloads also show live compressed-byte progress when the
-remote daemon provides a `Content-Length` header. The new phases and bulk-ingest
-path come from the collector; a spoke upgrade is needed only for manifest-delta
-transfer. If an upgraded binary does not show those phases, restart the local
-collector daemon.
+changed files, planning pending paths, processing affected sources, rebuilding
+FTS, and swapping the database. Pending paths can outnumber processed sources:
+deletions participate in recovery and cache invalidation but usually do not
+produce an import source. Provider fallback is identified explicitly, and its
+discovered sources determine the processing denominator.
+
+The final per-host line reports changed sessions, ordinary unchanged skips, and
+error-suppressed pending entries. A retained-journal line means recovery work
+will be replayed; cancellation, processing failure, cache-persistence failure,
+retirement failure, and a rebuild awaiting its database swap remain distinct.
+Individual source paths are omitted from normal output. Archive downloads also
+show live compressed-byte progress when the remote daemon provides a
+`Content-Length` header. These phases come from the collector; a spoke upgrade
+is needed only for manifest-delta transfer. If an upgraded binary does not show
+them, restart the local collector daemon.
 
 ______________________________________________________________________
 
@@ -407,6 +424,8 @@ agentsview usage statusline [flags]
 
 | Flag        | Default | Description                        |
 | ----------- | ------- | ---------------------------------- |
+| `--format`  | `human` | Output format: `human` or `json`   |
+| `--json`    | `false` | Alias for `--format json`          |
 | `--agent`   |         | Filter by agent name               |
 | `--offline` | `false` | Use embedded fallback pricing only |
 | `--no-sync` | `false` | Skip on-demand sync                |
@@ -416,6 +435,16 @@ agentsview usage statusline [flags]
 ```bash
 $ agentsview usage statusline
 $9.61 today
+```
+
+```bash
+$ agentsview usage statusline --json
+{
+  "date": "2026-08-04",
+  "cost": {
+    "microdollars": 9610000
+  }
+}
 ```
 
 See [Token Usage & Costs](/token-usage/#agentsview-usage-statusline) for
@@ -524,6 +553,10 @@ If the AgentsView server is already running, the command reads the current
 database state. If no server is running, it performs an on-demand sync for the
 requested session first.
 
+As of 0.40.0, the reported totals include every subagent transcript the session
+spawned, so the cost matches what the session actually spent. `token-use` has no
+opt-out; use `agentsview session usage <id> --own-only` for own-session numbers.
+
 **Example:**
 
 ```bash
@@ -538,12 +571,17 @@ agentsview token-use 550e8400-e29b-41d4-a716-446655440000
   "total_output_tokens": 15230,
   "peak_context_tokens": 84000,
   "has_token_data": true,
-  "cost_usd": 2.41,
+  "cost": {"microdollars": 2410000},
   "has_cost": true,
+  "cost_usd": 2.41,
   "models": ["claude-opus-4-7"],
   "server_running": false
 }
 ```
+
+`cost_usd` is a deprecated compatibility alias for `cost.microdollars / 1e6`
+and will be removed in a future release; new consumers should read
+`cost.microdollars` directly.
 
 See [`agentsview session usage`](/session-api/#agentsview-session-usage) for the
 full field reference and exit-code contract.
@@ -854,7 +892,7 @@ ______________________________________________________________________
 
 ### `agentsview import`
 
-Import Claude.ai or ChatGPT conversations into the local database. See
+Import Claude.ai, ChatGPT, or Gemini Apps conversations into the local database. See
 [Chat Import](/chat-import/) for full documentation.
 
 ```bash
@@ -863,10 +901,11 @@ agentsview import --type <type> <path>
 
 | Flag     | Default | Description                                      |
 | -------- | ------- | ------------------------------------------------ |
-| `--type` |         | Import type: `claude-ai` or `chatgpt` (required) |
+| `--type` |         | Import type: `claude-ai`, `chatgpt`, or `gemini-apps` (required) |
 
-The path can be a `.zip` file, a `conversations.json` file (Claude.ai only), or
-a directory containing the extracted export.
+The path can be a `.zip` file, a `conversations.json` file (Claude.ai only), a
+Gemini Apps `MyActivity.html` file, or a directory containing the extracted
+export.
 
 **Examples:**
 
@@ -874,6 +913,7 @@ a directory containing the extracted export.
 agentsview import --type claude-ai ~/Downloads/claude.zip
 agentsview import --type chatgpt ~/Downloads/chatgpt.zip
 agentsview import --type claude-ai ./conversations.json
+agentsview import --type gemini-apps ~/Downloads/takeout.zip
 ```
 
 ______________________________________________________________________
@@ -929,7 +969,7 @@ agentsview export sessions --all --format ndjson --project agentsview
 The JSON top level has `schema_version`, `database_id`, `cursor`, `pricing`,
 `projects`, and `sessions`. NDJSON writes the same metadata as the first line,
 then one session row per following line. Current builds emit
-`schema_version: 2`; see [Session Export](/session-export/#versioning) for the
+`schema_version: 5`; see [Session Export](/session-export/#versioning) for the
 v1 and transitional 0.38 release history. The default and maximum page size is
 `db.MaxSessionLimit`, currently 500.
 
@@ -940,6 +980,27 @@ stdout empty, and exit with code 4:
 ```json
 {"error":"cursor_reset","message":"session export cursor is no longer valid; restart the export","database_id":"..."}
 ```
+
+______________________________________________________________________
+
+### `agentsview export hour|day|digest`
+
+Export canonical UTC-hour activity and usage documents, coherent UTC-day
+snapshots, or compact date-range digests from the local archive. See
+[Reporting Export](/reporting-export/) for the v2 wire schema, quiet-hour
+semantics, snapshot guarantee, and digest rules.
+
+```bash
+agentsview export hour 2026-07-28-13
+agentsview export day 2026-07-28
+agentsview export digest --from 2026-06-28 --to 2026-07-27
+```
+
+Hour and date keys must be exact, zero-padded UTC values. Open and future hours
+are rejected. The current UTC date contains only closed hours and has no day
+digest. Digest ranges are inclusive and limited to 31 dates. Integrations
+should validate the emitted `schema_version: 2` and content digest before
+accepting a document.
 
 ______________________________________________________________________
 
@@ -960,13 +1021,21 @@ agentsview session sync <path-or-id>     # parse + insert
 agentsview session watch <id>            # NDJSON event stream
 agentsview session search <pattern>      # content search across sessions
 agentsview session usage <id>            # token usage and cost estimate
+agentsview session usage <id> --own-only # exclude subagent transcripts
 ```
+
+`session usage` attributes each subagent transcript's spend to the session that
+spawned it, so a parent that delegated most of its work still reports the full
+cost. `--own-only` restores the older own-session output.
 
 `session search` supports substring (default), `--regex`, `--fts`, `--semantic`,
 and `--hybrid` modes. Semantic and hybrid results can be scoped with
 `--scope top|all|subordinate` (default `all`) to include or exclude sidechain
 and subagent content — see
 [Semantic Search](/semantic-search/#scoping-results-scope).
+The human-readable table includes an `AGE` column derived from each match's
+timestamp, so recent evidence is visible without opening the session. Matches
+without a usable timestamp show `—`.
 
 Structured response commands accept `--format json`; `--json` is a short alias
 for that scripting mode. `session export` and `session watch` are the
@@ -1186,13 +1255,17 @@ agentsview help
 | `CORTEX_DIR`                      | `~/.snowflake/cortex/conversations`                  | Cortex Code conversations directory                                                                 |
 | `CURSOR_PROJECTS_DIR`             | `~/.cursor/projects`                                 | Cursor transcripts directory                                                                        |
 | `DEEPSEEK_TUI_SESSIONS_DIR`       | `~/.codewhale/sessions` and `~/.deepseek/sessions`   | DeepSeek TUI sessions directory                                                                     |
+| `DEEPSEEK_HARNESS_SESSIONS_DIR`   | `~/.dsh/sessions`                                    | DeepSeek Harness sessions directory                                                                 |
+| `DSH_HOME`                        | unset                                                | DeepSeek Harness home that re-roots the default `sessions/` discovery path                          |
 | `FORGE_DIR`                       | `~/.forge`                                           | Forge directory (contains `.forge.db`)                                                              |
 | `GEMINI_DIR`                      | `~/.gemini`                                          | Gemini CLI directory                                                                                |
+| `GOOSE_PATH_ROOT`                 | (platform-specific)                                  | Goose path root; sessions are read from `<root>/data/sessions/sessions.db`                          |
 | `GPTME_DIR`                       | `~/.local/share/gptme/logs`                          | gptme logs directory                                                                                |
 | `GROK_DIR`                        | `~/.grok/sessions`                                   | Grok sessions directory                                                                             |
 | `HERMES_SESSIONS_DIR`             | `~/.hermes/sessions`                                 | Hermes Agent sessions directory                                                                     |
 | `IFLOW_DIR`                       | `~/.iflow/projects`                                  | iFlow projects directory                                                                            |
 | `KILO_DIR`                        | `~/.local/share/kilo`                                | Kilo data directory                                                                                 |
+| `KILO_LEGACY_DIR`                 | (platform-specific)                                  | Kilo legacy VS Code extension data directory                                                        |
 | `KIMI_DIR`                        | `~/.kimi/sessions` and `~/.kimi-code/sessions`       | Kimi sessions directory                                                                             |
 | `KIMI_WORK_DIR`                   | (platform-specific)                                  | Kimi Work (kimi-desktop daimon) sessions directory                                                  |
 | `KIRO_SESSIONS_DIR`               | `~/.kiro/sessions/cli` and `~/.local/share/kiro-cli` | Kiro CLI sessions directory (JSONL and SQLite)                                                      |
@@ -1204,15 +1277,19 @@ agentsview help
 | `OPENCODE_DIR`                    | `~/.local/share/opencode`                            | OpenCode data directory                                                                             |
 | `OPENHANDS_CONVERSATIONS_DIR`     | `~/.openhands/conversations`                         | OpenHands CLI conversations directory                                                               |
 | `PI_DIR`                          | `~/.pi/agent/sessions`                               | Pi sessions directory                                                                               |
+| `PRIME_AGENT_SESSION_DIR`         | `~/.prime/agent/sessions`                            | Prime Agent sessions directory                                                                      |
 | `PIEBALD_DIR`                     | `~/.local/share/piebald`                             | Piebald directory (contains `app.db`)                                                               |
+| `POOLSIDE_DIR`                    | (platform-specific)                                  | Poolside Agent CLI trajectory directory                                                             |
 | `POSIT_ASSISTANT_DIR`             | `~/.posit/assistant/workspaces`                      | Posit Assistant workspaces directory                                                                |
 | `POSITRON_DIR`                    | (platform-specific)                                  | Positron Assistant user directory                                                                   |
 | `QCLAW_DIR`                       | `~/.qclaw/agents`                                    | QClaw agents directory                                                                              |
-| `QODER_PROJECTS_DIR`              | `~/.qoder/projects` and `~/.qoderwork/projects`      | Qoder projects directory                                                                            |
+| `QODER_PROJECTS_DIR`              | Legacy and platform-specific roots                   | Qoder projects directory; see [Session Discovery](/configuration/#session-discovery)                 |
 | `QWEN_PROJECTS_DIR`               | `~/.qwen/projects`                                   | Qwen Code projects directory                                                                        |
 | `QWENPAW_DIR`                     | `~/.copaw/workspaces`                                | QwenPaw workspaces directory                                                                        |
 | `REASONIX_DIR`                    | `~/.reasonix` and `~/AppData/Roaming/reasonix`       | Reasonix data directory                                                                             |
+| `ROOCODE_DIR`                     | (platform-specific)                                  | RooCode VS Code extension data directory                                                            |
 | `SHELLEY_DIR`                     | `~/.config/shelley`                                  | Shelley data directory                                                                              |
+| `TRAE_DIR`                        | (platform-specific)                                  | Trae editor user-data directory                                                                     |
 | `VISUALSTUDIO_COPILOT_DIR`        | (platform-specific)                                  | Visual Studio Copilot traces directory                                                              |
 | `VSCODE_COPILOT_DIR`              | (platform-specific)                                  | VS Code Copilot sessions directory                                                                  |
 | `WINDSURF_DIR`                    | (platform-specific)                                  | Windsurf user-data directory                                                                        |

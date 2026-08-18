@@ -12,12 +12,13 @@ import { analyticsPageDates } from "../../stores/analyticsPageDates.js";
 import { insights } from "../../stores/insights.svelte.js";
 import { router } from "../../stores/router.svelte.js";
 import { sessions } from "../../stores/sessions.svelte.js";
+import { ui } from "../../stores/ui.svelte.js";
 import { yokedDates } from "../../stores/yokedDates.svelte.js";
 import sourceRaw from "./AnalyticsPage.svelte?raw";
 // @ts-ignore
 import AnalyticsPage from "./AnalyticsPage.svelte";
 // @ts-ignore
-import InsightsPage from "../insights/InsightsPage.svelte";
+import QualityPage from "../quality/QualityPage.svelte";
 
 const source = sourceRaw.replace(/\r\n/g, "\n");
 
@@ -59,6 +60,7 @@ afterEach(() => {
   router.route = "sessions";
   router.params = {};
   router.sessionId = null;
+  router.isRootPath = false;
   analytics.isPinned = false;
   analytics.windowDays = 365;
   analytics.from = "";
@@ -71,6 +73,70 @@ afterEach(() => {
   sessions.filters.dateTo = "";
   yokedDates.setEnabled(false);
   analyticsPageDates.clear();
+  ui.sidebarOpen = true;
+  ui.isMobileViewport = false;
+});
+
+describe("AnalyticsPage sidebar controls", () => {
+  it("places the desktop expand control to the left of the relocated filter", async () => {
+    vi.stubGlobal(
+      "ResizeObserver",
+      class {
+        observe() {}
+        disconnect() {}
+      },
+    );
+    vi.spyOn(analytics, "fetchAll").mockResolvedValue();
+    vi.spyOn(sessions, "load").mockResolvedValue();
+    ui.sidebarOpen = false;
+    ui.isMobileViewport = false;
+
+    component = mount(AnalyticsPage, { target: document.body });
+    await flushEffects();
+
+    const anchor = document.querySelector<HTMLElement>(
+      ".toolbar-filter-anchor",
+    );
+    const expandButton = document.querySelector<HTMLButtonElement>(
+      'button[aria-label="Open sidebar"]',
+    );
+    const filterButton = anchor?.querySelector<HTMLButtonElement>(
+      ".filter-btn",
+    );
+
+    expect(anchor).not.toBeNull();
+    expect(expandButton).not.toBeNull();
+    expect(filterButton).not.toBeNull();
+    expect(expandButton?.nextElementSibling).toBe(filterButton);
+    expect(expandButton?.title).toBe("Toggle sidebar (b)");
+
+    expandButton!.click();
+    await flushEffects();
+
+    expect(ui.sidebarOpen).toBe(true);
+  });
+
+  it("leaves collapsed mobile sidebar controls in the title bar", async () => {
+    vi.stubGlobal(
+      "ResizeObserver",
+      class {
+        observe() {}
+        disconnect() {}
+      },
+    );
+    vi.spyOn(analytics, "fetchAll").mockResolvedValue();
+    vi.spyOn(sessions, "load").mockResolvedValue();
+    ui.sidebarOpen = false;
+    ui.isMobileViewport = true;
+
+    component = mount(AnalyticsPage, { target: document.body });
+    await flushEffects();
+
+    expect(document.querySelector(".toolbar-filter-anchor")).toBeNull();
+    expect(
+      document.querySelector('button[aria-label="Open sidebar"]'),
+    ).toBeNull();
+  });
 });
 
 describe("AnalyticsPage refresh behavior", () => {
@@ -223,7 +289,7 @@ describe("AnalyticsPage refresh behavior", () => {
     });
   });
 
-  it("retains independent Sessions and Insights ranges when linking is disabled", async () => {
+  it("retains independent Sessions and Quality ranges when linking is disabled", async () => {
     vi.useFakeTimers({ toFake: ["Date"] });
     vi.setSystemTime(new Date("2026-07-10T12:00:00"));
     vi.stubGlobal(
@@ -235,7 +301,7 @@ describe("AnalyticsPage refresh behavior", () => {
       },
     );
     vi.spyOn(analytics, "fetchAll").mockResolvedValue();
-    vi.spyOn(analytics, "fetchSignalsForInsights").mockResolvedValue();
+    vi.spyOn(analytics, "fetchSignalsForQuality").mockResolvedValue();
     vi.spyOn(sessions, "load").mockResolvedValue();
     vi.spyOn(sessions, "loadProjects").mockResolvedValue();
     vi.spyOn(sessions, "loadAgents").mockResolvedValue();
@@ -253,8 +319,8 @@ describe("AnalyticsPage refresh behavior", () => {
 
     unmount(component);
     component = undefined;
-    router.navigate("insights");
-    component = mount(InsightsPage, { target: document.body });
+    router.navigate("quality");
+    component = mount(QualityPage, { target: document.body });
     await flushEffects();
 
     expect(analytics.windowDays).toBe(365);
@@ -271,8 +337,8 @@ describe("AnalyticsPage refresh behavior", () => {
 
     unmount(component);
     component = undefined;
-    router.navigate("insights");
-    component = mount(InsightsPage, { target: document.body });
+    router.navigate("quality");
+    component = mount(QualityPage, { target: document.body });
     await flushEffects();
 
     expect(analytics.windowDays).toBe(7);
@@ -353,12 +419,13 @@ describe("AnalyticsPage refresh behavior", () => {
   });
 
   it("only seeds saved yoke dates during initial URL hydration", () => {
-    const seedIndex = source.indexOf("const seed = yokedDates.seedForPanel()");
+    const seedIndex = source.indexOf("yokedDates.seedForPanel()");
     const firstRunIndex = source.indexOf("if (firstRun) {");
 
     expect(seedIndex).toBeGreaterThan(-1);
     expect(firstRunIndex).toBeGreaterThan(-1);
     expect(seedIndex).toBeGreaterThan(firstRunIndex);
+    expect(source).toContain("if (router.isRootPath)");
   });
 
   it("treats drill-down clears as analytics date changes", () => {

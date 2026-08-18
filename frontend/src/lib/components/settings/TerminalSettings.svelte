@@ -1,7 +1,6 @@
 <script lang="ts">
   import { SegmentedControl, TextInput } from "@kenn-io/kit-ui";
   import { m } from "../../i18n/index.js";
-  import SettingsSection from "./SettingsSection.svelte";
   import { settings } from "../../stores/settings.svelte.js";
   import {
     ConfigService,
@@ -26,16 +25,19 @@
   });
 
   async function saveTerminal() {
-    configureGeneratedClient();
-    await ConfigService.postApiV1ConfigTerminal({
-      requestBody: {
-        mode: localMode as TerminalConfigBody.mode,
-        custom_bin: localBin || undefined,
-        custom_args: localArgs || undefined,
-      },
+    if (settings.saving) return;
+    await settings.runMutation(async () => {
+      configureGeneratedClient();
+      await ConfigService.postApiV1ConfigTerminal({
+        requestBody: {
+          mode: localMode as TerminalConfigBody.mode,
+          custom_bin: localBin || undefined,
+          custom_args: localArgs || undefined,
+        },
+      });
+      // Reload settings to pick up the saved values
+      await settings.load();
     });
-    // Reload settings to pick up the saved values
-    await settings.load();
   }
 
   let dirty = $derived(
@@ -45,10 +47,7 @@
   );
 </script>
 
-<SettingsSection
-  title={m.settings_terminal_title()}
-  description={m.settings_terminal_description()}
->
+<div class="terminal-settings">
   <div class="setting-row">
     <span class="setting-label">{m.settings_terminal_launch_mode()}</span>
     <SegmentedControl
@@ -100,9 +99,15 @@
       </button>
     </div>
   {/if}
-</SettingsSection>
+</div>
 
 <style>
+  .terminal-settings {
+    display: flex;
+    flex-direction: column;
+    gap: var(--space-5);
+  }
+
   .setting-row {
     display: flex;
     align-items: center;

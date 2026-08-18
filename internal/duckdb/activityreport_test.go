@@ -5,6 +5,7 @@ package duckdb
 import (
 	"context"
 	"encoding/json"
+	"fmt"
 	"testing"
 	"time"
 
@@ -13,6 +14,9 @@ import (
 
 	"go.kenn.io/agentsview/internal/activity"
 	"go.kenn.io/agentsview/internal/db"
+	"go.kenn.io/agentsview/internal/export"
+	"go.kenn.io/agentsview/internal/money"
+	pricingpkg "go.kenn.io/agentsview/internal/pricing"
 )
 
 // duckDayQuery resolves a single-day "day" Query for date/tz against a
@@ -47,6 +51,59 @@ func activityReportStore(
 	_, err = syncer.pushEverything(ctx, nil)
 	require.NoError(t, err)
 	return NewStoreFromDB(syncer.DB())
+}
+
+func TestActivityReportSourceProbeTracksIdentityRevision(t *testing.T) {
+	ctx := context.Background()
+	conn := openTestDuckDB(t)
+	require.NoError(t, EnsureSchema(ctx, conn))
+	store := NewStoreFromDB(conn)
+
+	before, err := store.ActivityReportSourceProbe(ctx)
+	require.NoError(t, err)
+	require.NoError(t, recordMetadataKey(
+		ctx, conn, identityRevisionMetadataKey, "7",
+	))
+	after, err := store.ActivityReportSourceProbe(ctx)
+	require.NoError(t, err)
+
+	assert.NotEqual(t, before, after,
+		"identity-only mirror updates must change the Activity probe")
+}
+
+func TestActivityReportCandidateSourcePreservesRangeEdgePairs(t *testing.T) {
+	const sessionID = "range-edge"
+	timestamps := []string{
+		"2026-06-13T23:54:59Z",
+		"2026-06-13T23:59:30Z",
+		"2026-06-14T00:00:30Z",
+		"2026-06-14T23:59:00Z",
+		"2026-06-15T00:20:00Z",
+	}
+	session := syncSession(sessionID, "edges", "edge", timestamps[0], len(timestamps))
+	session.EndedAt = &timestamps[len(timestamps)-1]
+	messages := make([]db.Message, 0, len(timestamps))
+	for ordinal, timestamp := range timestamps {
+		messages = append(messages, syncMessage(
+			sessionID, ordinal, "user", "edge", timestamp,
+		))
+	}
+	store := activityReportStore(t, []db.SessionBatchWrite{{
+		Session: session, Messages: messages,
+		DataVersion: 1, ReplaceMessages: true,
+	}}, nil)
+	q := duckDayQuery(t, "2026-06-14", "UTC")
+
+	var starts []int
+	err := store.ActivityReportCandidateSource(
+		[]string{sessionID}, q,
+	)(context.Background(), func(candidate activity.IntervalCandidate) error {
+		starts = append(starts, candidate.StartOrdinal)
+		return nil
+	})
+	require.NoError(t, err)
+	assert.Equal(t, []int{1, 2, 3}, starts,
+		"left pruning and right successor lookup must preserve adjacency")
 }
 
 func TestDuckGetActivityReportBasicConcurrency(t *testing.T) {
@@ -85,6 +142,7 @@ func TestDuckGetActivityReportBasicConcurrency(t *testing.T) {
 	require.NoError(t, err)
 	assert.Equal(t, 2, r.Peak.Agents)
 	assert.Equal(t, 2, r.Totals.Sessions)
+	assert.Equal(t, 2, r.SessionsTotal)
 	assert.GreaterOrEqual(t, len(r.ByAgent), 2)
 }
 
@@ -135,8 +193,8 @@ func TestDuckGetActivityReportIncludesSubagentUsage(t *testing.T) {
 			DataVersion: 1, ReplaceMessages: true},
 	}
 	pricing := []db.ModelPricing{
-		{ModelPattern: "root-model", InputPerMTok: 3.0, OutputPerMTok: 15.0},
-		{ModelPattern: "sub-model", InputPerMTok: 3.0, OutputPerMTok: 15.0},
+		{ModelPattern: "root-model", InputPerMTok: money.MustParseDollars("3.0"), OutputPerMTok: money.MustParseDollars("15.0")},
+		{ModelPattern: "sub-model", InputPerMTok: money.MustParseDollars("3.0"), OutputPerMTok: money.MustParseDollars("15.0")},
 	}
 	store := activityReportStore(t, writes, pricing)
 
@@ -156,7 +214,7 @@ func TestDuckGetActivityReportIncludesSubagentUsage(t *testing.T) {
 		"totals include subagent usage; the fork's replayed row dedups away")
 	// Cost = root (1000*3+500*15)/1e6 + subagent (2000*3+700*15)/1e6; the
 	// fork's duplicate row contributes nothing.
-	assert.InDelta(t, 0.0105+0.0165, r.Totals.Cost, 1e-9)
+	assert.Equal(t, money.MustParseDollars("0.027"), r.Totals.Cost)
 }
 
 func TestDuckGetActivityReportUsageCostAndTokens(t *testing.T) {
@@ -178,8 +236,8 @@ func TestDuckGetActivityReportUsageCostAndTokens(t *testing.T) {
 	}}
 	pricing := []db.ModelPricing{{
 		ModelPattern:  "claude-sonnet-4-20250514",
-		InputPerMTok:  3.0,
-		OutputPerMTok: 15.0,
+		InputPerMTok:  money.MustParseDollars("3.0"),
+		OutputPerMTok: money.MustParseDollars("15.0"),
 	}}
 	store := activityReportStore(t, writes, pricing)
 
@@ -190,12 +248,363 @@ func TestDuckGetActivityReportUsageCostAndTokens(t *testing.T) {
 	assert.Equal(t, 1, r.Totals.Sessions)
 	assert.Equal(t, 500, r.Totals.OutputTokens)
 	// Cost = (1000*3 + 500*15) / 1e6 = 0.0105
-	assert.InDelta(t, 0.0105, r.Totals.Cost, 1e-9)
+	assert.Equal(t, money.MustParseDollars("0.0105"), r.Totals.Cost)
+}
+
+func TestDuckGetActivityReportPrefersCompleteClaudeSnapshot(t *testing.T) {
+	ctx := context.Background()
+	sess := syncSession(
+		"streamed", "proj1", "first", "2026-06-14T10:30:00.000Z", 2)
+	sess.Agent = "claude"
+	partial := syncMessage(
+		"streamed", 0, "assistant", "partial", "2026-06-14T10:30:00.000Z")
+	partial.Model = "claude-sonnet-4-20250514"
+	partial.ClaudeMessageID = "msg-stream"
+	partial.ClaudeRequestID = "req-stream"
+	partial.TokenUsage = json.RawMessage(`{"input_tokens":1000,"output_tokens":5}`)
+	partial.OutputTokens = 5
+	complete := syncMessage(
+		"streamed", 1, "assistant", "complete", "2026-06-14T10:31:00.000Z")
+	complete.Model = "claude-sonnet-4-20250514"
+	complete.ClaudeMessageID = "msg-stream"
+	complete.ClaudeRequestID = "req-stream"
+	complete.TokenUsage = json.RawMessage(`{"input_tokens":1000,"output_tokens":631}`)
+	complete.OutputTokens = 631
+	store := activityReportStore(t, []db.SessionBatchWrite{{
+		Session:         sess,
+		Messages:        []db.Message{partial, complete},
+		DataVersion:     1,
+		ReplaceMessages: true,
+	}}, []db.ModelPricing{{
+		ModelPattern:  "claude-sonnet-4-20250514",
+		InputPerMTok:  money.MustParseDollars("3.0"),
+		OutputPerMTok: money.MustParseDollars("15.0"),
+	}})
+
+	r, err := store.GetActivityReport(
+		ctx, db.AnalyticsFilter{Timezone: "UTC"},
+		duckDayQuery(t, "2026-06-14", "UTC"))
+	require.NoError(t, err)
+	assert.Equal(t, 631, r.Totals.OutputTokens)
+}
+
+func TestDuckGetActivityReportFiltersAfterCrossSessionSnapshotSelection(
+	t *testing.T,
+) {
+	ctx := context.Background()
+	parent := syncSession(
+		"activity-parent", "parent-project", "parent",
+		"2026-06-14T10:00:00.000Z", 1)
+	parent.Agent = "claude"
+	child := syncSession(
+		"activity-child", "child-project", "child",
+		"2026-06-14T10:01:00.000Z", 1)
+	child.Agent = "claude"
+	partial := syncMessage(
+		"activity-parent", 0, "assistant", "partial",
+		"2026-06-14T10:00:00.000Z")
+	partial.Model = "partial-model"
+	partial.TokenUsage = json.RawMessage(`{"input_tokens":10,"output_tokens":5}`)
+	partial.OutputTokens = 5
+	partial.ClaudeMessageID = "activity-message"
+	partial.ClaudeRequestID = "activity-request"
+	complete := syncMessage(
+		"activity-child", 0, "assistant", "complete",
+		"2026-06-14T10:01:00.000Z")
+	complete.Model = "complete-model"
+	complete.TokenUsage = json.RawMessage(
+		`{"input_tokens":1000,"output_tokens":631}`)
+	complete.OutputTokens = 631
+	complete.ClaudeMessageID = "activity-message"
+	complete.ClaudeRequestID = "activity-request"
+	store := activityReportStore(t, []db.SessionBatchWrite{
+		{Session: parent, Messages: []db.Message{partial},
+			DataVersion: 1, ReplaceMessages: true},
+		{Session: child, Messages: []db.Message{complete},
+			DataVersion: 1, ReplaceMessages: true},
+	}, nil)
+
+	parentReport, err := store.GetActivityReport(ctx, db.AnalyticsFilter{
+		Project: "parent-project", Timezone: "UTC",
+	}, duckDayQuery(t, "2026-06-14", "UTC"))
+	require.NoError(t, err)
+	assert.Equal(t, 1, parentReport.Totals.Sessions)
+	assert.Equal(t, 631, parentReport.Totals.OutputTokens,
+		"the parent filter must retain the complete child snapshot")
+
+	childReport, err := store.GetActivityReport(ctx, db.AnalyticsFilter{
+		Project: "child-project", Timezone: "UTC",
+	}, duckDayQuery(t, "2026-06-14", "UTC"))
+	require.NoError(t, err)
+	assert.Equal(t, 1, childReport.Totals.Sessions)
+	assert.Zero(t, childReport.Totals.OutputTokens,
+		"the child source must not claim usage attributed to the parent")
+}
+
+func TestDuckGetActivityReportSelectsPeersForLargeSnapshotKeySet(t *testing.T) {
+	const pairCount = duckMaxSQLVars + 1
+	ctx := context.Background()
+	candidate := syncSession(
+		"large-candidate", "included-project", "candidate",
+		"2026-06-14T10:00:00.000Z", pairCount)
+	peer := syncSession(
+		"large-peer", "excluded-project", "peer",
+		"2026-06-14T10:01:00.000Z", pairCount)
+	candidateMessages := make([]db.Message, pairCount)
+	peerMessages := make([]db.Message, pairCount)
+	for i := range pairCount {
+		messageID := fmt.Sprintf("large-message-%04d", i)
+		requestID := fmt.Sprintf("large-request-%04d", i)
+		candidateMessages[i] = syncMessage(
+			candidate.ID, i, "assistant", "partial",
+			"2026-06-14T10:00:00.000Z")
+		candidateMessages[i].ClaudeMessageID = messageID
+		candidateMessages[i].ClaudeRequestID = requestID
+		candidateMessages[i].TokenUsage = json.RawMessage(
+			`{"input_tokens":1,"output_tokens":1}`)
+		candidateMessages[i].OutputTokens = 1
+		peerMessages[i] = syncMessage(
+			peer.ID, i, "assistant", "complete",
+			"2026-06-14T10:01:00.000Z")
+		peerMessages[i].ClaudeMessageID = messageID
+		peerMessages[i].ClaudeRequestID = requestID
+		peerMessages[i].TokenUsage = json.RawMessage(
+			`{"input_tokens":1,"output_tokens":10}`)
+		peerMessages[i].OutputTokens = 10
+	}
+	store := activityReportStore(t, []db.SessionBatchWrite{
+		{Session: candidate, Messages: candidateMessages,
+			DataVersion: 1, ReplaceMessages: true},
+		{Session: peer, Messages: peerMessages,
+			DataVersion: 1, ReplaceMessages: true},
+	}, nil)
+
+	report, err := store.GetActivityReport(ctx, db.AnalyticsFilter{
+		Project: "included-project", Timezone: "UTC",
+	}, duckDayQuery(t, "2026-06-14", "UTC"))
+	require.NoError(t, err)
+	assert.Equal(t, pairCount*10, report.Totals.OutputTokens,
+		"every complete peer snapshot must remain attributed to the candidate")
+}
+
+func TestDuckGetActivityReportDeduplicatesAfterProjectFilter(t *testing.T) {
+	ctx := context.Background()
+	excluded := syncSession(
+		"excluded-earlier", "excluded-project", "excluded",
+		"2026-06-14T10:00:00Z", 1)
+	excluded.Agent = "claude"
+	included := syncSession(
+		"included-later", "included-project", "included",
+		"2026-06-14T10:01:00Z", 1)
+	included.Agent = "claude"
+	excludedMsg := syncMessage(
+		"excluded-earlier", 0, "assistant", "excluded",
+		"2026-06-14T10:00:00Z")
+	excludedMsg.Model = "model-x"
+	excludedMsg.TokenUsage = json.RawMessage(
+		`{"input_tokens":10,"output_tokens":5}`)
+	excludedMsg.OutputTokens = 5
+	excludedMsg.SourceUUID = "shared-source"
+	includedMsg := syncMessage(
+		"included-later", 0, "assistant", "included",
+		"2026-06-14T10:01:00Z")
+	includedMsg.Model = "model-x"
+	includedMsg.TokenUsage = json.RawMessage(
+		`{"input_tokens":20,"output_tokens":631}`)
+	includedMsg.OutputTokens = 631
+	includedMsg.SourceUUID = "shared-source"
+	store := activityReportStore(t, []db.SessionBatchWrite{
+		{Session: excluded, Messages: []db.Message{excludedMsg},
+			DataVersion: 1, ReplaceMessages: true},
+		{Session: included, Messages: []db.Message{includedMsg},
+			DataVersion: 1, ReplaceMessages: true},
+	}, nil)
+
+	report, err := store.GetActivityReport(ctx, db.AnalyticsFilter{
+		Project: "included-project", Timezone: "UTC",
+	}, duckDayQuery(t, "2026-06-14", "UTC"))
+	require.NoError(t, err)
+	assert.Equal(t, 631, report.Totals.OutputTokens,
+		"an excluded duplicate must not suppress included usage")
+}
+
+func TestDuckActivityReportRowStatusCanonicalizesKimiAliasByTimestamp(t *testing.T) {
+	tests := []struct {
+		name         string
+		timestamp    string
+		canonical    string
+		expectedCost money.Money
+	}{
+		{
+			name:         "before cutoff",
+			timestamp:    "2026-07-18T23:59:59Z",
+			canonical:    pricingpkg.KimiK26Canonical,
+			expectedCost: money.MustParseDollars("1"),
+		},
+		{
+			name:         "at cutoff",
+			timestamp:    "2026-07-19T00:00:00Z",
+			canonical:    pricingpkg.KimiK3Canonical,
+			expectedCost: money.MustParseDollars("2"),
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			resolver := export.NewPricingResolver([]export.EffectivePricingRow{
+				{
+					ModelPattern: pricingpkg.KimiK26Canonical,
+					Rates: export.ModelRates{
+						InputPerMTok: money.MustParseDollars("1"),
+					},
+				},
+				{
+					ModelPattern: pricingpkg.KimiK3Canonical,
+					Rates: export.ModelRates{
+						InputPerMTok: money.MustParseDollars("2"),
+					},
+				},
+			})
+
+			_, cost, priced, contributes, err := duckActivityReportRowStatus(
+				duckActivityReportUsageRow{
+					model:    "daimon-kimi-code",
+					ts:       tt.timestamp,
+					inputTok: 1_000_000,
+				},
+				resolver,
+			)
+
+			require.NoError(t, err)
+			assert.True(t, priced)
+			assert.True(t, contributes)
+			assert.Equal(t, tt.expectedCost, cost)
+			block, err := resolver.BuildBlock()
+			require.NoError(t, err)
+			require.Contains(t, block.Models, "daimon-kimi-code")
+			resolutions := block.Models["daimon-kimi-code"].Resolutions
+			require.Len(t, resolutions, 1)
+			assert.Equal(t, tt.canonical, resolutions[0].PricedModel)
+			assert.NotContains(t, block.Models, tt.canonical)
+		})
+	}
+}
+
+func TestDuckActivityReportRowStatusPrefersExactCustomKimiAlias(t *testing.T) {
+	resolver := export.NewPricingResolver([]export.EffectivePricingRow{
+		{
+			ModelPattern: "daimon-kimi-code",
+			Rates: export.ModelRates{
+				InputPerMTok: money.MustParseDollars("7"),
+				Source:       export.PricingRowSourceCustom,
+			},
+		},
+		{
+			ModelPattern: pricingpkg.KimiK3Canonical,
+			Rates: export.ModelRates{
+				InputPerMTok: money.MustParseDollars("2"),
+				Source:       export.PricingRowSourceFetched,
+			},
+		},
+	})
+
+	_, cost, priced, contributes, err := duckActivityReportRowStatus(
+		duckActivityReportUsageRow{
+			model:    "daimon-kimi-code",
+			ts:       "2026-07-19T00:00:00Z",
+			inputTok: 1_000_000,
+		},
+		resolver,
+	)
+
+	require.NoError(t, err)
+	assert.True(t, priced)
+	assert.True(t, contributes)
+	assert.Equal(t, money.MustParseDollars("7"), cost)
+	block, err := resolver.BuildBlock()
+	require.NoError(t, err)
+	require.Contains(t, block.Models, "daimon-kimi-code")
+	resolutions := block.Models["daimon-kimi-code"].Resolutions
+	require.Len(t, resolutions, 1)
+	assert.Equal(t, "daimon-kimi-code", resolutions[0].PricedModel)
+}
+
+func TestDuckGetActivityReportPricingBandApplicationCountedOnce(t *testing.T) {
+	ctx := context.Background()
+	sess := syncSession(
+		"pricing-band", "proj1", "banded", "2026-06-14T10:30:00.000Z", 1)
+	msg := syncMessage(
+		sess.ID, 0, "assistant", "request", "2026-06-14T10:30:00.000Z")
+	msg.Model = "banded-model"
+	msg.TokenUsage = json.RawMessage(`{"input_tokens":300000}`)
+	store := activityReportStore(t, []db.SessionBatchWrite{{
+		Session: sess, Messages: []db.Message{msg},
+		DataVersion: 1, ReplaceMessages: true,
+	}}, []db.ModelPricing{{
+		ModelPattern: "banded-model",
+		InputPerMTok: money.MustParseDollars("1"),
+		Bands: []db.PricingBand{{
+			AboveInputTokens: 200_000,
+			InputPerMTok:     money.MustParseDollars("2"),
+		}},
+	}})
+
+	report, err := store.GetActivityReport(
+		ctx, db.AnalyticsFilter{Timezone: "UTC"},
+		duckDayQuery(t, "2026-06-14", "UTC"))
+	require.NoError(t, err)
+	assert.Equal(t, money.Money{Microdollars: 600_000}, report.Totals.Cost)
+	require.NotNil(t, report.Pricing)
+	provenance := report.Pricing.Models["banded-model"]
+	require.Len(t, provenance.Resolutions, 1)
+	assert.Equal(t, export.PricingApplication{
+		Bands: []export.AppliedPricingBand{{
+			AboveInputTokens: 200_000,
+			RequestCount:     1,
+		}},
+	}, provenance.Resolutions[0].Application)
+}
+
+func TestDuckGetActivityReportPricesGooseRequestAsRequestScoped(t *testing.T) {
+	ctx := context.Background()
+	sess := syncSession(
+		"pricing-band", "proj1", "banded", "2026-06-14T10:30:00.000Z", 1)
+	msg := syncMessage(
+		sess.ID, 0, "user", "request", "2026-06-14T10:30:00.000Z")
+	store := activityReportStore(t, []db.SessionBatchWrite{{
+		Session: sess, Messages: []db.Message{msg}, UsageEvents: []db.UsageEvent{{
+			Source: "goose-request", Model: "banded-model", InputTokens: 300_000,
+			OccurredAt: "2026-06-14T10:30:30.000Z", DedupKey: "goose-request",
+		}},
+		DataVersion: 1, ReplaceMessages: true,
+	}}, []db.ModelPricing{{
+		ModelPattern: "banded-model",
+		InputPerMTok: money.MustParseDollars("1"),
+		Bands: []db.PricingBand{{
+			AboveInputTokens: 200_000,
+			InputPerMTok:     money.MustParseDollars("2"),
+		}},
+	}})
+
+	report, err := store.GetActivityReport(
+		ctx, db.AnalyticsFilter{Timezone: "UTC"},
+		duckDayQuery(t, "2026-06-14", "UTC"))
+	require.NoError(t, err)
+	assert.Equal(t, money.Money{Microdollars: 600_000}, report.Totals.Cost)
+	require.NotNil(t, report.Pricing)
+	provenance := report.Pricing.Models["banded-model"]
+	require.Len(t, provenance.Resolutions, 1)
+	assert.Equal(t, export.PricingApplication{
+		Bands: []export.AppliedPricingBand{{
+			AboveInputTokens: 200_000,
+			RequestCount:     1,
+		}},
+	}, provenance.Resolutions[0].Application)
 }
 
 func TestDuckGetActivityReportCopilotReportedCostReplacesSessionEstimates(t *testing.T) {
 	ctx := context.Background()
-	reportedCost := 0.03
+	reportedCost := money.MustParseDollars("0.03")
 	sess := syncSession(
 		"copilot:activity-authoritative", "proj1", "copilot activity",
 		"2026-06-14T10:00:00.000Z", 1,
@@ -212,32 +621,32 @@ func TestDuckGetActivityReportCopilotReportedCostReplacesSessionEstimates(t *tes
 			{
 				Source: "shutdown", Model: "copilot-model-b",
 				InputTokens: 1_000_000,
-				CostUSD:     &reportedCost, CostStatus: "exact",
+				Cost:        &reportedCost, CostStatus: "exact",
 				CostSource: db.CopilotReportedCostSource,
 				OccurredAt: "2026-06-14T10:10:00.000Z", DedupKey: "final",
 			},
 		},
 		DataVersion: 1, ReplaceMessages: true,
 	}}, []db.ModelPricing{
-		{ModelPattern: "copilot-model-a", InputPerMTok: 10},
-		{ModelPattern: "copilot-model-b", InputPerMTok: 20},
+		{ModelPattern: "copilot-model-a", InputPerMTok: money.MustParseDollars("10")},
+		{ModelPattern: "copilot-model-b", InputPerMTok: money.MustParseDollars("20")},
 	})
 
 	r, err := store.GetActivityReport(
 		ctx, db.AnalyticsFilter{Timezone: "UTC"},
 		duckDayQuery(t, "2026-06-14", "UTC"))
 	require.NoError(t, err)
-	assert.InDelta(t, reportedCost, r.Totals.Cost, 1e-12)
+	assert.Equal(t, reportedCost, r.Totals.Cost)
 	require.Len(t, r.BySession, 1)
-	assert.InDelta(t, reportedCost, r.BySession[0].Cost, 1e-12)
-	modelCosts := make(map[string]float64, len(r.ByModel))
+	assert.Equal(t, reportedCost, r.BySession[0].Cost)
+	modelCosts := make(map[string]money.Money, len(r.ByModel))
 	for _, model := range r.ByModel {
 		modelCosts[model.Key] = model.Cost
 	}
-	assert.InDelta(t, 0.01, modelCosts["copilot-model-a"], 1e-12)
-	assert.InDelta(t, 0.02, modelCosts["copilot-model-b"], 1e-12)
+	assert.Equal(t, money.MustParseDollars("0.01"), modelCosts["copilot-model-a"])
+	assert.Equal(t, money.MustParseDollars("0.02"), modelCosts["copilot-model-b"])
 	assert.Equal(t, r.Totals.Cost,
-		modelCosts["copilot-model-a"]+modelCosts["copilot-model-b"])
+		money.MustAdd(modelCosts["copilot-model-a"], modelCosts["copilot-model-b"]))
 }
 
 func TestDuckGetActivityReportPricingModelsOnlyIncludeDedupSurvivors(t *testing.T) {
@@ -245,7 +654,7 @@ func TestDuckGetActivityReportPricingModelsOnlyIncludeDedupSurvivors(t *testing.
 	earlier := syncSession("earlier", "proj1", "first", "2026-06-14T10:30:00.000Z", 1)
 	earlier.Agent = "claude"
 	earlierMsg := syncMessage("earlier", 0, "assistant", "x", "2026-06-14T10:30:00.000Z")
-	earlierMsg.Model = "kept-model"
+	earlierMsg.Model = "partial-model"
 	earlierMsg.TokenUsage = json.RawMessage(
 		`{"input_tokens":1000,"output_tokens":500}`)
 	earlierMsg.OutputTokens = 500
@@ -255,7 +664,7 @@ func TestDuckGetActivityReportPricingModelsOnlyIncludeDedupSurvivors(t *testing.
 	later := syncSession("later", "proj1", "first", "2026-06-14T10:31:00.000Z", 1)
 	later.Agent = "claude"
 	laterMsg := syncMessage("later", 0, "assistant", "x", "2026-06-14T10:31:00.000Z")
-	laterMsg.Model = "discarded-model"
+	laterMsg.Model = "complete-model"
 	laterMsg.TokenUsage = json.RawMessage(
 		`{"input_tokens":2000,"output_tokens":900}`)
 	laterMsg.OutputTokens = 900
@@ -277,8 +686,8 @@ func TestDuckGetActivityReportPricingModelsOnlyIncludeDedupSurvivors(t *testing.
 		},
 	}
 	pricing := []db.ModelPricing{
-		{ModelPattern: "kept-model", InputPerMTok: 3.0, OutputPerMTok: 15.0},
-		{ModelPattern: "discarded-model", InputPerMTok: 3.0, OutputPerMTok: 15.0},
+		{ModelPattern: "partial-model", InputPerMTok: money.MustParseDollars("3.0"), OutputPerMTok: money.MustParseDollars("15.0")},
+		{ModelPattern: "complete-model", InputPerMTok: money.MustParseDollars("3.0"), OutputPerMTok: money.MustParseDollars("15.0")},
 	}
 	store := activityReportStore(t, writes, pricing)
 
@@ -286,10 +695,10 @@ func TestDuckGetActivityReportPricingModelsOnlyIncludeDedupSurvivors(t *testing.
 		ctx, db.AnalyticsFilter{Timezone: "UTC"},
 		duckDayQuery(t, "2026-06-14", "UTC"))
 	require.NoError(t, err)
-	assert.Equal(t, 500, r.Totals.OutputTokens)
+	assert.Equal(t, 900, r.Totals.OutputTokens)
 	require.NotNil(t, r.Pricing)
-	assert.Contains(t, r.Pricing.Models, "kept-model")
-	assert.NotContains(t, r.Pricing.Models, "discarded-model")
+	assert.Contains(t, r.Pricing.Models, "complete-model")
+	assert.NotContains(t, r.Pricing.Models, "partial-model")
 }
 
 func TestDuckGetActivityReportPreservesSessionSummaryUsageEventTokens(t *testing.T) {
@@ -322,8 +731,8 @@ func TestDuckGetActivityReportPreservesSessionSummaryUsageEventTokens(t *testing
 	}}
 	pricing := []db.ModelPricing{{
 		ModelPattern:  "summary-model",
-		InputPerMTok:  1,
-		OutputPerMTok: 2,
+		InputPerMTok:  money.MustParseDollars("1"),
+		OutputPerMTok: money.MustParseDollars("2"),
 	}}
 	store := activityReportStore(t, writes, pricing)
 
@@ -332,8 +741,12 @@ func TestDuckGetActivityReportPreservesSessionSummaryUsageEventTokens(t *testing
 		duckDayQuery(t, "2026-06-14", "UTC"))
 	require.NoError(t, err)
 	assert.Equal(t, rawOutput, r.Totals.OutputTokens)
-	wantCost := (float64(rawInput)*1 + float64(rawOutput)*2) / 1_000_000
-	assert.InDelta(t, wantCost, r.Totals.Cost, 1e-9)
+	wantCost, err := money.CostPerMillion([]money.RatedTokens{
+		{Tokens: int64(rawInput), Rate: money.MustParseDollars("1")},
+		{Tokens: int64(rawOutput), Rate: money.MustParseDollars("2")},
+	})
+	require.NoError(t, err)
+	assert.Equal(t, wantCost, r.Totals.Cost)
 }
 
 // TestDuckGetActivityReportExcludesIneligibleUsage confirms the DuckDB
@@ -371,8 +784,8 @@ func TestDuckGetActivityReportExcludesIneligibleUsage(t *testing.T) {
 	}}
 	pricing := []db.ModelPricing{{
 		ModelPattern:  "claude-sonnet-4-20250514",
-		InputPerMTok:  3.0,
-		OutputPerMTok: 15.0,
+		InputPerMTok:  money.MustParseDollars("3.0"),
+		OutputPerMTok: money.MustParseDollars("15.0"),
 	}}
 	store := activityReportStore(t, writes, pricing)
 
@@ -382,7 +795,7 @@ func TestDuckGetActivityReportExcludesIneligibleUsage(t *testing.T) {
 	require.NoError(t, err)
 	assert.Equal(t, 500, r.Totals.OutputTokens, "synthetic message excluded")
 	// Cost = (1000*3 + 500*15) / 1e6 = 0.0105
-	assert.InDelta(t, 0.0105, r.Totals.Cost, 1e-9)
+	assert.Equal(t, money.MustParseDollars("0.0105"), r.Totals.Cost)
 }
 
 // TestDuckGetActivityReportPriorDayWithinPadExcluded confirms the candidate
@@ -469,8 +882,8 @@ func TestDuckGetActivityReportOpenSessionWithInRangeMessageIncluded(t *testing.T
 }
 
 // TestDuckGetActivityReportUsageDedupSubSecondOrder confirms DuckDB orders the
-// usage stream by the parsed instant so first-seen-wins dedup keeps the
-// chronologically earlier row when two rows share a dedup key in the same
+// usage stream by the parsed instant so first-seen-wins fallback dedup keeps
+// the chronologically earlier row when two rows share a source UUID in the same
 // second -- one whole-second ("...00Z"), one fractional ("...00.123Z"). DuckDB
 // already sorts on the parsed time (not the formatted text), so this locks in
 // that cross-backend behavior, matching the SQLite
@@ -479,18 +892,18 @@ func TestDuckGetActivityReportUsageDedupSubSecondOrder(t *testing.T) {
 	ctx := context.Background()
 	pricing := []db.ModelPricing{{
 		ModelPattern:  "claude-sonnet-4-20250514",
-		InputPerMTok:  3.0,
-		OutputPerMTok: 15.0,
+		InputPerMTok:  money.MustParseDollars("3.0"),
+		OutputPerMTok: money.MustParseDollars("15.0"),
 	}}
 
-	// A resumed/forked pair shares one (claude_message_id, claude_request_id)
+	// A resumed/forked pair shares one source UUID fallback dedup identity
 	// across two sessions: the earlier whole-second instant carries 500 output
 	// tokens, the later fractional instant 9000. Dedup must keep the 500 row.
 	earlier := syncSession("earlier", "proj1", "first", "2026-06-14T10:30:00Z", 1)
 	earlierMsg := syncMessage("earlier", 0, "assistant", "x", "2026-06-14T10:30:00Z")
 	earlierMsg.Model = "claude-sonnet-4-20250514"
 	earlierMsg.ClaudeMessageID = "dup-m"
-	earlierMsg.ClaudeRequestID = "dup-r"
+	earlierMsg.SourceUUID = "dup-source"
 	earlierMsg.TokenUsage = json.RawMessage(`{"input_tokens":1000,"output_tokens":500}`)
 	earlierMsg.OutputTokens = 500
 
@@ -498,7 +911,7 @@ func TestDuckGetActivityReportUsageDedupSubSecondOrder(t *testing.T) {
 	laterMsg := syncMessage("later", 0, "assistant", "x", "2026-06-14T10:30:00.123Z")
 	laterMsg.Model = "claude-sonnet-4-20250514"
 	laterMsg.ClaudeMessageID = "dup-m"
-	laterMsg.ClaudeRequestID = "dup-r"
+	laterMsg.SourceUUID = "dup-source"
 	laterMsg.TokenUsage = json.RawMessage(`{"input_tokens":1000,"output_tokens":9000}`)
 	laterMsg.OutputTokens = 9000
 
@@ -522,8 +935,8 @@ func TestDuckGetActivityReportUsageDedupFallsBackToSourceUUID(t *testing.T) {
 	ctx := context.Background()
 	pricing := []db.ModelPricing{{
 		ModelPattern:  "claude-sonnet-4-20250514",
-		InputPerMTok:  3.0,
-		OutputPerMTok: 15.0,
+		InputPerMTok:  money.MustParseDollars("3.0"),
+		OutputPerMTok: money.MustParseDollars("15.0"),
 	}}
 
 	earlier := syncSession("earlier", "proj1", "first", "2026-06-14T10:30:00Z", 1)

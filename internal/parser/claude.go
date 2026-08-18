@@ -6,6 +6,7 @@ import (
 	"bytes"
 	"encoding/json"
 	"fmt"
+	"io"
 	"log"
 	"os"
 	"path/filepath"
@@ -30,9 +31,10 @@ var (
 )
 
 const (
-	initialScanBufSize = 64 * 1024        // 64KB
-	maxLineSize        = 64 * 1024 * 1024 // 64MB
-	forkThreshold      = 3
+	initialScanBufSize         = 64 * 1024        // 64KB
+	maxLineSize                = 64 * 1024 * 1024 // 64MB
+	maxPersistedToolResultSize = 16 * 1024 * 1024 // 16MB
+	forkThreshold              = 3
 )
 
 // dagEntry holds metadata for a single JSONL entry participating
@@ -53,8 +55,9 @@ type dagEntry struct {
 // of band and splice them into the message stream by timestamp
 // after DAG processing completes.
 type claudeQueuedCommand struct {
-	prompt    string
-	timestamp time.Time
+	prompt       string
+	promptSource string
+	timestamp    time.Time
 }
 
 // claudeParseWithExclusions parses a Claude Code JSONL session file
@@ -70,12 +73,29 @@ type claudeQueuedCommand struct {
 func claudeParseWithExclusions(
 	path, project, machine string,
 ) ([]ParseResult, []string, error) {
+	return claudeParseFile(path, project, machine, claudeParseOptions{})
+}
+
+func claudeParseFile(
+	path, project, machine string, opts claudeParseOptions,
+) ([]ParseResult, []string, error) {
 	info, err := os.Stat(path)
 	if err != nil {
 		return nil, nil, fmt.Errorf("stat %s: %w", path, err)
 	}
 
 	sessionID := strings.TrimSuffix(filepath.Base(path), ".jsonl")
+
+	// Background-fork lineage: when the transcript is a bg-marked fork
+	// that replays a non-bg sibling, drop the replayed prefix and link
+	// the fork to its parent. Whether the fork is still an exact copy
+	// of the parent is decided after parsing: uuid-less fork-own
+	// records (a prompt queued at handoff) can carry the fork's only
+	// message.
+	var lineage *claudeLineagePlan
+	if opts.siblingLineage {
+		lineage = claudeResolveSiblingLineage(path)
+	}
 
 	f, err := os.Open(path)
 	if err != nil {
@@ -97,8 +117,10 @@ func claudeParseWithExclusions(
 		displayName     string
 		agentLabel      string
 		entrypoint      string
+		sessionKind     string
 		foundParentSID  bool
 		lineIndex       int
+		uuidLineOrdinal int
 		malformedLines  int
 		lastLineHasData bool
 		lastLineValid   bool
@@ -108,6 +130,9 @@ func claudeParseWithExclusions(
 	)
 	allHaveUUID = true
 	parentSessionID = claudeCompanionParentSessionID(path, sessionID)
+	if lineage != nil {
+		parentSessionID = lineage.parentSessionID
+	}
 
 	lr := newLineReader(f, maxLineSize)
 	defer releaseLineReader(lr)
@@ -126,6 +151,18 @@ func claudeParseWithExclusions(
 		}
 		lastLineFailed = false
 
+		// Drop the contiguous leading replay region of a background
+		// fork before any metadata, timestamp, or attachment
+		// collection: replayed records belong to the parent session.
+		if lineage != nil &&
+			gjson.GetBytes(lineBytes, "uuid").Str != "" {
+			ordinal := uuidLineOrdinal
+			uuidLineOrdinal++
+			if ordinal < lineage.dropCount {
+				continue
+			}
+		}
+
 		entryType := gjson.GetBytes(lineBytes, "type").Str
 		if agentLabel == "" {
 			if value := gjson.GetBytes(lineBytes, "agentSetting").Str; strings.TrimSpace(value) != "" {
@@ -135,6 +172,11 @@ func claudeParseWithExclusions(
 		if entrypoint == "" {
 			if value := gjson.GetBytes(lineBytes, "entrypoint").Str; strings.TrimSpace(value) != "" {
 				entrypoint = strings.Clone(value)
+			}
+		}
+		if sessionKind == "" {
+			if value := gjson.GetBytes(lineBytes, "sessionKind").Str; strings.TrimSpace(value) != "" {
+				sessionKind = strings.Clone(value)
 			}
 		}
 
@@ -248,6 +290,14 @@ func claudeParseWithExclusions(
 
 		uuid := gjson.Get(line, "uuid").Str
 		parentUuid := gjson.Get(line, "parentUuid").Str
+		if lineage != nil && parentUuid != "" {
+			if _, dropped := lineage.dropUUIDs[parentUuid]; dropped {
+				// The replay boundary entry references a dropped
+				// record; re-root it so DAG processing still sees a
+				// single-root chain.
+				parentUuid = ""
+			}
+		}
 
 		if uuid != "" {
 			hasAnyUUID = true
@@ -301,6 +351,7 @@ func claudeParseWithExclusions(
 		displayName:     displayName,
 		agentLabel:      agentLabel,
 		entrypoint:      entrypoint,
+		sessionKind:     sessionKind,
 		malformedLines:  malformedLines,
 		isTruncated:     isTruncated,
 	}
@@ -336,6 +387,13 @@ func claudeParseWithExclusions(
 		results[0] = applyQueuedCommands(results[0], queuedCommands)
 	}
 
+	// An established background-fork lineage is a continuation of the
+	// parent transcript. In-file DAG forks (results[1:]) keep their
+	// fork relationship to the main branch.
+	if lineage != nil && len(results) > 0 {
+		results[0].Session.RelationshipType = RelContinuation
+	}
+
 	// Classify termination status for each result. All forks
 	// from a single file share lastLineFailed because a
 	// truncated tail affects every branch. The stop_reason is
@@ -353,11 +411,16 @@ func claudeParseWithExclusions(
 	// Drop content-free /usage probe sessions (e.g. CodexBar's
 	// ClaudeProbe) after the queued-command splice so both inline
 	// and queued /usage prompts are visible to the check. They never
-	// enter the archive.
+	// enter the archive. A background fork whose trimmed result holds
+	// no messages of its own is still an exact copy of its parent and
+	// is excluded the same way, retiring any previously stored
+	// untrimmed row.
 	kept := results[:0]
 	var excluded []string
 	for _, r := range results {
-		if isUsageProbeSession(r.Messages) {
+		if isUsageProbeSession(r.Messages) ||
+			(lineage != nil && r.Session.ID == sessionID &&
+				len(r.Messages) == 0) {
 			excluded = append(excluded, r.Session.ID)
 			continue
 		}
@@ -375,7 +438,7 @@ func compactClaudeEntry(line []byte) string {
 	topFields := []claudeCompactField{
 		{name: "uuid"}, {name: "parentUuid"}, {name: "timestamp"},
 		{name: "isCompactSummary"}, {name: "isSidechain"},
-		{name: "isMeta"}, {name: "requestId"},
+		{name: "isMeta"}, {name: "requestId"}, {name: "promptSource"},
 	}
 	messageFields := []claudeCompactField{
 		{name: "content"}, {name: "id"}, {name: "stop_reason"},
@@ -384,8 +447,12 @@ func compactClaudeEntry(line []byte) string {
 	snapshotFields := []claudeCompactField{
 		{name: "timestamp"},
 	}
+	// searchCount is how many billed server-side web searches a
+	// WebSearch tool result performed; it is the only surviving record
+	// of them in a Claude Code transcript.
 	toolResultFields := []claudeCompactField{
 		{name: "agentId"}, {name: "persistedOutputPath"},
+		{name: "searchCount"},
 	}
 
 	// Fill all field groups in a single pass over the entry. This runs
@@ -564,8 +631,9 @@ type ClaudeSubagentLink struct {
 // only change the stored session when the corresponding stored value is
 // still empty.
 type claudeStoredIdentity struct {
-	agentLabel string
-	entrypoint string
+	agentLabel  string
+	entrypoint  string
+	sessionKind string
 }
 
 // claudeIncrementalScan carries the per-session stored state an
@@ -726,6 +794,9 @@ func claudeParseSessionFrom(
 	if needsClaudeFullParseForSubagentMap(entries, subagentMap) {
 		return nil, nil, time.Time{}, 0, ErrClaudeIncrementalNeedsFullParse
 	}
+	if needsClaudeFullParseForWebSearchCounts(entries) {
+		return nil, nil, time.Time{}, 0, ErrClaudeIncrementalNeedsFullParse
+	}
 
 	if len(entries) == 0 && len(queuedCommands) == 0 {
 		return nil, nil, latestTS, consumed, nil
@@ -814,8 +885,12 @@ func claudeSessionIdentityUpdate(line string, stored claudeStoredIdentity) bool 
 		strings.TrimSpace(gjson.Get(line, "agentSetting").Str) != "" {
 		return true
 	}
-	return stored.entrypoint == "" &&
-		strings.TrimSpace(gjson.Get(line, "entrypoint").Str) != ""
+	if stored.entrypoint == "" &&
+		strings.TrimSpace(gjson.Get(line, "entrypoint").Str) != "" {
+		return true
+	}
+	return stored.sessionKind == "" &&
+		strings.TrimSpace(gjson.Get(line, "sessionKind").Str) != ""
 }
 
 // collectClaudeUnmatchedToolResults returns result links for appended
@@ -912,6 +987,16 @@ func needsClaudeFullParseForSubagentMap(
 		return false
 	}
 
+	appendedToolUseIDs := claudeAppendedToolUseIDs(entries)
+	for toolUseID := range subagentMap {
+		if _, ok := appendedToolUseIDs[toolUseID]; !ok {
+			return true
+		}
+	}
+	return false
+}
+
+func claudeAppendedToolUseIDs(entries []dagEntry) map[string]struct{} {
 	appendedToolUseIDs := make(map[string]struct{})
 	for _, e := range entries {
 		if e.entryType != "assistant" {
@@ -931,13 +1016,7 @@ func needsClaudeFullParseForSubagentMap(
 			return true
 		})
 	}
-
-	for toolUseID := range subagentMap {
-		if _, ok := appendedToolUseIDs[toolUseID]; !ok {
-			return true
-		}
-	}
-	return false
+	return appendedToolUseIDs
 }
 
 // appendAddsDAGRoot reports whether an appended message entry has a
@@ -1035,6 +1114,7 @@ func extractMessagesFrom(
 				SourceUUID:        e.uuid,
 				SourceParentUUID:  e.parentUuid,
 				IsSidechain:       gjson.Get(e.line, "isSidechain").Bool(),
+				PromptSource:      gjson.Get(e.line, "promptSource").Str,
 				IsCompactBoundary: true,
 			})
 			ordinal++
@@ -1087,9 +1167,32 @@ func extractMessagesFrom(
 					SourceUUID:       e.uuid,
 					SourceParentUUID: e.parentUuid,
 					IsSidechain:      gjson.Get(e.line, "isSidechain").Bool(),
+					PromptSource:     gjson.Get(e.line, "promptSource").Str,
 				})
 				ordinal++
 				continue
+			}
+			// The VS Code extension sometimes prepends an IDE-context
+			// wrapper directly onto a real prompt in the same entry.
+			// Split it into a hidden system-metadata message plus the
+			// real prompt, so first_message and the visible transcript
+			// show only the prompt.
+			if subtype, envelope, remainder, ok :=
+				splitClaudeIDEEnvelopePrompt(text); ok {
+				hidden := claudeIDEEnvelopeMessage(e, ordinal, subtype, envelope)
+				if remainder == "" || isClaudeSystemMessage(remainder) {
+					// The remainder is discarded, so no visible
+					// message remains to carry the entry's tool
+					// results; keep them on the hidden envelope row
+					// like the standalone classify branch does.
+					hidden.ToolResults = trs
+				}
+				messages = append(messages, hidden)
+				ordinal++
+				if remainder == "" {
+					continue
+				}
+				text = remainder
 			}
 			// Skip unclassified noise (e.g. non-caveat
 			// <local-command-*> envelopes).
@@ -1113,6 +1216,7 @@ func extractMessagesFrom(
 			SourceUUID:         e.uuid,
 			SourceParentUUID:   e.parentUuid,
 			IsSidechain:        gjson.Get(e.line, "isSidechain").Bool(),
+			PromptSource:       gjson.Get(e.line, "promptSource").Str,
 			tokenPresenceKnown: e.entryType == "assistant",
 		}
 
@@ -1124,6 +1228,9 @@ func extractMessagesFrom(
 		messages = append(messages, msg)
 		ordinal++
 	}
+
+	annotateClaudeWebSearchRequests(
+		messages, collectClaudeWebSearchCounts(entries))
 
 	return messages, startedAt, endedAt
 }
@@ -1138,6 +1245,7 @@ type claudeSessionMeta struct {
 	displayName     string
 	agentLabel      string
 	entrypoint      string
+	sessionKind     string
 	malformedLines  int
 	isTruncated     bool
 }
@@ -1151,6 +1259,7 @@ func (m claudeSessionMeta) applyTo(sess *ParsedSession) {
 	sess.SessionName = m.displayName
 	sess.AgentLabel = m.agentLabel
 	sess.Entrypoint = m.entrypoint
+	sess.SessionKind = m.sessionKind
 	sess.MalformedLines = m.malformedLines
 	sess.IsTruncated = m.isTruncated
 }
@@ -1169,9 +1278,8 @@ func parseLinear(
 	endedAt = laterTime(globalEnd, endedAt)
 	annotateSubagentSessions(messages, subagentMap)
 
-	// Promoted system messages (continuation/resume/interrupted/
-	// task_notification/stop_hook) carry Role=user so role-keyed
-	// analytics ignore them, but they are not real user turns;
+	// Promoted system messages carry Role=user so role-keyed analytics
+	// ignore them, but they are not real user turns;
 	// firstMessageAndUserCount skips them when computing
 	// user_message_count / first_message. It also skips leading
 	// /clear and /effort command envelopes so the sidebar shows
@@ -1442,8 +1550,9 @@ func extractQueuedCommand(line string) (claudeQueuedCommand, bool) {
 		return claudeQueuedCommand{}, false
 	}
 	return claudeQueuedCommand{
-		prompt:    prompt,
-		timestamp: extractTimestamp(line),
+		prompt:       prompt,
+		promptSource: gjson.Get(line, "promptSource").Str,
+		timestamp:    extractTimestamp(line),
 	}, true
 }
 
@@ -1579,6 +1688,7 @@ func queuedCommandMessage(
 			ContentLength: len(q.prompt),
 			SourceType:    "system",
 			SourceSubtype: subtype,
+			PromptSource:  q.promptSource,
 		}
 	}
 	return ParsedMessage{
@@ -1588,6 +1698,7 @@ func queuedCommandMessage(
 		ContentLength: len(q.prompt),
 		SourceType:    "user",
 		SourceSubtype: "queued_command",
+		PromptSource:  q.promptSource,
 	}
 }
 
@@ -1945,9 +2056,18 @@ func readClaudePersistedToolResult(
 		if !pathWithinDir(cleanResult, dir) {
 			continue
 		}
-		b, err := os.ReadFile(cleanResult)
+		f, err := os.Open(cleanResult)
 		if err != nil {
 			return "", false
+		}
+		b, readErr := io.ReadAll(io.LimitReader(f, maxPersistedToolResultSize+1))
+		closeErr := f.Close()
+		if readErr != nil || closeErr != nil {
+			return "", false
+		}
+		if len(b) > maxPersistedToolResultSize {
+			b = b[:maxPersistedToolResultSize]
+			b = append(b, "\n\n[agentsview: persisted tool result truncated at 16 MiB]"...)
 		}
 		return string(b), true
 	}
@@ -1982,11 +2102,10 @@ func pathWithinDir(path, dir string) bool {
 		rel != ".."
 }
 
-// countUserTurns counts all user entries reachable from a
-// starting index by traversing the entire subtree. Earlier
-// versions followed only the first child at each node, which
-// undercounted in sessions with many nested forks and caused
-// the fork heuristic to discard the main conversation branch.
+// countUserTurns counts real user entries reachable from a starting index
+// by traversing the entire subtree. System-injected user records must not
+// influence branch selection because they are promoted to system metadata
+// when messages are extracted.
 func countUserTurns(
 	entries []dagEntry,
 	children map[string][]int,
@@ -1997,12 +2116,33 @@ func countUserTurns(
 	for len(stack) > 0 {
 		current := stack[len(stack)-1]
 		stack = stack[:len(stack)-1]
-		if entries[current].entryType == "user" {
+		if isCountedClaudeUserTurn(entries[current]) {
 			count++
 		}
 		stack = append(stack, children[entries[current].uuid]...)
 	}
 	return count
+}
+
+func isCountedClaudeUserTurn(entry dagEntry) bool {
+	if entry.entryType != "user" ||
+		gjson.Get(entry.line, "isMeta").Bool() ||
+		gjson.Get(entry.line, "isCompactSummary").Bool() {
+		return false
+	}
+	content := gjson.Get(entry.line, "message.content")
+	text, _, _, _, _, _ := ExtractTextContent(content)
+	text, skip := preprocessClaudeUserText(text)
+	if skip || strings.TrimSpace(text) == "" {
+		return false
+	}
+	if _, _, remainder, ok := splitClaudeIDEEnvelopePrompt(text); ok {
+		if remainder == "" {
+			return false
+		}
+		text = remainder
+	}
+	return !isClaudeSystemMessage(text)
 }
 
 // extractMessages converts dagEntries into ParsedMessages, applying
@@ -2044,6 +2184,7 @@ func extractMessages(entries []dagEntry) (
 				SourceUUID:        e.uuid,
 				SourceParentUUID:  e.parentUuid,
 				IsSidechain:       gjson.Get(e.line, "isSidechain").Bool(),
+				PromptSource:      gjson.Get(e.line, "promptSource").Str,
 				IsCompactBoundary: true,
 			})
 			ordinal++
@@ -2097,9 +2238,32 @@ func extractMessages(entries []dagEntry) (
 					SourceUUID:       e.uuid,
 					SourceParentUUID: e.parentUuid,
 					IsSidechain:      gjson.Get(e.line, "isSidechain").Bool(),
+					PromptSource:     gjson.Get(e.line, "promptSource").Str,
 				})
 				ordinal++
 				continue
+			}
+			// The VS Code extension sometimes prepends an IDE-context
+			// wrapper directly onto a real prompt in the same entry.
+			// Split it into a hidden system-metadata message plus the
+			// real prompt, so first_message and the visible transcript
+			// show only the prompt.
+			if subtype, envelope, remainder, ok :=
+				splitClaudeIDEEnvelopePrompt(text); ok {
+				hidden := claudeIDEEnvelopeMessage(e, ordinal, subtype, envelope)
+				if remainder == "" || isClaudeSystemMessage(remainder) {
+					// The remainder is discarded, so no visible
+					// message remains to carry the entry's tool
+					// results; keep them on the hidden envelope row
+					// like the standalone classify branch does.
+					hidden.ToolResults = trs
+				}
+				messages = append(messages, hidden)
+				ordinal++
+				if remainder == "" {
+					continue
+				}
+				text = remainder
 			}
 			if isClaudeSystemMessage(text) {
 				continue
@@ -2121,6 +2285,7 @@ func extractMessages(entries []dagEntry) (
 			SourceUUID:         e.uuid,
 			SourceParentUUID:   e.parentUuid,
 			IsSidechain:        gjson.Get(e.line, "isSidechain").Bool(),
+			PromptSource:       gjson.Get(e.line, "promptSource").Str,
 			tokenPresenceKnown: e.entryType == "assistant",
 		}
 
@@ -2132,6 +2297,9 @@ func extractMessages(entries []dagEntry) (
 		messages = append(messages, msg)
 		ordinal++
 	}
+
+	annotateClaudeWebSearchRequests(
+		messages, collectClaudeWebSearchCounts(entries))
 
 	return messages, startedAt, endedAt
 }
@@ -2422,7 +2590,7 @@ func isCommandEnvelope(content string) bool {
 	return strings.TrimSpace(stripped) == ""
 }
 
-// isSkippablePreviewCommand returns true when content is a Claude
+// IsSkippablePreviewCommand returns true when content is a Claude
 // Code slash command (e.g. /login, /plan, /roborev-fix). Detection
 // is generic: the trimmed content must start with "/" followed by one
 // or more letters, digits, hyphens, or underscores, then either end
@@ -2430,7 +2598,7 @@ func isCommandEnvelope(content string) bool {
 // because command envelopes normalise to names like /skill-name.
 // File-path references like "/usr/local/bin gives an error" are not
 // skipped because the embedded "/" terminates the match.
-func isSkippablePreviewCommand(content string) bool {
+func IsSkippablePreviewCommand(content string) bool {
 	trimmed := strings.TrimSpace(content)
 	if !strings.HasPrefix(trimmed, "/") {
 		return false
@@ -2472,7 +2640,7 @@ func firstMessageAndUserCount(
 		}
 		userCount++
 		if firstMsg == "" &&
-			!isSkippablePreviewCommand(m.Content) {
+			!IsSkippablePreviewCommand(m.Content) {
 			firstMsg = truncate(
 				strings.ReplaceAll(m.Content, "\n", " "), 300,
 			)
@@ -2565,8 +2733,124 @@ func classifyClaudeSystemMessage(content string) string {
 			return ""
 		}
 		return "system_reminder"
+	case isStandaloneClaudeTaggedMessage(trimmed, "ide_opened_file"):
+		return "ide_opened_file"
+	case isStandaloneClaudeTaggedMessage(trimmed, "ide_selection"):
+		return "ide_selection"
 	}
 	return ""
+}
+
+func isStandaloneClaudeTaggedMessage(content, tag string) bool {
+	trimmed := strings.TrimSpace(content)
+	openTag := "<" + tag + ">"
+	closeTag := "</" + tag + ">"
+	if !strings.HasPrefix(trimmed, openTag) ||
+		!strings.HasSuffix(trimmed, closeTag) {
+		return false
+	}
+
+	afterOpen := trimmed[len(openTag):]
+	return strings.Index(afterOpen, closeTag) ==
+		len(afterOpen)-len(closeTag)
+}
+
+// claudeIDEEnvelopeTags are the VS Code extension's IDE-context
+// wrapper tags: standalone messages using these are already
+// promoted to hidden system metadata by classifyClaudeSystemMessage.
+// splitLeadingClaudeIDEEnvelope handles the remaining case where the
+// extension prepends one of these wrappers directly onto a real
+// prompt in the same user entry.
+var claudeIDEEnvelopeTags = [...]string{"ide_opened_file", "ide_selection"}
+
+// claudeIDEEnvelopeSourceUUID derives a distinct source UUID for the
+// synthetic hidden message a split envelope becomes. The real prompt
+// keeps the entry's own uuid: pins and Recall evidence resolve source
+// UUIDs and require them to be unique per session, so the two rows
+// produced from one entry must not share an identity. An empty entry
+// uuid stays empty rather than becoming a shared non-empty value.
+func claudeIDEEnvelopeSourceUUID(entryUUID string) string {
+	if entryUUID == "" {
+		return ""
+	}
+	return entryUUID + ":ide-context"
+}
+
+// splitLeadingClaudeIDEEnvelope detects a well-formed IDE-context
+// envelope at the very start of content that is followed by
+// additional real prompt text, and separates the two. The standalone
+// case (envelope with nothing else) is left alone here; that is
+// handled by classifyClaudeSystemMessage so the whole message
+// promotes to system metadata.
+//
+// Splitting keeps the envelope recorded as hidden system metadata
+// (same subtype as the standalone case) while letting first_message
+// and the visible transcript show only the real prompt that follows,
+// instead of raw IDE-context markup.
+// splitClaudeIDEEnvelopePrompt splits a leading IDE-context envelope
+// off a user entry's text and re-runs the revealed remainder through
+// the same command/system-reminder preprocessing a bare prompt gets,
+// so command XML normalizes (e.g. "/clear") instead of surfacing raw
+// markup in first_message. A remainder that preprocessing skips or
+// empties comes back as "": the entry carries no visible prompt.
+func splitClaudeIDEEnvelopePrompt(
+	text string,
+) (subtype, envelope, remainder string, ok bool) {
+	subtype, envelope, remainder, ok = splitLeadingClaudeIDEEnvelope(text)
+	if !ok {
+		return "", "", "", false
+	}
+	remainder, skip := preprocessClaudeUserText(remainder)
+	if skip || strings.TrimSpace(remainder) == "" {
+		return subtype, envelope, "", true
+	}
+	return subtype, envelope, remainder, true
+}
+
+// claudeIDEEnvelopeMessage builds the hidden system-metadata message a
+// split envelope becomes. Role stays "user" so role-keyed analytics
+// treat it as input, matching the standalone classify branch.
+func claudeIDEEnvelopeMessage(
+	e dagEntry, ordinal int, subtype, envelope string,
+) ParsedMessage {
+	return ParsedMessage{
+		Ordinal:          ordinal,
+		Role:             RoleUser,
+		Content:          envelope,
+		Timestamp:        e.timestamp,
+		IsSystem:         true,
+		ContentLength:    len(envelope),
+		SourceType:       "system",
+		SourceSubtype:    subtype,
+		SourceUUID:       claudeIDEEnvelopeSourceUUID(e.uuid),
+		SourceParentUUID: e.parentUuid,
+		IsSidechain:      gjson.Get(e.line, "isSidechain").Bool(),
+	}
+}
+
+func splitLeadingClaudeIDEEnvelope(
+	content string,
+) (subtype, envelope, remainder string, ok bool) {
+	trimmed := trimClaudeSystemMessagePrefix(content)
+	for _, tag := range claudeIDEEnvelopeTags {
+		openTag := "<" + tag + ">"
+		closeTag := "</" + tag + ">"
+		if !strings.HasPrefix(trimmed, openTag) {
+			continue
+		}
+		closeIdx := strings.Index(trimmed, closeTag)
+		if closeIdx < 0 {
+			continue
+		}
+		envelopeEnd := closeIdx + len(closeTag)
+		rest := strings.TrimSpace(trimmed[envelopeEnd:])
+		if rest == "" {
+			// Standalone: classifyClaudeSystemMessage handles this.
+			continue
+		}
+		return tag, trimmed[:envelopeEnd], rest, true
+	}
+	return "", "", "", false
 }
 
 func stripLeadingClaudeSystemReminderContent(content string) string {

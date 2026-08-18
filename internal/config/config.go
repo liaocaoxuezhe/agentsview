@@ -5,6 +5,7 @@ import (
 	"crypto/rand"
 	"encoding/base64"
 	"encoding/json"
+	"errors"
 	"flag"
 	"fmt"
 	"log"
@@ -25,6 +26,7 @@ import (
 	"github.com/gofrs/flock"
 	"github.com/spf13/pflag"
 	"go.kenn.io/agentsview/internal/parser"
+	"go.kenn.io/agentsview/internal/pathutil"
 )
 
 // TerminalConfig holds terminal launch preferences.
@@ -102,13 +104,18 @@ var pgConfigKeys = map[string]struct{}{
 
 // DuckDBConfig holds DuckDB mirror and Quack connection settings.
 type DuckDBConfig struct {
-	Path            string   `toml:"path" json:"path"`
-	URL             string   `toml:"url" json:"url"`
-	Token           string   `toml:"token" json:"token,omitempty"`
-	MachineName     string   `toml:"machine_name" json:"machine_name"`
-	AllowInsecure   bool     `toml:"allow_insecure" json:"allow_insecure"`
-	Projects        []string `toml:"projects" json:"projects,omitempty"`
-	ExcludeProjects []string `toml:"exclude_projects" json:"exclude_projects,omitempty"`
+	Path          string `toml:"path" json:"path"`
+	URL           string `toml:"url" json:"url"`
+	Token         string `toml:"token" json:"token,omitempty"`
+	MachineName   string `toml:"machine_name" json:"machine_name"`
+	AllowInsecure bool   `toml:"allow_insecure" json:"allow_insecure"`
+	// AttachTimeout bounds how long a remote Quack ATTACH (and its cheap TCP
+	// preflight) may run before the client gives up, so an unresponsive
+	// endpoint fails fast instead of hanging forever. Zero selects the
+	// package default; a negative value disables the guard.
+	AttachTimeout   time.Duration `toml:"attach_timeout" json:"attach_timeout,omitempty"`
+	Projects        []string      `toml:"projects" json:"projects,omitempty"`
+	ExcludeProjects []string      `toml:"exclude_projects" json:"exclude_projects,omitempty"`
 }
 
 // VectorConfig holds settings for the optional local semantic-search
@@ -181,6 +188,9 @@ type VectorEmbeddingsConfig struct {
 // VectorEmbeddingsConfig.
 type VectorEmbeddingsServerConfig struct {
 	Endpoint string `toml:"endpoint" json:"endpoint"`
+	// OllamaCPUFallback retries invalid Metal vectors once through Ollama's
+	// native CPU embedding path. It is transport-only and defaults to false.
+	OllamaCPUFallback bool `toml:"ollama_cpu_fallback" json:"ollama_cpu_fallback,omitempty"`
 	// APIKeyEnv names the environment variable holding the API key.
 	// Empty means anonymous access.
 	APIKeyEnv string `toml:"api_key_env" json:"api_key_env,omitempty"`
@@ -274,6 +284,9 @@ type VectorEmbedConfig struct {
 	// RunAfterSync enables debounced embedding of sync deltas.
 	// Defaults to true when unset; read it via RunAfterSyncEnabled.
 	RunAfterSync *bool `toml:"run_after_sync" json:"run_after_sync,omitempty"`
+	// Recall explicitly permits automatic Recall embedding. It defaults to
+	// false because Recall entries may contain distilled private content.
+	Recall bool `toml:"recall" json:"recall"`
 	// BackstopInterval is a parseable duration string for a periodic
 	// full rescan. Default "24h"; a negative duration disables it.
 	BackstopInterval string `toml:"backstop_interval" json:"backstop_interval"`
@@ -362,6 +375,19 @@ func (c VectorEmbeddingsServerConfig) validate(name string) error {
 	if c.Endpoint == "" {
 		return fmt.Errorf("%s endpoint is required", section)
 	}
+	if c.OllamaCPUFallback {
+		u, err := url.Parse(c.Endpoint)
+		if err != nil || u.Scheme == "" || u.Host == "" ||
+			(u.Scheme != "http" && u.Scheme != "https") {
+			return fmt.Errorf(
+				"%s ollama_cpu_fallback requires an absolute HTTP(S) endpoint", section)
+		}
+		endpointPath := strings.TrimSuffix(u.Path, "/")
+		if !strings.HasSuffix(endpointPath, "/v1") {
+			return fmt.Errorf(
+				"%s ollama_cpu_fallback requires an endpoint ending in /v1", section)
+		}
+	}
 	if c.BatchSize <= 0 {
 		return fmt.Errorf("%s batch_size must be greater than 0, got %d", section, c.BatchSize)
 	}
@@ -407,11 +433,54 @@ type AgentConfig struct {
 	AllowUnsafe bool   `json:"allow_unsafe,omitempty" toml:"allow_unsafe"`
 }
 
+// InsightsConfig controls an optional OpenAI-compatible chat-completions
+// endpoint for generated insights.
+type InsightsConfig struct {
+	Endpoint  string `json:"endpoint,omitempty" toml:"endpoint"`
+	Model     string `json:"model,omitempty" toml:"model"`
+	APIKeyEnv string `json:"api_key_env,omitempty" toml:"api_key_env"`
+	AllowHTTP bool   `json:"allow_http,omitempty" toml:"allow_http"`
+}
+
+// APIKey reads the configured key from the environment. The key itself is
+// intentionally never part of the serialized configuration.
+func (c InsightsConfig) APIKey() string {
+	if strings.TrimSpace(c.APIKeyEnv) == "" {
+		return ""
+	}
+	return os.Getenv(strings.TrimSpace(c.APIKeyEnv))
+}
+
+// Validate checks endpoint intent and transport safety.
+func (c InsightsConfig) Validate() error {
+	endpoint := strings.TrimSpace(c.Endpoint)
+	model := strings.TrimSpace(c.Model)
+	configured := endpoint != "" || model != "" ||
+		strings.TrimSpace(c.APIKeyEnv) != "" || c.AllowHTTP
+	if !configured {
+		return nil
+	}
+	if endpoint == "" || model == "" {
+		return fmt.Errorf("[insights] endpoint and model are required together")
+	}
+	u, err := url.Parse(endpoint)
+	if err != nil || (u.Scheme != "http" && u.Scheme != "https") || u.Host == "" {
+		return fmt.Errorf("[insights] endpoint %q must be an http(s) URL", RedactedEndpoint(endpoint))
+	}
+	if u.User != nil {
+		return fmt.Errorf("[insights] endpoint must not contain URL credentials: %q", RedactedEndpoint(endpoint))
+	}
+	if err := ValidateExtractTransport(u, c.AllowHTTP); err != nil {
+		return fmt.Errorf("[insights] %w", err)
+	}
+	return nil
+}
+
 type CustomModelRate struct {
-	Input         float64 `json:"input" toml:"input"`
-	Output        float64 `json:"output" toml:"output"`
-	CacheCreation float64 `json:"cache_creation,omitempty" toml:"cache_creation"`
-	CacheRead     float64 `json:"cache_read,omitempty" toml:"cache_read"`
+	InputMicrodollarsPerMTok         int64 `json:"input_microdollars_per_mtok" toml:"input_microdollars_per_mtok"`
+	OutputMicrodollarsPerMTok        int64 `json:"output_microdollars_per_mtok" toml:"output_microdollars_per_mtok"`
+	CacheCreationMicrodollarsPerMTok int64 `json:"cache_creation_microdollars_per_mtok,omitempty" toml:"cache_creation_microdollars_per_mtok"`
+	CacheReadMicrodollarsPerMTok     int64 `json:"cache_read_microdollars_per_mtok,omitempty" toml:"cache_read_microdollars_per_mtok"`
 }
 
 type RemoteTransport string
@@ -422,6 +491,27 @@ const (
 	RemoteTransportSSH  RemoteTransport = "ssh"
 	RemoteTransportHTTP RemoteTransport = "http"
 )
+
+type ChartPalette string
+
+const (
+	ChartPaletteAgentsview ChartPalette = "agentsview"
+	ChartPaletteMatplotlib ChartPalette = "matplotlib"
+	DefaultChartPalette                 = ChartPaletteAgentsview
+)
+
+func ParseChartPalette(value string) (ChartPalette, error) {
+	palette := ChartPalette(value)
+	switch palette {
+	case ChartPaletteAgentsview, ChartPaletteMatplotlib:
+		return palette, nil
+	default:
+		return "", fmt.Errorf(
+			`chart_palette must be "agentsview" or "matplotlib" (got %q)`,
+			value,
+		)
+	}
+}
 
 // RemoteHost describes one target for config-driven `agentsview sync`
 // fan-out. Host is required. Deprecated SSH remotes may set User and Port
@@ -438,16 +528,32 @@ type RemoteHost struct {
 	Interval  time.Duration   `toml:"interval,omitempty" json:"interval,omitempty"`
 }
 
+// SessionSource adds one agent session root with optional machine attribution.
+// Legacy per-agent directory settings are resolved into the same root set.
+type SessionSource struct {
+	Agent   parser.AgentType `toml:"agent" json:"agent"`
+	Dir     string           `toml:"dir" json:"dir"`
+	Machine string           `toml:"machine,omitempty" json:"machine,omitempty"`
+}
+
+type sessionSourceConfig struct {
+	Agent   string  `toml:"agent"`
+	Dir     string  `toml:"dir"`
+	Machine *string `toml:"machine"`
+}
+
 // Config holds all application configuration.
 type Config struct {
 	Host                 string                 `json:"host" toml:"host"`
 	Port                 int                    `json:"port" toml:"port"`
+	ChartPalette         ChartPalette           `json:"chart_palette" toml:"chart_palette"`
 	DataDir              string                 `json:"data_dir" toml:"data_dir"`
 	DBPath               string                 `json:"-" toml:"-"`
 	PublicURL            string                 `json:"public_url,omitempty" toml:"public_url"`
 	PublicOrigins        []string               `json:"public_origins,omitempty" toml:"public_origins"`
 	Proxy                ProxyConfig            `json:"proxy,omitempty" toml:"proxy"`
 	WatchExcludePatterns []string               `json:"watch_exclude_patterns,omitempty" toml:"watch_exclude_patterns"`
+	DisabledAgents       []parser.AgentType     `json:"disabled_agents,omitempty" toml:"disabled_agents"`
 	CursorSecret         string                 `json:"cursor_secret" toml:"cursor_secret"`
 	CursorAdminAPIKey    string                 `json:"cursor_admin_api_key,omitempty" toml:"cursor_admin_api_key"`
 	CursorAdminEmail     string                 `json:"cursor_admin_email,omitempty" toml:"cursor_admin_email"`
@@ -466,6 +572,7 @@ type Config struct {
 	DuckDB               DuckDBConfig           `json:"duckdb,omitempty" toml:"duckdb"`
 	Vector               VectorConfig           `json:"vector,omitempty" toml:"vector"`
 	Recall               RecallConfig           `json:"recall,omitempty" toml:"recall"`
+	Insights             InsightsConfig         `json:"insights,omitempty" toml:"insights"`
 	Automated            AutomatedConfig        `json:"automated,omitempty" toml:"automated"`
 	Agent                map[string]AgentConfig `json:"agent,omitempty" toml:"agent"`
 	WriteTimeout         time.Duration          `json:"-" toml:"-"`
@@ -480,6 +587,12 @@ type Config struct {
 	// slice; unconfigured agents use nil.
 	AgentDirs map[parser.AgentType][]string `json:"-" toml:"-"`
 
+	// SessionSources contains resolved structured sources. SourceMachines maps
+	// each effective configured root to its machine label for sync.
+	SessionSources       []SessionSource                        `json:"-" toml:"-"`
+	SourceMachines       map[parser.AgentType]map[string]string `json:"-" toml:"-"`
+	sessionSourceConfigs []sessionSourceConfig
+
 	// agentDirSource tracks how each agent's dirs were
 	// set so loadFile doesn't override env-set values.
 	agentDirSource map[parser.AgentType]dirSource
@@ -493,6 +606,16 @@ type Config struct {
 	// remote sync is unaffected because the prefixes describe local
 	// paths.
 	SyncIncludeCwdPrefixes []string `json:"-" toml:"sync_include_cwd_prefixes"`
+
+	// ScanProtectedPaths allows local Git discovery to read working
+	// directories inside macOS locations guarded by a TCC consent prompt
+	// (Documents, Downloads, Desktop, iCloud Drive, and cloud-provider
+	// folders such as Dropbox). It defaults to false so a first sync never
+	// asks for access to folders the user did not point us at; sessions
+	// there keep path-only project identity instead of Git remote,
+	// worktree, and branch detail. Setting it accepts one macOS prompt per
+	// location in exchange for that detail. No effect off macOS.
+	ScanProtectedPaths bool `json:"-" toml:"scan_protected_paths"`
 
 	// EventsCoalesceInterval is the minimum wall-clock time between
 	// SSE data_changed broadcasts to connected clients. Emits that
@@ -519,6 +642,13 @@ type Config struct {
 	pgEnvOverrides pgEnvOverrides
 }
 
+func (c Config) ResolvedChartPalette() ChartPalette {
+	if c.ChartPalette == "" {
+		return DefaultChartPalette
+	}
+	return c.ChartPalette
+}
+
 type dirSource int
 
 const (
@@ -528,10 +658,61 @@ const (
 )
 
 // ResolveDirs returns the effective directories for an agent.
-func (c *Config) ResolveDirs(
-	agent parser.AgentType,
-) []string {
-	return c.AgentDirs[agent]
+func (c Config) AgentDisabled(agent parser.AgentType) bool {
+	return slices.Contains(c.DisabledAgents, agent)
+}
+
+func (c Config) ConfiguredDirs(agent parser.AgentType) []string {
+	return append([]string(nil), c.AgentDirs[agent]...)
+}
+
+func (c Config) ResolveDirs(agent parser.AgentType) []string {
+	return c.ConfiguredDirs(agent)
+}
+
+// LocalProviderFactories returns the provider set used for local filesystem
+// ingestion. Remote import and export deliberately use the full registry.
+func (c Config) LocalProviderFactories() []parser.ProviderFactory {
+	factories := parser.ProviderFactories()
+	return slices.DeleteFunc(factories, func(factory parser.ProviderFactory) bool {
+		return c.AgentDisabled(factory.Definition().Type)
+	})
+}
+
+func NormalizeDisabledAgents(
+	values []string,
+) ([]parser.AgentType, error) {
+	requested := make(map[parser.AgentType]struct{}, len(values))
+	for _, value := range values {
+		agent := parser.AgentType(strings.ToLower(strings.TrimSpace(value)))
+		found := false
+		for _, def := range parser.Registry {
+			if def.Type != agent {
+				continue
+			}
+			found = true
+			if !def.FileBased && def.EnvVar == "" {
+				return nil, fmt.Errorf(
+					`disabled_agents: %q is not a configurable session provider`,
+					agent,
+				)
+			}
+			requested[agent] = struct{}{}
+			break
+		}
+		if !found {
+			return nil, fmt.Errorf(
+				`disabled_agents: unknown session provider %q`, agent,
+			)
+		}
+	}
+	normalized := make([]parser.AgentType, 0, len(requested))
+	for _, def := range parser.Registry {
+		if _, ok := requested[def.Type]; ok {
+			normalized = append(normalized, def.Type)
+		}
+	}
+	return normalized, nil
 }
 
 // IsUserConfigured reports whether the agent's directories
@@ -719,12 +900,14 @@ func Default() (Config, error) {
 	return Config{
 		Host:                           "127.0.0.1",
 		Port:                           8080,
+		ChartPalette:                   DefaultChartPalette,
 		DataDir:                        dataDir,
 		DBPath:                         filepath.Join(dataDir, "sessions.db"),
 		WriteTimeout:                   30 * time.Second,
 		LocalMachineName:               hostname,
 		AgentDirs:                      agentDirs,
 		agentDirSource:                 agentDirSource,
+		SourceMachines:                 make(map[parser.AgentType]map[string]string),
 		WatchExcludePatterns:           []string{".git", "node_modules", "__pycache__", ".venv", "venv", "vendor", ".next"},
 		ResultContentBlockedCategories: []string{"Read", "Glob"},
 		EventsCoalesceInterval:         10 * time.Second,
@@ -785,22 +968,6 @@ func LoadPFlags(fs *pflag.FlagSet) (Config, error) {
 	return cfg, nil
 }
 
-// LoadPGServe builds a Config for `pg serve` by preserving
-// shared and PG settings from defaults/env/config file while
-// resetting serve-specific network/browser settings to defaults.
-// Only explicitly provided serve flags are applied on top.
-func LoadPGServe(fs *flag.FlagSet) (Config, error) {
-	cfg, err := loadPGServeBase()
-	if err != nil {
-		return cfg, err
-	}
-	applyFlags(&cfg, fs)
-	if err := finalize(&cfg); err != nil {
-		return cfg, err
-	}
-	return cfg, nil
-}
-
 // LoadPGServePFlags builds a PG serve config from a parsed Cobra/pflag FlagSet.
 func LoadPGServePFlags(fs *pflag.FlagSet) (Config, error) {
 	cfg, err := loadPGServeBase()
@@ -834,6 +1001,9 @@ func loadPGServeBase() (Config, error) {
 		return cfg, err
 	}
 	cfg.loadEnv()
+	if err := expandDataDir(&cfg); err != nil {
+		return cfg, err
+	}
 	if err := cfg.loadFile(); err != nil {
 		return cfg, fmt.Errorf("loading config file: %w", err)
 	}
@@ -866,6 +1036,9 @@ func LoadMinimal() (Config, error) {
 		return cfg, err
 	}
 	cfg.loadEnv()
+	if err := expandDataDir(&cfg); err != nil {
+		return cfg, err
+	}
 
 	if err := cfg.loadFile(); err != nil {
 		return cfg, fmt.Errorf("loading config file: %w", err)
@@ -889,6 +1062,9 @@ func LoadReadOnly() (Config, error) {
 		return cfg, err
 	}
 	cfg.loadEnv()
+	if err := expandDataDir(&cfg); err != nil {
+		return cfg, err
+	}
 
 	if err := cfg.loadFileReadOnly(); err != nil {
 		return cfg, fmt.Errorf("loading config file: %w", err)
@@ -1008,11 +1184,14 @@ func (c *Config) applyConfigTOML(data string) error {
 		CursorAdminUserID              string                     `toml:"cursor_admin_user_id"`
 		Host                           string                     `toml:"host"`
 		Port                           int                        `toml:"port"`
+		ChartPalette                   ChartPalette               `toml:"chart_palette"`
 		PublicURL                      string                     `toml:"public_url"`
 		PublicOrigins                  []string                   `toml:"public_origins"`
 		Proxy                          ProxyConfig                `toml:"proxy"`
 		WatchExcludePatterns           []string                   `toml:"watch_exclude_patterns"`
+		DisabledAgents                 []string                   `toml:"disabled_agents"`
 		SyncIncludeCwdPrefixes         []string                   `toml:"sync_include_cwd_prefixes"`
+		ScanProtectedPaths             bool                       `toml:"scan_protected_paths"`
 		ResultContentBlockedCategories []string                   `toml:"result_content_blocked_categories"`
 		Terminal                       TerminalConfig             `toml:"terminal"`
 		AuthToken                      string                     `toml:"auth_token"`
@@ -1024,16 +1203,27 @@ func (c *Config) applyConfigTOML(data string) error {
 		DuckDB                         DuckDBConfig               `toml:"duckdb"`
 		Vector                         VectorConfig               `toml:"vector"`
 		Recall                         RecallConfig               `toml:"recall"`
+		Insights                       InsightsConfig             `toml:"insights"`
 		Automated                      AutomatedConfig            `toml:"automated"`
 		Agent                          map[string]AgentConfig     `toml:"agent"`
 		EventsCoalesceInterval         time.Duration              `toml:"events_coalesce_interval"`
 		DaemonIdleTimeout              time.Duration              `toml:"daemon_idle_timeout"`
 		CustomModelPricing             map[string]CustomModelRate `toml:"custom_model_pricing"`
 		RemoteHosts                    []RemoteHost               `toml:"remote_hosts"`
+		SessionSources                 []sessionSourceConfig      `toml:"session_sources"`
 	}
 	meta, err := toml.Decode(data, &file)
 	if err != nil {
 		return fmt.Errorf("parsing config: %w", err)
+	}
+	for _, key := range meta.Undecoded() {
+		if len(key) != 3 || key[0] != "custom_model_pricing" {
+			continue
+		}
+		return fmt.Errorf(
+			"%s: unsupported pricing field; use input_microdollars_per_mtok, output_microdollars_per_mtok, cache_creation_microdollars_per_mtok, or cache_read_microdollars_per_mtok",
+			key.String(),
+		)
 	}
 	var raw map[string]any
 	if _, err := toml.Decode(data, &raw); err != nil {
@@ -1060,6 +1250,13 @@ func (c *Config) applyConfigTOML(data string) error {
 	if file.Port != 0 {
 		c.Port = file.Port
 	}
+	if meta.IsDefined("chart_palette") {
+		palette, err := ParseChartPalette(string(file.ChartPalette))
+		if err != nil {
+			return err
+		}
+		c.ChartPalette = palette
+	}
 	if file.PublicURL != "" {
 		c.PublicURL = file.PublicURL
 	}
@@ -1075,8 +1272,18 @@ func (c *Config) applyConfigTOML(data string) error {
 	if file.WatchExcludePatterns != nil {
 		c.WatchExcludePatterns = file.WatchExcludePatterns
 	}
+	if meta.IsDefined("disabled_agents") {
+		disabled, err := NormalizeDisabledAgents(file.DisabledAgents)
+		if err != nil {
+			return err
+		}
+		c.DisabledAgents = disabled
+	}
 	if file.SyncIncludeCwdPrefixes != nil {
 		c.SyncIncludeCwdPrefixes = file.SyncIncludeCwdPrefixes
+	}
+	if file.ScanProtectedPaths {
+		c.ScanProtectedPaths = true
 	}
 	if file.ResultContentBlockedCategories != nil {
 		c.ResultContentBlockedCategories = file.ResultContentBlockedCategories
@@ -1140,6 +1347,9 @@ func (c *Config) applyConfigTOML(data string) error {
 	if file.DuckDB.AllowInsecure {
 		c.DuckDB.AllowInsecure = true
 	}
+	if file.DuckDB.AttachTimeout != 0 && c.DuckDB.AttachTimeout == 0 {
+		c.DuckDB.AttachTimeout = file.DuckDB.AttachTimeout
+	}
 	if file.DuckDB.Projects != nil && c.DuckDB.Projects == nil {
 		c.DuckDB.Projects = file.DuckDB.Projects
 	}
@@ -1188,10 +1398,19 @@ func (c *Config) applyConfigTOML(data string) error {
 	if file.Vector.Embed.RunAfterSync != nil {
 		c.Vector.Embed.RunAfterSync = file.Vector.Embed.RunAfterSync
 	}
+	if meta.IsDefined("vector", "embed", "recall") {
+		c.Vector.Embed.Recall = file.Vector.Embed.Recall
+	}
 	if file.Vector.Embed.BackstopInterval != "" {
 		c.Vector.Embed.BackstopInterval = file.Vector.Embed.BackstopInterval
 	}
 	c.mergeRecallExtractTOML(file.Recall, meta)
+	if meta.IsDefined("insights") {
+		c.Insights = file.Insights
+		c.Insights.Endpoint = strings.TrimSpace(c.Insights.Endpoint)
+		c.Insights.Model = strings.TrimSpace(c.Insights.Model)
+		c.Insights.APIKeyEnv = strings.TrimSpace(c.Insights.APIKeyEnv)
+	}
 	// IsDefined distinguishes "unset" (leave default 10s) from an
 	// explicit "0s" (disable coalescing). Checking != 0 would silently
 	// ignore the latter.
@@ -1224,6 +1443,14 @@ func (c *Config) applyConfigTOML(data string) error {
 		}
 	}
 	if len(file.CustomModelPricing) > 0 {
+		for model, rate := range file.CustomModelPricing {
+			if rate.InputMicrodollarsPerMTok < 0 ||
+				rate.OutputMicrodollarsPerMTok < 0 ||
+				rate.CacheCreationMicrodollarsPerMTok < 0 ||
+				rate.CacheReadMicrodollarsPerMTok < 0 {
+				return fmt.Errorf("custom_model_pricing.%s: rates must not be negative", model)
+			}
+		}
 		c.CustomModelPricing = file.CustomModelPricing
 	}
 	if len(file.RemoteHosts) > 0 {
@@ -1240,6 +1467,9 @@ func (c *Config) applyConfigTOML(data string) error {
 			}
 		}
 		c.RemoteHosts = hosts
+	}
+	if meta.IsDefined("session_sources") {
+		c.sessionSourceConfigs = append([]sessionSourceConfig(nil), file.SessionSources...)
 	}
 
 	// Parse config-file dir arrays for agents that have a
@@ -1264,6 +1494,7 @@ func (c *Config) applyConfigTOML(data string) error {
 			continue
 		}
 		dirs := make([]string, 0, len(rawSlice))
+		valid := true
 		for _, v := range rawSlice {
 			s, ok := v.(string)
 			if !ok {
@@ -1271,12 +1502,12 @@ func (c *Config) applyConfigTOML(data string) error {
 					"config: %s: expected string array: element is %T",
 					def.ConfigKey, v,
 				)
-				dirs = nil
+				valid = false
 				break
 			}
 			dirs = append(dirs, s)
 		}
-		if len(dirs) > 0 {
+		if valid {
 			c.AgentDirs[def.Type] = dirs
 			c.agentDirSource[def.Type] = dirFile
 		}
@@ -1369,6 +1600,14 @@ func dataDirFromEnv() string {
 func (c *Config) loadEnv() {
 	for _, def := range parser.Registry {
 		if v := os.Getenv(def.EnvVar); v != "" {
+			if def.Type == parser.AgentGoose {
+				v = parser.ResolveGoosePathRoot(v)
+				if v == "" {
+					// A whitespace-only override must not replace the
+					// defaults or a configured goose_dirs entry.
+					continue
+				}
+			}
 			c.AgentDirs[def.Type] = []string{v}
 			c.agentDirSource[def.Type] = dirEnv
 		}
@@ -1417,6 +1656,16 @@ func (c *Config) loadEnv() {
 	}
 	if v := os.Getenv("AGENTSVIEW_DUCKDB_MACHINE"); v != "" {
 		c.DuckDB.MachineName = v
+	}
+	if v := os.Getenv("AGENTSVIEW_DUCKDB_ATTACH_TIMEOUT"); v != "" {
+		if d, err := time.ParseDuration(v); err == nil {
+			c.DuckDB.AttachTimeout = d
+		} else {
+			log.Printf(
+				"warning: invalid AGENTSVIEW_DUCKDB_ATTACH_TIMEOUT %q: %v",
+				v, err,
+			)
+		}
 	}
 	if v := os.Getenv("AGENTSVIEW_DISABLE_UPDATE_CHECK"); v != "" {
 		c.DisableUpdateCheck = v == "1" || v == "true"
@@ -1675,8 +1924,14 @@ func splitFlagList(value string) []string {
 
 func finalize(cfg *Config) error {
 	var err error
+	if err := expandLocalPaths(cfg); err != nil {
+		return err
+	}
 	if strings.TrimSpace(cfg.LocalMachineName) == "" {
 		return fmt.Errorf("identify local sync machine: hostname is empty")
+	}
+	if err := cfg.resolveSessionSources(); err != nil {
+		return err
 	}
 	if err := normalizeProxyConfig(&cfg.Proxy); err != nil {
 		return err
@@ -1706,7 +1961,167 @@ func finalize(cfg *Config) error {
 	if err := cfg.Recall.Extract.Validate(); err != nil {
 		return err
 	}
+	if err := cfg.Insights.Validate(); err != nil {
+		return err
+	}
 	return nil
+}
+
+func (c *Config) resolveSessionSources() error {
+	type rootState struct {
+		dir     string
+		machine string
+	}
+
+	resolved := make([]SessionSource, 0)
+	rootsByAgent := make(map[parser.AgentType]map[string]rootState, len(c.AgentDirs))
+	for _, def := range parser.Registry {
+		seen := make(map[string]rootState)
+		dirs := make([]string, 0, len(c.AgentDirs[def.Type]))
+		for _, rawDir := range c.AgentDirs[def.Type] {
+			value := strings.TrimSpace(rawDir)
+			if value == "" {
+				continue
+			}
+			key, err := sessionSourceComparisonKey(value)
+			if err != nil {
+				return fmt.Errorf(
+					"resolve %s session source %q: %w", def.Type, value, err,
+				)
+			}
+			if _, ok := seen[key]; ok {
+				continue
+			}
+			seen[key] = rootState{
+				dir:     value,
+				machine: c.LocalMachineName,
+			}
+			dirs = append(dirs, value)
+		}
+		c.AgentDirs[def.Type] = dirs
+		rootsByAgent[def.Type] = seen
+	}
+
+	var problems []string
+	for i, input := range c.sessionSourceConfigs {
+		entry := i + 1
+		agent := parser.AgentType(strings.TrimSpace(strings.ToLower(input.Agent)))
+		if agent == "" {
+			problems = append(problems,
+				fmt.Sprintf("entry %d: agent is required", entry))
+			continue
+		}
+		if _, ok := parser.AgentByType(agent); !ok {
+			problems = append(problems,
+				fmt.Sprintf("entry %d: unknown agent %q; use a registered parser name such as claude, codex, or copilot", entry, input.Agent))
+			continue
+		}
+		factory, hasFactory := parser.ProviderFactoryByType(agent)
+		if !hasFactory ||
+			factory.Capabilities().Source.DiscoverSources != parser.CapabilitySupported {
+			problems = append(problems,
+				fmt.Sprintf("entry %d (%s): session_sources requires a discoverable filesystem provider; %s is import-only", entry, agent, agent))
+			continue
+		}
+		rawDir := strings.TrimSpace(input.Dir)
+		if strings.HasPrefix(strings.ToLower(rawDir), "s3://") {
+			problems = append(problems,
+				fmt.Sprintf("entry %d (%s): dir %q is an S3 root; session_sources supports filesystem roots only, so configure S3 through the existing per-agent directory setting", entry, agent, input.Dir))
+			continue
+		}
+		dir, err := normalizeSessionSourceDir(input.Dir)
+		if err != nil {
+			problems = append(problems,
+				fmt.Sprintf("entry %d (%s): %v", entry, agent, err))
+			continue
+		}
+		machine := c.LocalMachineName
+		if input.Machine != nil {
+			machine = strings.TrimSpace(*input.Machine)
+			if machine == "" {
+				problems = append(problems,
+					fmt.Sprintf("entry %d (%s): machine must not be empty when set", entry, agent))
+				continue
+			}
+			if machine == "local" {
+				problems = append(problems,
+					fmt.Sprintf("entry %d (%s): machine %q is reserved for legacy local attribution; use the actual machine name or omit machine", entry, agent, machine))
+				continue
+			}
+		}
+
+		seen := rootsByAgent[agent]
+		if seen == nil {
+			seen = make(map[string]rootState)
+			rootsByAgent[agent] = seen
+		}
+		key, err := sessionSourceComparisonKey(dir)
+		if err != nil {
+			problems = append(problems,
+				fmt.Sprintf("entry %d (%s): %v", entry, agent, err))
+			continue
+		}
+		state, duplicate := seen[key]
+		if duplicate {
+			state.machine = machine
+			seen[key] = state
+		} else {
+			seen[key] = rootState{
+				dir:     dir,
+				machine: machine,
+			}
+			c.AgentDirs[agent] = append(c.AgentDirs[agent], dir)
+		}
+		c.agentDirSource[agent] = dirFile
+		resolved = append(resolved, SessionSource{
+			Agent: agent, Dir: dir, Machine: machine,
+		})
+	}
+	if len(problems) > 0 {
+		return fmt.Errorf("session_sources: %s", strings.Join(problems, "; "))
+	}
+
+	sourceMachines := make(map[parser.AgentType]map[string]string, len(rootsByAgent))
+	for agent, roots := range rootsByAgent {
+		machines := make(map[string]string, len(roots))
+		for _, state := range roots {
+			if strings.HasPrefix(strings.ToLower(state.dir), "s3://") {
+				continue
+			}
+			machines[state.dir] = state.machine
+		}
+		sourceMachines[agent] = machines
+	}
+	c.SessionSources = resolved
+	c.SourceMachines = sourceMachines
+	return nil
+}
+
+func sessionSourceComparisonKey(dir string) (string, error) {
+	if strings.HasPrefix(strings.ToLower(dir), "s3://") {
+		return dir, nil
+	}
+	return pathutil.LocalComparisonKey(dir)
+}
+
+func normalizeSessionSourceDir(raw string) (string, error) {
+	value := strings.TrimSpace(raw)
+	if value == "" {
+		return "", fmt.Errorf("dir is required")
+	}
+	if strings.ContainsRune(value, '\x00') {
+		return "", fmt.Errorf("dir %q contains a NUL byte", raw)
+	}
+	// Structured sources resolve after expandLocalPaths has already expanded
+	// the legacy per-agent arrays, so expand here too. Without it a "~/..."
+	// root is never scanned and cannot deduplicate against, or relabel, the
+	// equivalent expanded legacy root. This resolves the path only; separator
+	// and case spelling are still left exactly as configured.
+	expanded, err := pathutil.ExpandHome(value)
+	if err != nil {
+		return "", fmt.Errorf("expanding dir %q: %w", raw, err)
+	}
+	return expanded, nil
 }
 
 func resolvePublicURL(value string, proxyCfg ProxyConfig) (string, error) {
@@ -2057,6 +2472,9 @@ func ResolveDataDir() (string, error) {
 	if v := dataDirFromEnv(); v != "" {
 		cfg.DataDir = v
 	}
+	if err := expandDataDir(&cfg); err != nil {
+		return "", err
+	}
 	return cfg.DataDir, nil
 }
 
@@ -2322,6 +2740,10 @@ func (c *Config) ResolveDuckDB() (DuckDBConfig, error) {
 		if err != nil {
 			return duck, fmt.Errorf("expanding path: %w", err)
 		}
+		expanded, err = pathutil.ExpandHome(expanded)
+		if err != nil {
+			return duck, fmt.Errorf("expanding path: %w", err)
+		}
 		duck.Path = expanded
 	}
 	if duck.URL != "" {
@@ -2375,11 +2797,6 @@ func IsEnvDependentURL(s string) bool {
 // about, so each distinct variable triggers a warning at most once.
 var bareEnvWarned sync.Map
 
-// ResetBareEnvWarned clears the warning dedup state. Exported for tests.
-func ResetBareEnvWarned() {
-	bareEnvWarned.Range(func(k, _ any) bool { bareEnvWarned.Delete(k); return true })
-}
-
 // expandBracedEnv expands ${VAR} references in s. As a convenience,
 // if the entire string is a single bare $VAR (e.g. "$PGURL"), it is
 // expanded as a whole-string shortcut. Bare $VAR references embedded
@@ -2424,6 +2841,13 @@ func expandBracedEnv(s string) (string, error) {
 
 // SaveTerminalConfig persists terminal settings to the config file.
 func (c *Config) SaveTerminalConfig(tc TerminalConfig) error {
+	live := tc
+	expanded, err := pathutil.ExpandHome(live.CustomBin)
+	if err != nil {
+		return fmt.Errorf("expanding terminal custom binary: %w", err)
+	}
+	live.CustomBin = expanded
+
 	return c.withConfigLock(func() error {
 		existing, err := c.readConfigMap()
 		if err != nil {
@@ -2434,7 +2858,7 @@ func (c *Config) SaveTerminalConfig(tc TerminalConfig) error {
 		if err := c.writeConfigMap(existing); err != nil {
 			return err
 		}
-		c.Terminal = tc
+		c.Terminal = live
 		return nil
 	})
 }
@@ -2443,6 +2867,33 @@ func (c *Config) SaveTerminalConfig(tc TerminalConfig) error {
 // The patch map contains config keys mapped to their new values. Only
 // the keys present in patch are written; other config keys are preserved.
 func (c *Config) SaveSettings(patch map[string]any) error {
+	patch = maps.Clone(patch)
+	if value, ok := patch["chart_palette"]; ok {
+		palette, ok := value.(ChartPalette)
+		if !ok {
+			return fmt.Errorf("chart_palette must use the typed configuration value")
+		}
+		if _, err := ParseChartPalette(string(palette)); err != nil {
+			return err
+		}
+	}
+	if value, ok := patch["disabled_agents"]; ok {
+		agents, ok := value.([]parser.AgentType)
+		if !ok {
+			return fmt.Errorf(
+				"disabled_agents must use typed session provider values",
+			)
+		}
+		raw := make([]string, len(agents))
+		for i, agent := range agents {
+			raw[i] = string(agent)
+		}
+		normalized, err := NormalizeDisabledAgents(raw)
+		if err != nil {
+			return err
+		}
+		patch["disabled_agents"] = normalized
+	}
 	return c.withConfigLock(func() error {
 		existing, err := c.readConfigMap()
 		if err != nil {
@@ -2492,6 +2943,16 @@ func (c *Config) SaveSettings(patch map[string]any) error {
 				c.RequireAuth = b
 			}
 		}
+		if v, ok := patch["chart_palette"]; ok {
+			if palette, ok := v.(ChartPalette); ok {
+				c.ChartPalette = palette
+			}
+		}
+		if v, ok := patch["disabled_agents"]; ok {
+			if agents, ok := v.([]parser.AgentType); ok {
+				c.DisabledAgents = append([]parser.AgentType(nil), agents...)
+			}
+		}
 		return nil
 	})
 }
@@ -2524,6 +2985,32 @@ func (c *Config) EnsureAuthToken() error {
 		c.AuthToken = token
 		return nil
 	})
+}
+
+// ValidateArtifactOriginID checks the persisted single-writer origin prefix.
+func ValidateArtifactOriginID(origin string) error {
+	if origin == "" {
+		return errors.New("artifact origin is required")
+	}
+	if origin != strings.TrimSpace(origin) {
+		return fmt.Errorf("invalid artifact origin %q", origin)
+	}
+	if origin == "local" {
+		return fmt.Errorf("invalid artifact origin %q", origin)
+	}
+	if strings.ContainsAny(origin, `/\`) || filepath.Base(origin) != origin {
+		return fmt.Errorf("invalid artifact origin %q", origin)
+	}
+	if strings.HasPrefix(origin, "-") || strings.HasSuffix(origin, "-") {
+		return fmt.Errorf("invalid artifact origin %q", origin)
+	}
+	for _, r := range origin {
+		if r >= 'a' && r <= 'z' || r >= '0' && r <= '9' || r == '-' {
+			continue
+		}
+		return fmt.Errorf("invalid artifact origin %q", origin)
+	}
+	return nil
 }
 
 // SaveGithubToken persists the GitHub token to the config file.

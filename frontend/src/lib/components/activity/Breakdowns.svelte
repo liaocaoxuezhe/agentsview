@@ -1,9 +1,15 @@
 <script lang="ts">
   import { m } from "../../i18n/index.js";
+  import { router } from "../../stores/router.svelte.js";
   import type { Report } from "../../api/types.js";
   import type { ActivityKeyMinutes } from "../../api/generated/index";
+  import { formatMoney, moneyFromMicrodollars } from "../../money.js";
 
-  let { report }: { report: Report } = $props();
+  interface Props {
+    report: Report;
+  }
+
+  let { report }: Props = $props();
 
   type Metric = "minutes" | "cost";
   let metric = $state<Metric>("minutes");
@@ -15,19 +21,19 @@
   }
 
   function rowValue(row: ActivityKeyMinutes): number {
-    return metric === "cost" ? row.cost : row.agent_minutes;
+    return metric === "cost" ? row.cost.microdollars : row.agent_minutes;
   }
 
   // Per-row automation split for the active metric. Interactive + automated
   // sum to rowValue, so the two bar segments stack to the full bar width.
   function interactiveValue(row: ActivityKeyMinutes): number {
     return metric === "cost"
-      ? row.interactive_cost
+      ? row.interactive_cost.microdollars
       : row.interactive_agent_minutes;
   }
 
   function automatedValue(row: ActivityKeyMinutes): number {
-    return metric === "cost" ? row.automated_cost : row.automated_agent_minutes;
+    return metric === "cost" ? row.automated_cost.microdollars : row.automated_agent_minutes;
   }
 
   // Rank by the selected metric and drop rows that are zero for it: an untimed
@@ -60,6 +66,21 @@
 	return projectRows ? (row.project_key || row.key) : row.key;
   }
 
+  function projectKeyOf(row: ActivityKeyMinutes): string {
+    return row.project_key || row.key;
+  }
+
+  function projectHref(row: ActivityKeyMinutes): string {
+    return router.buildHref("data", { project_key: projectKeyOf(row) });
+  }
+
+  function openInData(event: MouseEvent, row: ActivityKeyMinutes) {
+    if (event.metaKey || event.ctrlKey || event.shiftKey || event.altKey || event.button !== 0)
+      return;
+    event.preventDefault();
+    router.navigate("data", { project_key: projectKeyOf(row) });
+  }
+
   function maxValue(rows: ActivityKeyMinutes[]): number {
     if (rows.length === 0) return 1;
     const m = Math.max(...rows.map(rowValue));
@@ -76,16 +97,12 @@
     return Math.round(v).toLocaleString();
   }
 
-  function fmtCost(v: number): string {
-    return `$${v.toFixed(2)}`;
-  }
-
   function fmtValue(row: ActivityKeyMinutes): string {
-    return metric === "cost" ? fmtCost(row.cost) : fmtMinutes(row.agent_minutes);
+    return metric === "cost" ? formatMoney(row.cost) : fmtMinutes(row.agent_minutes);
   }
 
   function fmtSeg(v: number): string {
-    return metric === "cost" ? fmtCost(v) : fmtMinutes(v);
+    return metric === "cost" ? formatMoney(moneyFromMicrodollars(v)) : fmtMinutes(v);
   }
 
   function truncate(name: string, max: number): string {
@@ -168,9 +185,20 @@
                 onmouseenter={(e) => showTip(e, row, total)}
                 onmouseleave={hideTip}
               >
-                <span class="bar-label" title={row.key}>
-                  {truncate(row.key, 22)}
-                </span>
+                {#if panel.projectRows}
+                  <a
+                    class="bar-label"
+                    href={projectHref(row)}
+                    title={m.activity_view_in_data({ project: row.key })}
+                    onclick={(event) => openInData(event, row)}
+                  >
+                    {truncate(row.key, 22)}
+                  </a>
+                {:else}
+                  <span class="bar-label" title={row.key}>
+                    {truncate(row.key, 22)}
+                  </span>
+                {/if}
                 <div class="bar-track">
                   <div
                     class="bar-seg interactive"
@@ -314,6 +342,7 @@
     display: flex;
     align-items: center;
     gap: 8px;
+    position: relative;
   }
 
   .bar-label {
@@ -324,6 +353,15 @@
     white-space: nowrap;
     overflow: hidden;
     text-overflow: ellipsis;
+  }
+
+  a.bar-label {
+    color: var(--text-secondary);
+    text-decoration: none;
+  }
+
+  a.bar-label:hover {
+    text-decoration: underline;
   }
 
   .bar-track {

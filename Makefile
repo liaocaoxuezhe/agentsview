@@ -274,18 +274,28 @@ desktop-linux-appimage:
 # Backward-compatible alias (macOS .app)
 desktop-app: desktop-macos-app
 
-# Run tests
+# Keep local package/test-process fan-out bounded. A plain `go test ./...`
+# otherwise defaults to GOMAXPROCS, which can launch a large number of fresh
+# test binaries at once on a developer machine. Override with `GO_TEST_P=`
+# when an operator intentionally wants the Go default.
+GO_TEST_P ?= 4
+GO_TEST_P_FLAG := $(if $(GO_TEST_P),-p $(GO_TEST_P),)
+
+# Run the cacheable unit/integration suite. The external-service lanes below
+# intentionally retain `-count=1` because they require fresh state.
 test: pricing-snapshot ensure-embed-dir
-	go test -tags "fts5" ./... -v -count=1
+	go test $(GO_TEST_P_FLAG) -tags "fts5" ./... -v
 
 # Run fast tests only
 test-short: pricing-snapshot ensure-embed-dir
-	go test -tags "fts5" ./... -short -count=1
+	go test $(GO_TEST_P_FLAG) -tags "fts5" ./... -short
 
 # Run the quarantined eval-ingest endpoint tests under their build tag.
+# Only internal/server contains evalingest-gated code; every other package is
+# identical under the tag and already covered by the untagged run.
 test-evalingest: pricing-snapshot ensure-embed-dir
 	CGO_ENABLED=1 go test -tags "fts5,evalingest" \
-		./internal/db ./internal/server -v -count=1
+		./internal/server -v -count=1
 
 # Compare db.Store read-query performance across SQLite, DuckDB, and PostgreSQL.
 # Requires Docker because the PostgreSQL backend is started with testcontainers.
@@ -299,23 +309,40 @@ bench-backends: pricing-snapshot ensure-embed-dir
 
 # Hot-path benchmark gate. Runs every benchmark in the gated packages
 # (sync engine warm/cold/append, message write paths, usage
-# aggregation, secret scanning). This target is the single source of
-# truth for the gate configuration: CI's bench.yml runs it on both
-# the PR head and the merge base, then compares the outputs with
-# `go run ./cmd/benchgate -old old.txt -new new.txt`. Run it before
-# and after touching a sync or DB hot path.
-BENCH_GATE_PACKAGES ?= ./internal/sync ./internal/db ./internal/secrets
+# aggregation, secret scanning, signal analysis). This target is the
+# single source of truth for the gate configuration: CI's bench.yml
+# runs it on both the PR head and the merge base, then compares the
+# outputs with `go run ./cmd/benchgate -old old.txt -new new.txt`.
+# Run it before and after touching a gated hot path.
+BENCH_GATE_PACKAGES ?= ./internal/sync ./internal/db ./internal/secrets \
+	./internal/signals
 # Count must stay >= 5: benchgate's time gate needs at least 5
-# candidate samples for its significance test.
-BENCH_GATE_COUNT ?= 6
+# candidate samples for its significance test. Every -count run
+# rebuilds each benchmark's fixture, so this is also the multiplier
+# on the 100k-row seeds below.
+BENCH_GATE_COUNT ?= 5
 # Fixed iterations, not a duration: some gated benchmarks grow their
 # fixture as they iterate, so baseline and candidate must run the
 # same iteration count to measure identical workloads.
 BENCH_GATE_TIME ?= 20x
+# Benchmarks whose single iteration costs hundreds of milliseconds to
+# seconds (100k-row usage and activity-report fixtures, cold-archive
+# ingest) run in a second pass with fewer iterations. Their per-op
+# ratios are stable at that scale, and at BENCH_GATE_TIME these few
+# benchmarks were most of the gate's wall clock. The regex is matched
+# against top-level benchmark names, so sub-benchmarks follow their
+# parent; the cheap benchmarks keep the full iteration count because
+# their millisecond-scale samples are what needs the averaging.
+BENCH_GATE_HEAVY ?= GetDailyUsage|SQLiteActivityReport|SyncAllColdArchive|ResyncBulk
+BENCH_GATE_HEAVY_TIME ?= 5x
 bench-gate: pricing-snapshot ensure-embed-dir
 	CGO_ENABLED=1 go test -tags "fts5" -run '^$$' \
-		-bench . -benchmem \
+		-bench . -skip '$(BENCH_GATE_HEAVY)' -benchmem \
 		-count $(BENCH_GATE_COUNT) -benchtime $(BENCH_GATE_TIME) \
+		-timeout 25m $(BENCH_GATE_PACKAGES)
+	CGO_ENABLED=1 go test -tags "fts5" -run '^$$' \
+		-bench '$(BENCH_GATE_HEAVY)' -benchmem \
+		-count $(BENCH_GATE_COUNT) -benchtime $(BENCH_GATE_HEAVY_TIME) \
 		-timeout 25m $(BENCH_GATE_PACKAGES)
 
 # Prints the gate's sample/iteration configuration in shell-evalable
@@ -325,6 +352,7 @@ bench-gate: pricing-snapshot ensure-embed-dir
 # package list intentionally stays per-side).
 bench-gate-config:
 	@echo "BENCH_GATE_COUNT=$(BENCH_GATE_COUNT) BENCH_GATE_TIME=$(BENCH_GATE_TIME)"
+	@echo "BENCH_GATE_HEAVY='$(BENCH_GATE_HEAVY)' BENCH_GATE_HEAVY_TIME=$(BENCH_GATE_HEAVY_TIME)"
 
 # Start test PostgreSQL container
 postgres-up:
@@ -378,7 +406,8 @@ e2e:
 # Run focused Playwright smoke tests against duckdb serve.
 e2e-duckdb:
 	cd frontend && AGENTSVIEW_E2E_BACKEND=duckdb npx playwright test \
-		e2e/duckdb-backend.spec.ts e2e/session-list.spec.ts --project=chromium
+		e2e/duckdb-backend.spec.ts e2e/data-mode.spec.ts \
+		e2e/session-list.spec.ts --project=chromium
 
 # Vet
 vet: pricing-snapshot ensure-embed-dir
@@ -425,20 +454,69 @@ nilaway-golangci-build:
 		golangci-lint custom --version "$(GOLANGCI_LINT_VERSION)" --name custom-gcl
 
 # Run NilAway through the custom golangci-lint module plugin.
+#
+# NilAway is run once per package instead of once over ./... because a single
+# whole-module run blows up memory. Each invocation therefore keeps its own
+# tight caps (GOMAXPROCS=1, GOGC=10, GOMEMLIMIT=512MiB). Those caps are
+# per-process, so the ~45 invocations can safely overlap: NILAWAY_JOBS of them
+# run at a time, bounding peak usage at roughly NILAWAY_JOBS x GOMEMLIMIT.
+# Concurrent invocations share one GOLANGCI_LINT_CACHE, so they need
+# --allow-parallel-runners; without it golangci-lint's start-up file lock makes
+# every overlapping run fail with "parallel golangci-lint is running".
+#
+# Each invocation writes its output to its own scratch file, which the parent
+# prints in package order once the run finishes. Writing straight to stdout
+# would interleave one package's findings with another's as soon as a report
+# exceeded the pipe's atomic-write size. NILAWAY_JOBS must be a positive
+# integer: `xargs -P 0` means "unlimited" and would remove the memory bound
+# this whole arrangement depends on.
+NILAWAY_JOBS ?= 4
+
 nilaway: pricing-snapshot ensure-embed-dir nilaway-golangci-build
 	@set -e; \
+	case "$(NILAWAY_JOBS)" in \
+		''|*[!0-9]*) \
+			echo "nilaway: NILAWAY_JOBS must be a positive integer (got '$(NILAWAY_JOBS)')" >&2; \
+			exit 1;; \
+	esac; \
+	njobs=$$(( $(NILAWAY_JOBS) + 0 )); \
+	if [ "$$njobs" -lt 1 ]; then \
+		echo "nilaway: NILAWAY_JOBS must be at least 1 (got '$(NILAWAY_JOBS)')" >&2; \
+		exit 1; \
+	fi; \
 	root=$$(pwd); \
 	dirs=$$(go list -f '{{.Dir}}' ./...); \
-	for dir in $$dirs; do \
+	pkgs=$$(for dir in $$dirs; do \
 		if [ "$$dir" = "$$root" ]; then \
-			pkg="."; \
+			printf '%s\n' "."; \
 		else \
-			pkg="./$${dir#$$root/}"; \
+			printf '%s\n' "./$${dir#$$root/}"; \
 		fi; \
-		echo "$(CUSTOM_GCL) run --config .golangci.nilaway.yml $$pkg"; \
-		GOMAXPROCS=$${GOMAXPROCS:-1} GOGC=$${GOGC:-10} GOMEMLIMIT=$${GOMEMLIMIT:-512MiB} \
-			$(CUSTOM_GCL) run --config .golangci.nilaway.yml "$$pkg"; \
-	done
+	done); \
+	if [ -z "$$pkgs" ]; then echo "nilaway: no packages to lint" >&2; exit 1; fi; \
+	NILAWAY_OUT_DIR=$$(mktemp -d); \
+	export NILAWAY_OUT_DIR; \
+	trap 'rm -f "$$NILAWAY_OUT_DIR"/*; rmdir "$$NILAWAY_OUT_DIR"' EXIT HUP INT TERM; \
+	set +e; \
+	printf '%s\n' "$$pkgs" | awk '{ printf "%d:%s\n", NR, $$0 }' | tr '\n' '\0' \
+		| xargs -0 -n 1 -P "$$njobs" sh -c ' \
+		n=$${1%%:*}; \
+		pkg=$${1#*:}; \
+		cmd="$(CUSTOM_GCL) run --allow-parallel-runners --config .golangci.nilaway.yml $$pkg"; \
+		out=$$(GOMAXPROCS=$${GOMAXPROCS:-1} GOGC=$${GOGC:-10} GOMEMLIMIT=$${GOMEMLIMIT:-512MiB} \
+			$(CUSTOM_GCL) run --allow-parallel-runners \
+				--config .golangci.nilaway.yml "$$pkg" 2>&1); \
+		status=$$?; \
+		{ printf "%s\n" "$$cmd"; \
+		  if [ -n "$$out" ]; then printf "%s\n" "$$out"; fi; \
+		} > "$$NILAWAY_OUT_DIR/$$n"; \
+		exit $$status' sh; \
+	rc=$$?; \
+	set -e; \
+	ls "$$NILAWAY_OUT_DIR" | sort -n | while IFS= read -r n; do \
+		cat "$$NILAWAY_OUT_DIR/$$n"; \
+	done; \
+	exit $$rc
 
 # Install pinned local lint tools.
 lint-tools:

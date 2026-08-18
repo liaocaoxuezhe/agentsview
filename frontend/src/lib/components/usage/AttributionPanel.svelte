@@ -4,30 +4,17 @@
     type GroupBy,
     type AttributionView,
   } from "../../stores/usage.svelte.js";
-  import { seriesColorMap } from "../../utils/projectColor.js";
   import Treemap from "./Treemap.svelte";
   import { m } from "../../i18n/index.js";
+  import { formatMoney, moneyFromMicrodollars } from "../../money.js";
+  import { formatTokenCount } from "../../utils/format.js";
+  import { sumSelectedTokens } from "../../stores/usageTokenTypes.js";
 
-  function fmtCost(v: number): string {
-    if (v >= 100) return `$${v.toFixed(0)}`;
-    return `$${v.toFixed(2)}`;
+  interface Props {
+    colorMap: ReadonlyMap<string, string>;
   }
 
-  function fmtTokens(v: number): string {
-    if (v >= 1_000_000_000) {
-      const g = Math.floor(v / 100_000_000) / 10;
-      return `${g}B`;
-    }
-    if (v >= 1_000_000) {
-      const m = Math.floor(v / 100_000) / 10;
-      return `${m}M`;
-    }
-    if (v >= 1_000) {
-      const k = Math.floor(v / 100) / 10;
-      return `${k}K`;
-    }
-    return String(v);
-  }
+  let { colorMap }: Props = $props();
 
   function fmtPct(v: number, total: number): string {
     if (total <= 0) return "";
@@ -61,24 +48,24 @@
         id: p.project_key,
         label: p.project,
         value: isTokenMode
-          ? p.inputTokens + p.outputTokens + p.cacheCreationTokens + p.cacheReadTokens
-          : p.cost,
+          ? sumSelectedTokens(p, usage.selectedTokenTypes)
+          : p.cost.microdollars,
       }));
     } else if (groupBy === "model") {
       items = s.modelTotals.map((m) => ({
         id: m.model,
         label: m.model,
         value: isTokenMode
-          ? m.inputTokens + m.outputTokens + m.cacheCreationTokens + m.cacheReadTokens
-          : m.cost,
+          ? sumSelectedTokens(m, usage.selectedTokenTypes)
+          : m.cost.microdollars,
       }));
     } else {
       items = s.agentTotals.map((a) => ({
         id: a.agent,
         label: a.agent,
         value: isTokenMode
-          ? a.inputTokens + a.outputTokens + a.cacheCreationTokens + a.cacheReadTokens
-          : a.cost,
+          ? sumSelectedTokens(a, usage.selectedTokenTypes)
+          : a.cost.microdollars,
       }));
     }
 
@@ -86,13 +73,9 @@
     return items;
   });
 
-  const colorMap = $derived(
-    seriesColorMap(rowItems.map((item) => item.id).sort()),
-  );
-
   const rows = $derived.by((): Row[] => {
     const items = rowItems;
-    const total = items.reduce((s, d) => s + d.value, 0);
+    const total = items.reduce((sum, item) => sum + item.value, 0);
 
     return items.map((d) => ({
       id: d.id,
@@ -110,7 +93,7 @@
       value: r.value,
       color: r.color,
       meta: fmtPct(r.value, rows.reduce(
-        (s, d) => s + d.value, 0,
+        (sum, item) => sum + item.value, 0,
       )),
     })),
   );
@@ -136,7 +119,11 @@
 
 <div class="attribution-panel">
   <div class="panel-header">
-    <h3 class="chart-title">{isTokenMode ? m.usage_tokens_attribution_title() : m.usage_cost_attribution_title()}</h3>
+    <h3 class="chart-title">
+      {isTokenMode
+        ? m.usage_tokens_attribution_title()
+        : m.usage_cost_attribution_title()}
+    </h3>
     <div class="toggles">
       <div class="segment-toggle">
         <button
@@ -191,6 +178,7 @@
             items={treemapItems}
             height={260}
             onSelect={handleSelect}
+            formatValue={isTokenMode ? formatTokenCount : undefined}
           />
         </div>
         <div class="side-rail">
@@ -208,7 +196,11 @@
                 style="background: {row.color}"
               ></span>
               <span class="rail-label">{row.label}</span>
-              <span class="rail-cost">{isTokenMode ? fmtTokens(row.value) : fmtCost(row.value)}</span>
+              <span class="rail-cost">
+                {isTokenMode
+                  ? formatTokenCount(row.value)
+                  : formatMoney(moneyFromMicrodollars(row.value))}
+              </span>
             </div>
           {/each}
         </div>
@@ -241,7 +233,11 @@
             <span class="list-pct">
               {(row.pct * 100).toFixed(1)}%
             </span>
-            <span class="list-cost">{isTokenMode ? fmtTokens(row.value) : fmtCost(row.value)}</span>
+            <span class="list-cost">
+              {isTokenMode
+                ? formatTokenCount(row.value)
+                : formatMoney(moneyFromMicrodollars(row.value))}
+            </span>
           </div>
         {/each}
       </div>

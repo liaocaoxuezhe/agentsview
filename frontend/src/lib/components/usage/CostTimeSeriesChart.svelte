@@ -1,7 +1,14 @@
 <script lang="ts">
   import { usage, type GroupBy } from "../../stores/usage.svelte.js";
-  import { seriesColorMap } from "../../utils/projectColor.js";
   import { m } from "../../i18n/index.js";
+  import { formatMoney, moneyFromMicrodollars } from "../../money.js";
+  import { sumSelectedTokens } from "../../stores/usageTokenTypes.js";
+
+  interface Props {
+    colorMap: ReadonlyMap<string, string>;
+  }
+
+  let { colorMap }: Props = $props();
 
   const CHART_H = 180;
   const X_LABEL_H = 20;
@@ -12,8 +19,6 @@
   // ascenders do not clip against the SVG viewBox edge.
   const TOP_PAD = 10;
   const MAX_SERIES = 5;
-
-  const OTHER_COLOR = "var(--text-muted)";
 
   let containerEl: HTMLDivElement | undefined = $state();
   let containerWidth = $state(600);
@@ -38,8 +43,13 @@
   const groupBy = $derived(usage.toggles.timeSeries.groupBy);
   const isTokenMode = $derived(usage.mode === "token");
 
-  function breakdownTokens(b: { inputTokens: number; outputTokens: number; cacheCreationTokens: number; cacheReadTokens: number }): number {
-    return b.inputTokens + b.outputTokens + b.cacheCreationTokens + b.cacheReadTokens;
+  function breakdownTokens(b: {
+    inputTokens: number;
+    outputTokens: number;
+    cacheCreationTokens: number;
+    cacheReadTokens: number;
+  }): number {
+    return sumSelectedTokens(b, usage.selectedTokenTypes);
   }
 
   const seriesData = $derived.by((): {
@@ -53,34 +63,40 @@
       return { points: [], keys: [], maxY: 0, labels: {} };
     }
 
-    // Sum value per key across the whole range to find top N.
+    // Sum the selected value per key across the whole range to find top N.
     const totals = new Map<string, number>();
 	const labels: Record<string, string> = {};
     for (const day of daily) {
       if (groupBy === "project" && day.projectBreakdowns) {
         for (const b of day.projectBreakdowns) {
           labels[b.project_key] = b.project;
-          const v = isTokenMode ? breakdownTokens(b) : b.cost;
+          const value = isTokenMode
+            ? breakdownTokens(b)
+            : b.cost.microdollars;
           totals.set(
             b.project_key,
-            (totals.get(b.project_key) ?? 0) + v,
+            (totals.get(b.project_key) ?? 0) + value,
           );
         }
       } else if (groupBy === "model" && day.modelBreakdowns) {
         for (const b of day.modelBreakdowns) {
-          const v = isTokenMode ? breakdownTokens(b) : b.cost;
+          const value = isTokenMode
+            ? breakdownTokens(b)
+            : b.cost.microdollars;
           totals.set(
             b.modelName,
-            (totals.get(b.modelName) ?? 0) + v,
+            (totals.get(b.modelName) ?? 0) + value,
           );
           labels[b.modelName] = b.modelName;
         }
       } else if (groupBy === "agent" && day.agentBreakdowns) {
         for (const b of day.agentBreakdowns) {
-          const v = isTokenMode ? breakdownTokens(b) : b.cost;
+          const value = isTokenMode
+            ? breakdownTokens(b)
+            : b.cost.microdollars;
           totals.set(
             b.agent,
-            (totals.get(b.agent) ?? 0) + v,
+            (totals.get(b.agent) ?? 0) + value,
           );
           labels[b.agent] = b.agent;
         }
@@ -91,7 +107,11 @@
     if (totals.size === 0) {
       const points = daily.map((d) => ({
         date: d.date,
-        values: { total: isTokenMode ? (d.inputTokens + d.outputTokens + d.cacheCreationTokens + d.cacheReadTokens) : d.totalCost },
+        values: {
+          total: isTokenMode
+            ? breakdownTokens(d)
+            : d.totalCost.microdollars,
+        },
       }));
       let maxY = 0;
       for (const pt of points) {
@@ -116,17 +136,17 @@
       if (groupBy === "project" && day.projectBreakdowns) {
         items = day.projectBreakdowns.map((b) => ({
           key: b.project_key,
-          value: isTokenMode ? breakdownTokens(b) : b.cost,
+          value: isTokenMode ? breakdownTokens(b) : b.cost.microdollars,
         }));
       } else if (groupBy === "model" && day.modelBreakdowns) {
         items = day.modelBreakdowns.map((b) => ({
           key: b.modelName,
-          value: isTokenMode ? breakdownTokens(b) : b.cost,
+          value: isTokenMode ? breakdownTokens(b) : b.cost.microdollars,
         }));
       } else if (groupBy === "agent" && day.agentBreakdowns) {
         items = day.agentBreakdowns.map((b) => ({
           key: b.agent,
-          value: isTokenMode ? breakdownTokens(b) : b.cost,
+          value: isTokenMode ? breakdownTokens(b) : b.cost.microdollars,
         }));
       }
 
@@ -159,12 +179,6 @@
 
     return { points, keys, maxY: maxY || 1, labels };
   });
-
-  const colorMap = $derived(
-    seriesColorMap(
-      seriesData.keys.filter((key) => key !== "__other__").sort(),
-    ),
-  );
 
   const chartWidth = $derived(
     Math.max(containerWidth - Y_LABEL_W - X_LABEL_RIGHT_PAD, 100),
@@ -336,9 +350,7 @@
   });
 
   function fmtCostYLabel(v: number): string {
-    if (v >= 100) return `$${v.toFixed(0)}`;
-    if (v >= 1) return `$${v.toFixed(1)}`;
-    return `$${v.toFixed(2)}`;
+    return formatMoney(moneyFromMicrodollars(v));
   }
 
   function fmtTokenYLabel(v: number): string {
@@ -360,7 +372,9 @@
       const val = step * i;
       ticks.push({
         y: scaleY(val, max, CHART_H),
-        label: isTokenMode ? fmtTokenYLabel(val) : fmtCostYLabel(val),
+        label: isTokenMode
+          ? fmtTokenYLabel(val)
+          : fmtCostYLabel(val),
       });
     }
     return ticks;
@@ -373,7 +387,11 @@
 
 <div class="chart-container">
   <div class="chart-header">
-    <h3 class="chart-title">{isTokenMode ? m.usage_tokens_over_time_title() : m.usage_cost_over_time_title()}</h3>
+    <h3 class="chart-title">
+      {isTokenMode
+        ? m.usage_tokens_over_time_title()
+        : m.usage_cost_over_time_title()}
+    </h3>
     <div class="segment-toggle">
       <button
         class="toggle-btn"

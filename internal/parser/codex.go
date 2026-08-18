@@ -57,6 +57,8 @@ type codexSessionIndexEntry struct {
 // JSONL session file line by line.
 type codexSessionBuilder struct {
 	codexCursorState
+	resolveParentTurns   codexParentTurnResolver
+	parentTurnIDs        map[string]struct{}
 	messages             []ParsedMessage
 	firstMessage         string
 	startedAt            time.Time
@@ -75,58 +77,82 @@ type codexSessionBuilder struct {
 	unattachedTokenUsage bool
 }
 
-// codexForkGate drops the replayed parent history at the top of a
-// forked Codex rollout (#643).
+// codexForkGate drops replayed parent history at the top of a Codex
+// fork or subagent rollout (#643).
 //
-// `codex fork` copies the parent's lines — its session_meta, turns,
-// messages and token_count events — into the new file with re-stamped
-// envelope timestamps, so the same usage exists in two session files
-// and gets counted twice. Envelope timestamps cannot locate the
-// boundary (the replay is re-stamped at fork creation), but turn ids
-// are UUIDv7 values minted when the turn originally ran: every
-// replayed turn predates the fork instant, and the first genuine turn
-// is minted at or after it. The gate stays closed until the first
-// turn_context whose turn_id timestamp is >= the fork's own creation
-// time, then everything flows normally.
-//
-// Replayed turn_context entries from parents recorded before Codex
-// stamped turn ids carry no turn_id at all; a CLI new enough to write
-// forked_from_id always stamps genuine turns, so a missing turn_id
-// while gated means replayed history. An unparseable turn_id fails
-// open (pre-#643 behaviour) rather than risk dropping live data.
+// Codex copies the parent's lines — its session_meta, turns, messages
+// and token_count events — into both kinds of derived rollout with
+// re-stamped envelope timestamps, so the same usage exists in multiple
+// session files and gets counted repeatedly. Envelope timestamps cannot
+// locate the boundary. The referenced parent transcript can: while the
+// gate is active, turn ids also present in that parent are replayed and
+// the first turn id absent from it belongs to the child. Turn ids are
+// opaque equality keys here; their UUID version and bytes have no
+// chronological meaning.
 type codexForkGate struct {
-	active    bool
-	createdMs int64
+	active          bool
+	parentSessionID string
+	parentResolved  bool
 }
 
-// armFromMeta activates the gate when the session_meta belongs to a
-// forked session and its creation instant can be anchored: from the
-// fork's UUIDv7 id, the payload timestamp, or the JSONL envelope
-// timestamp, in that order.
-func (g *codexForkGate) armFromMeta(payload gjson.Result, envelopeTS time.Time) {
-	if payload.Get("forked_from_id").Str == "" {
+type codexParentTurnResolver func(string) (map[string]struct{}, bool)
+
+// armFromMeta records explicit lineage and activates replay filtering only
+// when the referenced parent transcript was resolved. Missing parents fail
+// open so an incomplete source archive cannot erase child data.
+func (g *codexForkGate) armFromMeta(payload gjson.Result, parentResolved bool) {
+	forkedFromID := strings.TrimSpace(payload.Get("forked_from_id").Str)
+	parentID := codexSubagentParentThreadID(payload)
+	if forkedFromID == "" && parentID == "" {
 		return
 	}
-	ms := uuidV7Millis(payload.Get("id").Str)
-	if ms == 0 {
-		if t := parseTimestamp(payload.Get("timestamp").Str); !t.IsZero() {
-			ms = t.UnixMilli()
-		}
+	if forkedFromID != "" {
+		parentID = forkedFromID
 	}
-	if ms == 0 && !envelopeTS.IsZero() {
-		ms = envelopeTS.UnixMilli()
+	g.parentSessionID = parentID
+	g.parentResolved = parentResolved
+	if forkedFromID != "" {
+		g.active = parentResolved
+		return
 	}
-	if ms == 0 {
-		return // no anchor for the boundary — fail open
+	// Parent metadata alone also appears in child-only transcripts. Wait
+	// for the copied parent's session_meta before suppressing anything.
+}
+
+// suppressesSessionMeta identifies the copied parent session_meta that
+// positively distinguishes a replay-prefix subagent from a child-only
+// transcript. Explicit forks are already active when their copied meta
+// arrives.
+func (g *codexForkGate) suppressesSessionMeta(payload gjson.Result) bool {
+	if g.active {
+		return true
 	}
-	g.active = true
-	g.createdMs = ms
+	parentID := payload.Get("id").Str
+	if parentID == "" || parentID != g.parentSessionID {
+		return false
+	}
+	g.active = g.parentResolved
+	return true
+}
+
+func codexSubagentParentThreadID(payload gjson.Result) string {
+	parentID := strings.TrimSpace(
+		payload.Get("source.subagent.thread_spawn.parent_thread_id").Str,
+	)
+	if parentID == "" && payload.Get("thread_source").Str == "subagent" {
+		parentID = strings.TrimSpace(payload.Get("parent_thread_id").Str)
+	}
+	return parentID
 }
 
 // suppresses reports whether the line is replayed parent history.
-// turn_context lines open the gate when their turn id was minted at
-// or after the fork instant.
-func (g *codexForkGate) suppresses(lineType string, payload gjson.Result) bool {
+// Parent turn ids are opaque membership keys. Once the first turn id
+// absent from the parent appears, every later line belongs to the child.
+func (g *codexForkGate) suppresses(
+	lineType string,
+	payload gjson.Result,
+	parentTurnIDs map[string]struct{},
+) bool {
 	if !g.active {
 		return false
 	}
@@ -134,28 +160,12 @@ func (g *codexForkGate) suppresses(lineType string, payload gjson.Result) bool {
 		return true
 	}
 	tid := payload.Get("turn_id").Str
-	if tid == "" {
-		return true // pre-turn_id parent history
-	}
-	if ms := uuidV7Millis(tid); ms != 0 && ms < g.createdMs {
+	if _, replayed := parentTurnIDs[tid]; replayed {
 		return true
 	}
 	g.active = false
+	g.parentResolved = false
 	return false
-}
-
-// uuidV7Millis extracts the millisecond timestamp embedded in a
-// UUIDv7, returning 0 for anything that is not a v7 UUID.
-func uuidV7Millis(id string) int64 {
-	hex := strings.ReplaceAll(id, "-", "")
-	if len(hex) != 32 || hex[12] != '7' {
-		return 0
-	}
-	ms, err := strconv.ParseInt(hex[:12], 16, 64)
-	if err != nil {
-		return 0
-	}
-	return ms
 }
 
 type codexToolCallRef struct {
@@ -174,8 +184,10 @@ type codexPendingEvent struct {
 
 func newCodexSessionBuilder(
 	_ bool,
+	resolveParentTurns codexParentTurnResolver,
 ) *codexSessionBuilder {
 	return &codexSessionBuilder{
+		resolveParentTurns:   resolveParentTurns,
 		project:              "unknown",
 		callNames:            make(map[string]string),
 		callRefs:             make(map[string]codexToolCallRef),
@@ -184,6 +196,30 @@ func newCodexSessionBuilder(
 		pendingAgentEvents:   make(map[string][]codexPendingEvent),
 		orphanNotificationIx: make(map[string]int),
 	}
+}
+
+func (b *codexSessionBuilder) armForkGate(payload gjson.Result) {
+	parentID := strings.TrimSpace(payload.Get("forked_from_id").Str)
+	if parentID == "" {
+		parentID = codexSubagentParentThreadID(payload)
+	}
+	resolved := false
+	if parentID != "" && b.resolveParentTurns != nil {
+		b.parentTurnIDs, resolved = b.resolveParentTurns(parentID)
+	}
+	b.forkGate.armFromMeta(payload, resolved)
+}
+
+func (b *codexSessionBuilder) suppresses(
+	lineType string,
+	payload gjson.Result,
+) bool {
+	if b.forkGate.active && b.parentTurnIDs == nil &&
+		b.resolveParentTurns != nil {
+		b.parentTurnIDs, _ =
+			b.resolveParentTurns(b.forkGate.parentSessionID)
+	}
+	return b.forkGate.suppresses(lineType, payload, b.parentTurnIDs)
 }
 
 func (b *codexSessionBuilder) incrementalSeed() codexIncrementalSeed {
@@ -211,24 +247,24 @@ func (b *codexSessionBuilder) processLine(
 
 	switch gjson.Get(line, "type").Str {
 	case codexTypeSessionMeta:
-		if b.forkGate.active {
+		if b.forkGate.suppressesSessionMeta(payload) {
 			// A forked rollout replays the parent's session_meta
 			// too — the fork's own meta came first and wins.
 			return false
 		}
 		return b.handleSessionMeta(payload, ts)
 	case codexTypeTurnContext:
-		if b.forkGate.suppresses(codexTypeTurnContext, payload) {
+		if b.suppresses(codexTypeTurnContext, payload) {
 			return false
 		}
 		b.model = payload.Get("model").Str
 	case codexTypeResponseItem:
-		if b.forkGate.suppresses(codexTypeResponseItem, payload) {
+		if b.suppresses(codexTypeResponseItem, payload) {
 			return false
 		}
 		b.handleResponseItem(payload, ts)
 	case codexTypeEventMsg:
-		if b.forkGate.suppresses(codexTypeEventMsg, payload) {
+		if b.suppresses(codexTypeEventMsg, payload) {
 			return false
 		}
 		b.handleEventMsg(payload)
@@ -246,15 +282,7 @@ func (b *codexSessionBuilder) handleSessionMeta(
 			payload.Get("source.subagent.thread_spawn.agent_path").Str,
 		)
 	}
-	b.parentSessionID = strings.TrimSpace(
-		payload.Get("source.subagent.thread_spawn.parent_thread_id").Str,
-	)
-	if b.parentSessionID == "" &&
-		payload.Get("thread_source").Str == "subagent" {
-		b.parentSessionID = strings.TrimSpace(
-			payload.Get("parent_thread_id").Str,
-		)
-	}
+	b.parentSessionID = codexSubagentParentThreadID(payload)
 	if b.parentSessionID != "" {
 		b.parentSessionID = codexSubagentSessionID(b.parentSessionID)
 		b.relationshipType = RelSubagent
@@ -270,7 +298,7 @@ func (b *codexSessionBuilder) handleSessionMeta(
 		}
 	}
 
-	b.forkGate.armFromMeta(payload, envelopeTS)
+	b.armForkGate(payload)
 
 	return false
 }
@@ -1461,6 +1489,105 @@ func (p *codexProvider) parseSession(
 	)
 }
 
+func (p *codexProvider) parentTurnResolver(
+	childPath string,
+) codexParentTurnResolver {
+	return func(parentID string) (map[string]struct{}, bool) {
+		parentKey := strings.Join(p.sources.roots, "\x00") + "\x00" + parentID
+		if turnIDs, ok := p.parentTurnCache.GetParent(parentKey); ok {
+			return turnIDs, true
+		}
+		parentPath := ""
+		for _, root := range p.sources.roots {
+			candidate := p.sources.findSourceFile(root, parentID)
+			if candidate == "" || filepath.Clean(candidate) == filepath.Clean(childPath) {
+				continue
+			}
+			parentPath = candidate
+			break
+		}
+		if parentPath == "" {
+			return nil, false
+		}
+		info, err := os.Stat(parentPath)
+		if err != nil || info.IsDir() {
+			return nil, false
+		}
+		cacheKey := codexParentTurnCacheKeyFor(parentPath, info)
+		if turnIDs, ok := p.parentTurnCache.Get(cacheKey); ok {
+			return turnIDs, true
+		}
+
+		turnIDs := make(map[string]struct{})
+		_, err = readCodexJSONLFrom(parentPath, 0, func(line string) {
+			if gjson.Get(line, "type").Str != codexTypeTurnContext {
+				return
+			}
+			turnIDs[gjson.Get(line, "payload.turn_id").Str] = struct{}{}
+		})
+		if err != nil && !errors.Is(err, errCodexIncrementalNeedsFullParse) {
+			return nil, false
+		}
+		p.parentTurnCache.PutParent(parentKey, cacheKey, turnIDs)
+		return turnIDs, true
+	}
+}
+
+func (p *codexProvider) codexParentResolution(
+	childPath string,
+) (string, bool) {
+	parentID, resolutionNeeded := CodexReplayParentID(childPath)
+	if parentID == "" || !resolutionNeeded {
+		return "", false
+	}
+	turnIDs, resolved := p.parentTurnResolver(childPath)(parentID)
+	return parentID, resolved && len(turnIDs) > 0
+}
+
+// CodexReplayParentID returns the explicit parent only when the rollout has a
+// positive replay-prefix signal: forked_from_id, or a copied parent
+// session_meta after subagent lineage metadata. Child-only subagents return no
+// replay parent and remain current without resolving their parent transcript.
+func CodexReplayParentID(childPath string) (string, bool) {
+	f, err := os.Open(childPath)
+	if err != nil {
+		return "", false
+	}
+	defer f.Close()
+
+	parentID := ""
+	resolutionNeeded := false
+	scanner := bufio.NewScanner(f)
+	scanner.Buffer(make([]byte, 0, 64*1024), maxLineSize)
+	for scanner.Scan() {
+		line := strings.TrimSpace(scanner.Text())
+		if !gjson.Valid(line) {
+			continue
+		}
+		if resolutionNeeded || gjson.Get(line, "type").Str != codexTypeSessionMeta {
+			continue
+		}
+		payload := gjson.Get(line, "payload")
+		forkedFromID := strings.TrimSpace(payload.Get("forked_from_id").Str)
+		if forkedFromID != "" {
+			parentID = forkedFromID
+			resolutionNeeded = true
+			continue
+		}
+		if parentID == "" {
+			parentID = codexSubagentParentThreadID(payload)
+			continue
+		}
+		if payload.Get("id").Str == parentID {
+			resolutionNeeded = true
+		}
+	}
+	if scanner.Err() != nil || parentID == "" || !resolutionNeeded {
+		return "", false
+	}
+	return parentID, true
+}
+
 // parseSessionSnapshot parses exactly the raw-size snapshot captured from f.
 // Limiting the reader prevents an append racing the scan from being folded into
 // a cursor keyed by the earlier size.
@@ -1472,7 +1599,7 @@ func (p *codexProvider) parseSessionSnapshot(
 ) (*ParsedSession, []ParsedMessage, error) {
 	lr := newLineReader(io.LimitReader(f, info.Size()), maxLineSize)
 	defer releaseLineReader(lr)
-	b := newCodexSessionBuilder(includeExec)
+	b := newCodexSessionBuilder(includeExec, p.parentTurnResolver(path))
 
 	for {
 		line, ok := lr.next()
@@ -1521,36 +1648,39 @@ func (p *codexProvider) parseSessionSnapshot(
 	}
 
 	mtime := info.ModTime().UnixNano()
-	// Include session_index.jsonl mtime so renames trigger a re-parse.
-	if idxPath := codexSessionIndexPath(path); idxPath != "" {
-		if idxInfo, err := os.Stat(idxPath); err == nil {
-			if idxMtime := idxInfo.ModTime().UnixNano(); idxMtime > mtime {
-				mtime = idxMtime
-			}
-		}
+	if p.spec.agent == AgentCodex {
+		// Include session_index.jsonl mtime so Codex renames trigger a re-parse.
+		mtime = CodexEffectiveMtime(path, mtime)
 	}
 
-	sessionName := LookupCodexThreadName(path, b.sessionID)
-	if sessionName == "" && b.firstMessage == "" &&
+	sessionName := ""
+	sessionNamePresent := false
+	if p.spec.agent == AgentCodex {
+		sessionName, sessionNamePresent = LookupCodexThreadNameEntry(
+			path, b.sessionID,
+		)
+	}
+	if !sessionNamePresent && sessionName == "" && b.firstMessage == "" &&
 		b.relationshipType == RelSubagent {
 		sessionName = codexAgentPathLeaf(b.agentPath)
 	}
 
 	sess := &ParsedSession{
-		ID:                sessionID,
-		Project:           b.project,
-		Machine:           machine,
-		Agent:             AgentCodex,
-		ParentSessionID:   b.parentSessionID,
-		RelationshipType:  b.relationshipType,
-		Cwd:               b.cwd,
-		FirstMessage:      b.firstMessage,
-		SessionName:       sessionName,
-		StartedAt:         b.startedAt,
-		EndedAt:           b.endedAt,
-		MessageCount:      len(b.messages),
-		UserMessageCount:  userCount,
-		TerminationStatus: classifyCodexTermination(b.lastTaskEvent),
+		ID:                 sessionID,
+		Project:            b.project,
+		Machine:            machine,
+		Agent:              AgentCodex,
+		ParentSessionID:    b.parentSessionID,
+		RelationshipType:   b.relationshipType,
+		Cwd:                b.cwd,
+		FirstMessage:       b.firstMessage,
+		SessionName:        sessionName,
+		SessionNamePresent: sessionNamePresent,
+		StartedAt:          b.startedAt,
+		EndedAt:            b.endedAt,
+		MessageCount:       len(b.messages),
+		UserMessageCount:   userCount,
+		TerminationStatus:  classifyCodexTermination(b.lastTaskEvent),
 		File: FileInfo{
 			Path:   path,
 			Size:   info.Size(),
@@ -1611,18 +1741,62 @@ func EvictCodexSessionIndexForSession(sessionPath string) {
 // LookupCodexThreadName returns the current Codex thread name for a session
 // from the session_index.jsonl file next to the session root.
 func LookupCodexThreadName(sessionPath, sessionID string) string {
+	name, _ := LookupCodexThreadNameEntry(sessionPath, sessionID)
+	return name
+}
+
+// LookupCodexThreadNameEntry returns the session_index.jsonl title for the
+// session and whether the index actually holds an entry for it. A missing or
+// unreadable index, or an index without this session, reports ok=false so
+// callers can distinguish "renamed to empty" from "no rename signal at all" —
+// modern Codex releases no longer write session_index.jsonl.
+func LookupCodexThreadNameEntry(
+	sessionPath, sessionID string,
+) (string, bool) {
+	name, ok, _ := ReadCodexThreadNameEntry(sessionPath, sessionID)
+	return name, ok
+}
+
+// ReadCodexThreadNameEntry returns the session_index.jsonl title for the
+// session, whether the index holds an entry, and any read or scan failure.
+// A missing index is a verified absence and returns no error; modern Codex
+// releases no longer create this file. Callers that persist freshness state
+// use the error to distinguish that normal absence from a transient failure.
+func ReadCodexThreadNameEntry(
+	sessionPath, sessionID string,
+) (string, bool, error) {
 	if strings.TrimSpace(sessionID) == "" {
-		return ""
+		return "", false, nil
 	}
 	indexPath := codexSessionIndexPath(sessionPath)
 	if indexPath == "" {
-		return ""
+		return "", false, nil
 	}
 	titles, err := loadCodexSessionIndex(indexPath)
-	if err != nil {
-		return ""
+	if errors.Is(err, os.ErrNotExist) {
+		return "", false, nil
 	}
-	return strings.TrimSpace(titles[sessionID])
+	if err != nil {
+		return "", false, err
+	}
+	title, ok := titles[sessionID]
+	return strings.TrimSpace(title), ok, nil
+}
+
+// VerifyCodexSessionIndex reports whether the title index associated with a
+// rollout was read successfully or confirmed absent. It preserves non-ENOENT
+// failures so callers cannot persist a freshness digest for unchecked title
+// metadata.
+func VerifyCodexSessionIndex(sessionPath string) error {
+	indexPath := codexSessionIndexPath(sessionPath)
+	if indexPath == "" {
+		return nil
+	}
+	_, err := loadCodexSessionIndex(indexPath)
+	if errors.Is(err, os.ErrNotExist) {
+		return nil
+	}
+	return err
 }
 
 // CodexEffectiveMtime returns the effective mtime for a Codex session file,
@@ -1708,7 +1882,8 @@ func loadCodexSessionIndex(indexPath string) (map[string]string, error) {
 }
 
 // ParseCodexSessionIndexTitles reads a Codex session_index.jsonl stream and
-// returns session UUIDs mapped to non-empty thread titles.
+// returns session UUIDs mapped to their thread titles. Explicit blank titles
+// remain present so callers can distinguish them from absent entries.
 func ParseCodexSessionIndexTitles(r io.Reader) (map[string]string, error) {
 	titles := make(map[string]string)
 	s := bufio.NewScanner(r)
@@ -1719,11 +1894,11 @@ func ParseCodexSessionIndexTitles(r io.Reader) (map[string]string, error) {
 			continue
 		}
 		id := gjson.Get(line, "id").Str
-		title := strings.TrimSpace(gjson.Get(line, "thread_name").Str)
-		if id == "" || title == "" {
+		threadName := gjson.Get(line, "thread_name")
+		if id == "" || !threadName.Exists() {
 			continue
 		}
-		titles[id] = title
+		titles[id] = strings.TrimSpace(threadName.Str)
 	}
 	if err := s.Err(); err != nil {
 		return nil, err
@@ -1766,7 +1941,7 @@ type codexIncrementalSeed = codexCursorState
 // still active at the end of the scan means the stored offset landed
 // inside the replayed parent history of a forked rollout, so the
 // incremental parse must keep suppressing appended replay lines.
-func seedCodexIncrementalState(
+func (p *codexProvider) seedCodexIncrementalState(
 	path string, offset int64,
 ) (codexIncrementalSeed, error) {
 	f, err := os.Open(path)
@@ -1778,6 +1953,7 @@ func seedCodexIncrementalState(
 	defer f.Close()
 	seed, err := seedCodexIncrementalStateFromReader(
 		io.LimitReader(f, offset),
+		p.parentTurnResolver(path),
 	)
 	if err != nil {
 		return codexIncrementalSeed{}, fmt.Errorf(
@@ -1789,8 +1965,9 @@ func seedCodexIncrementalState(
 
 func seedCodexIncrementalStateFromReader(
 	r io.Reader,
+	resolveParentTurns codexParentTurnResolver,
 ) (codexIncrementalSeed, error) {
-	var seed codexIncrementalSeed
+	b := newCodexSessionBuilder(false, resolveParentTurns)
 	lr := newLineReader(r, maxLineSize)
 	defer releaseLineReader(lr)
 	for {
@@ -1807,48 +1984,45 @@ func seedCodexIncrementalStateFromReader(
 			// Mirror processLine: the fork's own meta arms the
 			// gate and supplies cwd, and replayed parent metas are
 			// dropped while it is active.
-			if !seed.forkGate.active {
+			if !b.forkGate.suppressesSessionMeta(payload) {
 				if cwd := payload.Get("cwd").Str; cwd != "" {
-					seed.cwd = cwd
+					b.cwd = cwd
 				}
-				seed.agentPath = strings.TrimSpace(
+				b.agentPath = strings.TrimSpace(
 					payload.Get("agent_path").Str,
 				)
-				if seed.agentPath == "" {
-					seed.agentPath = strings.TrimSpace(payload.Get(
+				if b.agentPath == "" {
+					b.agentPath = strings.TrimSpace(payload.Get(
 						"source.subagent.thread_spawn.agent_path",
 					).Str)
 				}
-				seed.forkGate.armFromMeta(
-					payload,
-					parseTimestamp(gjson.Get(line, "timestamp").Str),
-				)
+				b.armForkGate(payload)
 			}
 			continue
 		}
-		if seed.forkGate.suppresses(lineType, payload) {
+		if b.suppresses(lineType, payload) {
 			continue
 		}
 		switch lineType {
 		case codexTypeTurnContext:
-			seed.model = payload.Get("model").Str
+			b.model = payload.Get("model").Str
 		case codexTypeEventMsg:
 			eventType := payload.Get("type").Str
-			seed.observeTaskEvent(eventType)
+			b.observeTaskEvent(eventType)
 			if eventType == "token_count" {
 				raw := payload.Get("info.last_token_usage").Raw
 				if raw != "" {
-					seed.observeTokenUsage(raw)
+					b.observeTokenUsage(raw)
 				}
 			}
 		case codexTypeResponseItem:
-			observeCodexIncrementalUserMessage(&seed, payload)
+			observeCodexIncrementalUserMessage(&b.codexCursorState, payload)
 		}
 	}
 	if err := lr.Err(); err != nil {
 		return codexIncrementalSeed{}, err
 	}
-	return seed, nil
+	return b.codexCursorState, nil
 }
 
 // observeUserMessage feeds one response_item into the
@@ -2054,6 +2228,7 @@ func (p *codexProvider) parseSessionFromSnapshot(
 		func() (codexIncrementalSeed, error) {
 			return seedCodexIncrementalStateFromReader(
 				io.NewSectionReader(f, 0, offset),
+				p.parentTurnResolver(path),
 			)
 		},
 	)
@@ -2072,7 +2247,7 @@ func (p *codexProvider) parseSessionFromWithReader(
 		startOrdinal,
 		includeExec,
 		readLines,
-		seedCodexIncrementalState,
+		p.seedCodexIncrementalState,
 	)
 }
 
@@ -2127,7 +2302,7 @@ func (p *codexProvider) parseSessionFromWithSources(
 		}
 	}
 
-	b := newCodexSessionBuilder(includeExec)
+	b := newCodexSessionBuilder(includeExec, p.parentTurnResolver(path))
 	b.ordinal = startOrdinal
 	b.codexCursorState = seed
 	var fallbackErr error
@@ -2137,15 +2312,28 @@ func (p *codexProvider) parseSessionFromWithSources(
 			if fallbackErr != nil {
 				return
 			}
-			// Skip session_meta — already processed in
-			// the initial full parse.
-			if gjson.Get(line, "type").Str ==
-				codexTypeSessionMeta {
+			lineType := gjson.Get(line, "type").Str
+			// A session_meta after the persisted offset can change fork or
+			// subagent replay classification. Rebuild the current session
+			// authoritatively instead of appending against stale gate state.
+			if lineType == codexTypeSessionMeta {
+				fallbackErr = errCodexIncrementalNeedsFullParse
 				return
 			}
 			if codexIncrementalNeedsFullParse(line) {
 				fallbackErr = errCodexIncrementalNeedsFullParse
 				return
+			}
+			if lineType == codexTypeResponseItem {
+				payload := gjson.Get(line, "payload")
+				switch payload.Get("type").Str {
+				case "function_call_output",
+					"custom_tool_call_output":
+					if b.incrementalOutputNeedsFullParse(payload) {
+						fallbackErr = errCodexIncrementalNeedsFullParse
+						return
+					}
+				}
 			}
 			b.processLine(line)
 			if b.unattachedTokenUsage {
@@ -2202,7 +2390,8 @@ func (p *codexProvider) parseSessionFrom(
 // parse error requires the caller to fall back to a full parse.
 func IsIncrementalFullParseFallback(err error) bool {
 	return errors.Is(err, errCodexIncrementalNeedsFullParse) ||
-		errors.Is(err, ErrClaudeIncrementalNeedsFullParse)
+		errors.Is(err, ErrClaudeIncrementalNeedsFullParse) ||
+		errors.Is(err, ErrIncrementalNeedsFullParse)
 }
 
 func isCodexSystemMessage(content string) bool {
@@ -2326,10 +2515,6 @@ func codexIncrementalNeedsFullParse(line string) bool {
 	switch payload.Get("type").Str {
 	case "function_call", "custom_tool_call":
 		return isCodexWaitAgentCall(payload.Get("name").Str)
-	case "function_call_output", "custom_tool_call_output":
-		output, raw := parseCodexFunctionOutput(payload)
-		return isCodexSubagentFunctionOutput(output) ||
-			strings.TrimSpace(raw) != ""
 	default:
 		role := payload.Get("role").Str
 		if role != "user" {
@@ -2340,4 +2525,35 @@ func codexIncrementalNeedsFullParse(line string) bool {
 		)
 		return agentID != "" && text != ""
 	}
+}
+
+// incrementalOutputNeedsFullParse reports whether an appended
+// function_call_output / custom_tool_call_output line cannot be
+// represented by an append-only incremental write. Subagent outputs
+// repair lineage on rows outside the append, and an output whose call
+// is not part of this appended chunk belongs to an already-stored tool
+// call; both need a replacing full parse. An output paired with its
+// call in the same chunk attaches in memory exactly as a full parse
+// would, so it stays on the incremental path.
+func (b *codexSessionBuilder) incrementalOutputNeedsFullParse(
+	payload gjson.Result,
+) bool {
+	output, raw := parseCodexFunctionOutput(payload)
+	if isCodexSubagentFunctionOutput(output) {
+		return true
+	}
+	if strings.TrimSpace(raw) == "" {
+		return false
+	}
+	callID := payload.Get("call_id").Str
+	if callID == "" {
+		// A full parse drops outputs without a call id too.
+		return false
+	}
+	switch b.callNames[callID] {
+	case "spawn_agent", "wait", "wait_agent":
+		return true
+	}
+	_, attachable := b.callRefs[callID]
+	return !attachable
 }

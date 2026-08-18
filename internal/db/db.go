@@ -17,14 +17,31 @@ import (
 	"sync/atomic"
 	"time"
 
-	_ "github.com/mattn/go-sqlite3"
-
 	"go.kenn.io/agentsview/internal/config"
 	"go.kenn.io/agentsview/internal/export"
 	"go.kenn.io/agentsview/internal/parser"
 )
 
 const projectIdentityRemoteScrubCompletedKey = "project_identity_remote_scrub_v1"
+
+// provider_freshnessDDL is the per-component stat-hash side-table for
+// providers with multi-file on-disk layouts (currently Codebuff and
+// Freebuff). The engine uses it to short-circuit warm sync over an
+// unchanged archive without invoking provider.Fingerprint on the hot
+// path. CREATE TABLE IF NOT EXISTS is idempotent, so legacy DBs created
+// before this table existed gain it on the next Open without a version
+// bump.
+const provider_freshnessDDL = `
+CREATE TABLE IF NOT EXISTS provider_freshness (
+    agent         TEXT NOT NULL,
+    file_path     TEXT NOT NULL,
+    stat_hash     INTEGER NOT NULL,
+    updated_at    TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%fZ','now')),
+    PRIMARY KEY (agent, file_path)
+);
+CREATE INDEX IF NOT EXISTS idx_provider_freshness_updated_at
+    ON provider_freshness(updated_at);
+`
 
 // dataVersion tracks parser changes that require a full
 // re-sync. Increment this when parsing logic changes in ways
@@ -182,7 +199,7 @@ const projectIdentityRemoteScrubCompletedKey = "project_identity_remote_scrub_v1
 // (30: Hermes parser no longer treats cost_status
 // "included" as a confident $0 when cost_source is "none"/empty (its
 // default for models it does not price, e.g. gpt-5.5). Such rows now
-// leave cost_usd nil so they are catalog-priced. Existing Hermes rows
+// leave cost_microdollars nil so they are catalog-priced. Existing Hermes rows
 // need re-parsing so their usage cost reflects the catalog instead of a
 // baked-in $0.)
 //
@@ -311,19 +328,98 @@ const projectIdentityRemoteScrubCompletedKey = "project_identity_remote_scrub_v1
 // (68: Hermes skill_view metadata. Re-parsing populates tool_calls.skill_name
 // for existing Hermes sessions so historical skill usage appears in analytics.)
 // (69: Copilot shutdown events persist the authoritative AI-credit total as
-// reported cost. Re-parsing populates cost_usd and cost_source on existing
-// Copilot rows from session.shutdown totalNanoAiu values.)
+// reported cost. Re-parsing populates cost_microdollars and cost_source on
+// existing Copilot rows from session.shutdown totalNanoAiu values.)
 // (70: Grok per-turn usage reparse. turn_completed usage payloads are
 // per-turn measurements, not cumulative snapshots — one event per turn
 // and model replaces the single last-payload event per session, with
 // occurred_at from each turn's timestamp. Existing Grok rows undercount
 // multi-turn sessions and need re-parsing.)
-// (71: Kimi step.end usage reparse. step.end emits usage after tool.result
-// has already flushed the assistant turn's text and tool calls; the parser
-// now back-fills that usage onto the owning assistant message instead of
-// dropping it. Existing Kimi rows lose nearly all input/cache tokens and
-// need re-parsing.)
-const dataVersion = 71
+// (71: OpenCode SQLite cwd/project derivation now prefers a concrete
+// session.directory over the synthetic global project worktree "/". Existing
+// OpenCode rows need re-parsing so unchanged sessions refresh cwd and project.)
+// (72: OpenCode invalid tool calls emit an errored result event. OpenCode
+// records unknown-tool calls as a synthetic "invalid" tool that completes
+// successfully, so existing rows carry no failure signal. Re-parsing attaches
+// the errored event so tool-health failure counts cover historical sessions.)
+// (73: OpenCode bash tool calls emit an errored result event when the tool
+// state records a non-zero metadata.exit. Windows shells produce no "exit
+// status N" output text, so existing rows carry no failure signal. Re-parsing
+// attaches the errored event so tool-health failure counts cover historical
+// OpenCode sessions on every platform.)
+// (74: Claude Code IDE context reparse. Standalone ide_opened_file and
+// ide_selection wrappers are promoted to system metadata so existing
+// VS Code sessions no longer use them as titles or user turns.)
+// (75: Git worktree project attribution reparse. Hosting-oriented worktree
+// paths retain the owning repository after checkout removal, live linked
+// worktrees backed by bare common repositories resolve to the repository
+// instead of the generated checkout leaf, and generic hosting fragments defer
+// to an enclosing live repository. Existing rows need re-parsing so activity
+// is neither fragmented by worktree names nor claimed by nested fixture paths.)
+// (76: Copilot CLI tool execution boundaries. Re-parsing persists
+// tool.execution_start and tool.execution_complete timestamps as result events
+// so Session Analysis excludes resumed-session idle time from completed calls.)
+// (77: Vibe usage reparse. The Vibe parser now reads
+// stats.session_cached_tokens, splitting the provider cache-hit count out of
+// input tokens into the usage event's cache-read field. Existing rows need
+// re-parsing so the cached prefix is priced at the discounted cache-read rate
+// instead of the full input rate. The same reparse replaces parser-source
+// project identity snapshots that older mapping behavior could persist with
+// the mapped target label before incremental ingestion is allowed to reuse
+// them.)
+//
+// (78: Devin timestamp reparse. The Devin parser read sessions.created_at,
+// sessions.last_activity_at, and message_nodes.created_at as epoch
+// milliseconds when Devin writes epoch seconds, so every existing Devin row
+// carries 1970-era started_at/ended_at and message timestamps that were
+// discarded as invalid. Existing rows need re-parsing to backfill real
+// timestamps. A fingerprint change alone cannot cover this: for a message-node
+// fallback session whose sessions row has no usable created_at or
+// last_activity_at, the Devin fingerprint hashes only raw epoch integers and
+// zero-time metadata, so it is byte-identical before and after the fix and
+// incremental sync would skip the correction.)
+// (79: Claude launch/prompt provenance. Re-parsing populates the new
+// sessions.session_kind and messages.prompt_source columns from top-level
+// sessionKind and promptSource fields on existing Claude rows.)
+// (80: Kimi Code tool-step usage reparse. Protocol-1.4 transcripts can persist
+// tool.result before step.end, so existing Kimi and Kimi Work rows may omit
+// per-message usage for tool-calling steps. Re-parsing attaches the trailing
+// step usage to the assistant tool-call message.)
+// (81: Pi-family flat cache-write usage reparse. Existing Pi and OMP rows can
+// persist cache creation under cacheWrite, which older parses ignored.
+// Re-parsing restores those tokens to per-message usage and computed cost.)
+// (82: Claude web search accounting. The parser now records how many billed
+// server-side web searches an assistant message performed in its stored
+// token_usage blob, taking the count from the linked WebSearch tool result
+// when the message's own server_tool_use counter is zero. Existing Claude
+// rows need re-parsing so historical web searches are charged the
+// per-request fee.)
+// (83: Claude background-fork lineage. The parser now trims the replayed
+// prefix a background handoff copies into its new transcript and links the
+// fork to its original session as a continuation. Existing Claude rows need
+// re-parsing so already-ingested fork sessions drop their duplicated
+// messages and usage and stop appearing as unrelated top-level sessions.)
+// (84: Amp usage accounting. Exported Amp threads carry a per-inference
+// usage object with model and token counts that the parser previously
+// ignored. Existing Amp rows need re-parsing so their model, token
+// usage, and computed cost appear in usage reports.)
+// (85: Codex subagent replay accounting. Codex can copy a parent's complete
+// rollout prefix into a newly spawned subagent file, re-stamping messages and
+// token_count events at child creation. Existing Codex-format rows need
+// re-parsing so derived sessions retain only child-owned messages and usage.)
+// (86: VS Code Copilot response item parsing. VS Code 1.132 persists status,
+// inline reference, and terminal command fields in shapes the parser previously
+// skipped. Existing VS Code Copilot and Positron rows need re-parsing so their
+// structured tool calls and visible file references are restored.)
+// (87: Codex fork replay boundary correction. Turn identifiers are opaque;
+// existing Codex-format rows need re-parsing so copied parent turns with any
+// identifier shape remain excluded until the first child-owned turn.)
+// (88: Claude Code IDE context wrappers prepended onto a real prompt in
+// the same entry are now split into a hidden system-metadata message plus
+// the real prompt, instead of leaving the raw wrapper in first_message and
+// the visible transcript. Existing rows need re-parsing so first_message
+// and message content drop the leading markup.)
+const dataVersion = 88
 
 const tokenCoverageRepairStatsKey = "token_coverage_repair_v1"
 
@@ -530,8 +626,9 @@ type DB struct {
 	cursorMu     sync.RWMutex
 	cursorSecret []byte
 
-	customPricing        map[string]config.CustomModelRate
-	customPricingSources map[string]export.PricingRowSource
+	customPricing       map[string]config.CustomModelRate
+	effectivePricing    map[string]export.ModelRates
+	emptyCatalogPricing map[string]export.ModelRates
 
 	checkpointMu   sync.Mutex
 	checkpointStop chan struct{}
@@ -539,6 +636,7 @@ type DB struct {
 
 	vectorMu       sync.RWMutex
 	vectorSearcher VectorSearcher
+	recallSearcher RecallVectorSearcher
 }
 
 // Reader exposes guarded read-only query operations. It intentionally does
@@ -775,17 +873,32 @@ func (db *DB) requireWritable() error {
 
 func (db *DB) SetCustomPricing(p map[string]config.CustomModelRate) {
 	db.customPricing = p
-	db.customPricingSources = nil
+	db.effectivePricing = nil
 }
 
 // SetEffectivePricing installs in-memory pricing rows with explicit provenance
 // sources for read-only fallback paths that cannot seed model_pricing.
 func (db *DB) SetEffectivePricing(
-	p map[string]config.CustomModelRate,
-	sources map[string]export.PricingRowSource,
+	p map[string]export.ModelRates,
 ) {
-	db.customPricing = p
-	db.customPricingSources = sources
+	db.customPricing = nil
+	db.effectivePricing = make(map[string]export.ModelRates, len(p))
+	for model, rates := range p {
+		rates.Bands = append([]export.PricingBand(nil), rates.Bands...)
+		db.effectivePricing[model] = rates
+	}
+}
+
+// SetEmptyCatalogPricing installs in-memory rates that are used only when the
+// query source loading pricing sees no stored catalog rows.
+func (db *DB) SetEmptyCatalogPricing(
+	p map[string]export.ModelRates,
+) {
+	db.emptyCatalogPricing = make(map[string]export.ModelRates, len(p))
+	for model, rates := range p {
+		rates.Bands = append([]export.PricingBand(nil), rates.Bands...)
+		db.emptyCatalogPricing[model] = rates
+	}
 }
 
 // SetCursorSecret updates the secret key used for cursor signing.
@@ -1103,6 +1216,11 @@ CREATE TABLE IF NOT EXISTS session_project_identity_snapshots (
     FOREIGN KEY (session_id) REFERENCES sessions(id) ON DELETE CASCADE
 );
 
+CREATE INDEX IF NOT EXISTS idx_session_project_identity_snapshots_evidence
+    ON session_project_identity_snapshots(
+        machine, root_path, git_remote, observed_at DESC, session_id
+    );
+
 CREATE TABLE IF NOT EXISTS background_migrations (
     name            TEXT PRIMARY KEY,
     state           TEXT NOT NULL,
@@ -1292,7 +1410,7 @@ func OpenReadOnly(path string) (*DB, error) {
 		)
 	}
 
-	reader, err := sql.Open("sqlite3", makeDSN(path, true))
+	reader, err := sql.Open(sqliteUsageDriverName, makeDSN(path, true))
 	if err != nil {
 		return nil, fmt.Errorf("opening read-only reader: %w", err)
 	}
@@ -1350,6 +1468,7 @@ var readOnlyRequiredTables = []string{
 	"session_project_identity_snapshots",
 	"pg_sync_state",
 	"model_pricing",
+	"model_pricing_bands",
 	"secret_findings",
 	"recall_entries",
 	"recall_evidence",
@@ -1357,6 +1476,19 @@ var readOnlyRequiredTables = []string{
 	"recall_query_exposures",
 	"recall_extract_generations",
 	"recall_extract_progress",
+	"artifact_export_queue",
+	"artifact_publications",
+	"artifact_publication_revisions",
+	"artifact_checkpoint_heads",
+	"artifact_checkpoint_floors",
+	"artifact_import_queue",
+	"artifact_import_attempt_generations",
+	"artifact_peer_checkpoint_heads",
+	"artifact_checkpoint_landings",
+	"artifact_checkpoint_landing_sessions",
+	"artifact_checkpoint_stages",
+	"artifact_checkpoint_stage_sessions",
+	"artifact_imported_sessions",
 }
 
 var (
@@ -1647,8 +1779,52 @@ func legacySchemaColumnMigrations() []schemaColumnMigration {
 func schemaColumnMigrations() []schemaColumnMigration {
 	return []schemaColumnMigration{
 		{
+			"artifact_import_queue", "quarantine_pending",
+			"ALTER TABLE artifact_import_queue ADD COLUMN quarantine_pending INTEGER NOT NULL DEFAULT 0",
+		},
+		{
+			"artifact_checkpoint_stages", "pending_count",
+			"ALTER TABLE artifact_checkpoint_stages ADD COLUMN pending_count INTEGER NOT NULL DEFAULT 0",
+		},
+		{
+			"artifact_checkpoint_stages", "decoded_count",
+			"ALTER TABLE artifact_checkpoint_stages ADD COLUMN decoded_count INTEGER NOT NULL DEFAULT 0",
+		},
+		{
+			"artifact_checkpoint_stages", "decode_offset",
+			"ALTER TABLE artifact_checkpoint_stages ADD COLUMN decode_offset INTEGER NOT NULL DEFAULT 0",
+		},
+		{
+			"artifact_checkpoint_stages", "decoder_version",
+			"ALTER TABLE artifact_checkpoint_stages ADD COLUMN decoder_version INTEGER NOT NULL DEFAULT 1",
+		},
+		{
+			"artifact_checkpoint_stage_sessions", "satisfied",
+			"ALTER TABLE artifact_checkpoint_stage_sessions ADD COLUMN satisfied INTEGER NOT NULL DEFAULT 0",
+		},
+		{
+			"artifact_export_queue", "rejected_generation",
+			"ALTER TABLE artifact_export_queue ADD COLUMN rejected_generation INTEGER",
+		},
+		{
+			"artifact_export_queue", "last_error",
+			"ALTER TABLE artifact_export_queue ADD COLUMN last_error TEXT NOT NULL DEFAULT ''",
+		},
+		{
+			"artifact_export_queue", "rejected_at",
+			"ALTER TABLE artifact_export_queue ADD COLUMN rejected_at TEXT",
+		},
+		{
 			"sessions", "display_name",
 			"ALTER TABLE sessions ADD COLUMN display_name TEXT",
+		},
+		{
+			// Preserve the current parent exactly once when the private parser
+			// provenance column is introduced. Running the UPDATE on every open
+			// would let a later linker-derived effective parent overwrite it.
+			"sessions", "parser_parent_session_id",
+			"ALTER TABLE sessions ADD COLUMN parser_parent_session_id TEXT;" +
+				" UPDATE sessions SET parser_parent_session_id = parent_session_id",
 		},
 		{
 			"sessions", "session_name",
@@ -1705,6 +1881,10 @@ func schemaColumnMigrations() []schemaColumnMigration {
 		{
 			"messages", "source_subtype",
 			"ALTER TABLE messages ADD COLUMN source_subtype TEXT NOT NULL DEFAULT ''",
+		},
+		{
+			"messages", "prompt_source",
+			"ALTER TABLE messages ADD COLUMN prompt_source TEXT NOT NULL DEFAULT ''",
 		},
 		{
 			"messages", "source_uuid",
@@ -1875,6 +2055,10 @@ func schemaColumnMigrations() []schemaColumnMigration {
 			"ALTER TABLE sessions ADD COLUMN entrypoint TEXT NOT NULL DEFAULT ''",
 		},
 		{
+			"sessions", "session_kind",
+			"ALTER TABLE sessions ADD COLUMN session_kind TEXT NOT NULL DEFAULT ''",
+		},
+		{
 			"sessions", "transcript_fidelity",
 			"ALTER TABLE sessions ADD COLUMN transcript_fidelity TEXT NOT NULL DEFAULT ''",
 		},
@@ -1993,6 +2177,10 @@ func schemaColumnMigrations() []schemaColumnMigration {
 			"ALTER TABLE worktree_project_mappings ADD COLUMN layout TEXT NOT NULL DEFAULT 'explicit'",
 		},
 		{
+			"worktree_project_mappings", "original_project",
+			"ALTER TABLE worktree_project_mappings ADD COLUMN original_project TEXT NOT NULL DEFAULT ''",
+		},
+		{
 			"project_identity_observations", "session_id",
 			"ALTER TABLE project_identity_observations ADD COLUMN session_id TEXT NOT NULL DEFAULT ''",
 		},
@@ -2035,11 +2223,31 @@ func schemaColumnMigrations() []schemaColumnMigration {
 	}
 }
 
-func applySchemaColumnMigrations(
-	queryRow func(string, ...any) rowScanner,
-	exec func(string, ...any) (sql.Result, error),
-) error {
-	return applyColumnMigrations(schemaColumnMigrations(), queryRow, exec)
+func applySchemaColumnMigrations(w *writerHandle) error {
+	tx, err := w.BeginTx(context.Background(), nil)
+	if err != nil {
+		return fmt.Errorf("starting column migration transaction: %w", err)
+	}
+	defer func() { _ = tx.Rollback() }()
+
+	if _, err := tx.Exec(provider_freshnessDDL); err != nil {
+		return fmt.Errorf(
+			"creating provider_freshness side-table: %w", err)
+	}
+
+	if err := applyColumnMigrations(
+		schemaColumnMigrations(),
+		func(query string, args ...any) rowScanner {
+			return tx.QueryRow(query, args...)
+		},
+		tx.Exec,
+	); err != nil {
+		return err
+	}
+	if err := tx.Commit(); err != nil {
+		return fmt.Errorf("committing column migrations: %w", err)
+	}
+	return nil
 }
 
 func applyColumnMigrations(
@@ -2124,6 +2332,152 @@ func repairLegacySchemaBeforeInit(w *writerHandle) error {
 	return nil
 }
 
+// artifactSessionQueueTriggerDropsSQL and artifactSessionQueueTriggerCreatesSQL
+// together keep the three sessions-table triggers that populate
+// artifact_export_queue upgradable across releases. They are applied here
+// rather than in schema.sql because the CREATE bodies reference columns added
+// by applySchemaColumnMigrations; running them at schema-init time would fire
+// "no such column" errors against a legacy archive before those columns
+// exist.
+//
+// The drops run BEFORE applySchemaColumnMigrations and the creates run AFTER:
+// a trigger left over from a previous release must not still be attached to
+// the sessions table while column migrations run, because a future
+// migration that rebuilds the table (rather than a plain ALTER TABLE ADD
+// COLUMN) would fail against a trigger body referencing columns mid-rebuild.
+// Splitting the DDL this way keeps the table trigger-free for the duration
+// of the migration step regardless of what a later migration needs to do.
+//
+// Every trigger additionally gates on the presence of an artifact origin
+// (pg_sync_state key artifact_origin_id) so that archives which have never
+// created or adopted an artifact origin never populate the export queue.
+const artifactSessionQueueTriggerDropsSQL = `
+DROP TRIGGER IF EXISTS artifact_sessions_insert_queue;
+DROP TRIGGER IF EXISTS artifact_sessions_update_queue;
+DROP TRIGGER IF EXISTS artifact_sessions_delete_queue;
+`
+
+const artifactSessionQueueTriggerCreatesSQL = `
+CREATE TRIGGER IF NOT EXISTS artifact_sessions_insert_queue
+AFTER INSERT ON sessions WHEN (
+    NEW.machine = 'local' OR EXISTS (
+        SELECT 1 FROM pg_sync_state
+        WHERE key = 'artifact_local_machine_name' AND value = NEW.machine
+    )
+) AND EXISTS (
+    SELECT 1 FROM pg_sync_state WHERE key = 'artifact_origin_id'
+) BEGIN
+    INSERT INTO artifact_export_queue(session_id) VALUES (NEW.id)
+    ON CONFLICT(session_id) DO UPDATE SET
+        enqueued_at = CASE WHEN pending = 0
+            THEN strftime('%Y-%m-%dT%H:%M:%fZ','now') ELSE enqueued_at END,
+        generation = generation + 1,
+        pending = 1,
+        rejected_generation = NULL,
+        last_error = '',
+        rejected_at = NULL;
+END;
+
+CREATE TRIGGER IF NOT EXISTS artifact_sessions_update_queue
+AFTER UPDATE ON sessions
+WHEN (
+    OLD.machine = 'local' OR NEW.machine = 'local' OR EXISTS (
+        SELECT 1 FROM pg_sync_state
+        WHERE key = 'artifact_local_machine_name'
+          AND (value = OLD.machine OR value = NEW.machine)
+    )
+) AND EXISTS (
+    SELECT 1 FROM pg_sync_state WHERE key = 'artifact_origin_id'
+) AND (
+    OLD.project IS NOT NEW.project OR
+    OLD.machine IS NOT NEW.machine OR
+    OLD.agent IS NOT NEW.agent OR
+    OLD.agent_label IS NOT NEW.agent_label OR
+    OLD.entrypoint IS NOT NEW.entrypoint OR
+    OLD.session_kind IS NOT NEW.session_kind OR
+    OLD.first_message IS NOT NEW.first_message OR
+    OLD.display_name IS NOT NEW.display_name OR
+    OLD.session_name IS NOT NEW.session_name OR
+    OLD.started_at IS NOT NEW.started_at OR
+    OLD.ended_at IS NOT NEW.ended_at OR
+    OLD.message_count IS NOT NEW.message_count OR
+    OLD.user_message_count IS NOT NEW.user_message_count OR
+    OLD.transcript_revision IS NOT NEW.transcript_revision OR
+    OLD.parent_session_id IS NOT NEW.parent_session_id OR
+    OLD.relationship_type IS NOT NEW.relationship_type OR
+    OLD.total_output_tokens IS NOT NEW.total_output_tokens OR
+    OLD.peak_context_tokens IS NOT NEW.peak_context_tokens OR
+    OLD.has_total_output_tokens IS NOT NEW.has_total_output_tokens OR
+    OLD.has_peak_context_tokens IS NOT NEW.has_peak_context_tokens OR
+    OLD.is_automated IS NOT NEW.is_automated OR
+    OLD.tool_failure_signal_count IS NOT NEW.tool_failure_signal_count OR
+    OLD.tool_retry_count IS NOT NEW.tool_retry_count OR
+    OLD.edit_churn_count IS NOT NEW.edit_churn_count OR
+    OLD.consecutive_failure_max IS NOT NEW.consecutive_failure_max OR
+    OLD.outcome IS NOT NEW.outcome OR
+    OLD.outcome_confidence IS NOT NEW.outcome_confidence OR
+    OLD.ended_with_role IS NOT NEW.ended_with_role OR
+    OLD.final_failure_streak IS NOT NEW.final_failure_streak OR
+    OLD.signals_pending_since IS NOT NEW.signals_pending_since OR
+    OLD.compaction_count IS NOT NEW.compaction_count OR
+    OLD.mid_task_compaction_count IS NOT NEW.mid_task_compaction_count OR
+    OLD.context_pressure_max IS NOT NEW.context_pressure_max OR
+    OLD.health_score IS NOT NEW.health_score OR
+    OLD.health_grade IS NOT NEW.health_grade OR
+    OLD.has_tool_calls IS NOT NEW.has_tool_calls OR
+    OLD.has_context_data IS NOT NEW.has_context_data OR
+    OLD.quality_signal_version IS NOT NEW.quality_signal_version OR
+    OLD.short_prompt_count IS NOT NEW.short_prompt_count OR
+    OLD.unstructured_start IS NOT NEW.unstructured_start OR
+    OLD.missing_success_criteria_count IS NOT NEW.missing_success_criteria_count OR
+    OLD.missing_verification_count IS NOT NEW.missing_verification_count OR
+    OLD.duplicate_prompt_count IS NOT NEW.duplicate_prompt_count OR
+    OLD.no_code_context_count IS NOT NEW.no_code_context_count OR
+    OLD.runaway_tool_loop_count IS NOT NEW.runaway_tool_loop_count OR
+    OLD.data_version IS NOT NEW.data_version OR
+    OLD.cwd IS NOT NEW.cwd OR
+    OLD.git_branch IS NOT NEW.git_branch OR
+    OLD.source_session_id IS NOT NEW.source_session_id OR
+    OLD.source_version IS NOT NEW.source_version OR
+    OLD.transcript_fidelity IS NOT NEW.transcript_fidelity OR
+    OLD.parser_malformed_lines IS NOT NEW.parser_malformed_lines OR
+    OLD.is_truncated IS NOT NEW.is_truncated OR
+    OLD.deleted_at IS NOT NEW.deleted_at OR
+    OLD.created_at IS NOT NEW.created_at OR
+    OLD.termination_status IS NOT NEW.termination_status
+) BEGIN
+    INSERT INTO artifact_export_queue(session_id) VALUES (NEW.id)
+    ON CONFLICT(session_id) DO UPDATE SET
+        enqueued_at = CASE WHEN pending = 0
+            THEN strftime('%Y-%m-%dT%H:%M:%fZ','now') ELSE enqueued_at END,
+        generation = generation + 1,
+        pending = 1,
+        rejected_generation = NULL,
+        last_error = '',
+        rejected_at = NULL;
+END;
+
+CREATE TRIGGER IF NOT EXISTS artifact_sessions_delete_queue
+BEFORE DELETE ON sessions WHEN (
+    OLD.machine = 'local' OR EXISTS (
+        SELECT 1 FROM pg_sync_state
+        WHERE key = 'artifact_local_machine_name' AND value = OLD.machine
+    )
+) AND EXISTS (
+    SELECT 1 FROM pg_sync_state WHERE key = 'artifact_origin_id'
+) BEGIN
+    INSERT INTO artifact_export_queue(session_id) VALUES (OLD.id)
+    ON CONFLICT(session_id) DO UPDATE SET
+        enqueued_at = CASE WHEN pending = 0
+            THEN strftime('%Y-%m-%dT%H:%M:%fZ','now') ELSE enqueued_at END,
+        generation = generation + 1,
+        pending = 1,
+        rejected_generation = NULL,
+        last_error = '',
+        rejected_at = NULL;
+END;
+`
+
 // migrateColumns adds columns introduced by this branch to databases created
 // by older releases, then runs the data repairs required by a normal writable
 // startup. Schema-only callers use applySchemaColumnMigrations directly.
@@ -2131,8 +2485,20 @@ func (db *DB) migrateColumns() error {
 	db.mu.Lock()
 	defer db.mu.Unlock()
 	w := db.getWriter()
-	if err := applySchemaColumnMigrations(w.QueryRow, w.Exec); err != nil {
+	if err := migrateMoneyColumnsLocked(w); err != nil {
 		return err
+	}
+	if _, err := w.Exec(modelPricingBandsSchemaSQL); err != nil {
+		return fmt.Errorf("creating model pricing bands: %w", err)
+	}
+	if _, err := w.Exec(artifactSessionQueueTriggerDropsSQL); err != nil {
+		return fmt.Errorf("dropping artifact session queue triggers: %w", err)
+	}
+	if err := applySchemaColumnMigrations(w); err != nil {
+		return err
+	}
+	if _, err := w.Exec(artifactSessionQueueTriggerCreatesSQL); err != nil {
+		return fmt.Errorf("installing artifact session queue triggers: %w", err)
 	}
 	if err := installSyncMarkerSchemaLocked(w); err != nil {
 		return err
@@ -2207,6 +2573,7 @@ func (db *DB) migrateColumns() error {
 			path_prefix TEXT NOT NULL,
 			layout      TEXT NOT NULL DEFAULT 'explicit',
 			project     TEXT NOT NULL,
+			original_project TEXT NOT NULL DEFAULT '',
 			enabled     INTEGER NOT NULL DEFAULT 1,
 			created_at  TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%fZ','now')),
 			updated_at  TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%fZ','now')),
@@ -2274,6 +2641,10 @@ func (db *DB) migrateColumns() error {
 			key                TEXT NOT NULL DEFAULT '',
 			FOREIGN KEY (session_id) REFERENCES sessions(id) ON DELETE CASCADE
 		);
+		CREATE INDEX IF NOT EXISTS idx_session_project_identity_snapshots_evidence
+			ON session_project_identity_snapshots(
+				machine, root_path, git_remote, observed_at DESC, session_id
+			);
 	`); err != nil {
 		return fmt.Errorf(
 			"creating project identity metadata: %w", err,
@@ -2295,6 +2666,9 @@ func (db *DB) migrateColumns() error {
 	if err := db.ensureCursorUsageEventsSchemaLocked(w); err != nil {
 		return err
 	}
+	if err := requeueInvalidArtifactPublicationsLocked(w); err != nil {
+		return err
+	}
 
 	runRepair, err := db.shouldRunTokenCoverageRepairLocked(w)
 	if err != nil {
@@ -2308,6 +2682,192 @@ func (db *DB) migrateColumns() error {
 	}
 	if err := db.markTokenCoverageRepairDoneLocked(w); err != nil {
 		return err
+	}
+	return nil
+}
+
+const modelPricingBandsSchemaSQL = `
+CREATE TABLE IF NOT EXISTS model_pricing_bands (
+    model_pattern TEXT NOT NULL
+        REFERENCES model_pricing(model_pattern) ON DELETE CASCADE,
+    above_input_tokens INTEGER NOT NULL CHECK (above_input_tokens > 0),
+    input_microdollars_per_mtok INTEGER NOT NULL,
+    output_microdollars_per_mtok INTEGER NOT NULL,
+    cache_creation_microdollars_per_mtok INTEGER NOT NULL,
+    cache_read_microdollars_per_mtok INTEGER NOT NULL,
+    updated_at TEXT NOT NULL
+        DEFAULT (strftime('%Y-%m-%dT%H:%M:%fZ','now')),
+    PRIMARY KEY (model_pattern, above_input_tokens)
+);`
+
+const (
+	bootstrapArtifactExportQueueSQL = `
+		INSERT OR IGNORE INTO artifact_export_queue(session_id)
+		SELECT id FROM sessions
+		WHERE (
+			machine = 'local' OR machine = (
+				SELECT value FROM pg_sync_state
+				WHERE key = 'artifact_local_machine_name'
+			)
+		) AND deleted_at IS NULL`
+	requeueArtifactExportsSQL = `
+		INSERT INTO artifact_export_queue(session_id)
+		SELECT id FROM sessions
+		WHERE (
+			machine = 'local' OR machine = (
+				SELECT value FROM pg_sync_state
+				WHERE key = 'artifact_local_machine_name'
+			)
+		) AND deleted_at IS NULL
+		ON CONFLICT(session_id) DO UPDATE SET
+			enqueued_at = CASE WHEN pending = 0
+				THEN strftime('%Y-%m-%dT%H:%M:%fZ','now') ELSE enqueued_at END,
+			generation = generation + 1,
+			pending = 1,
+			rejected_generation = NULL,
+			last_error = '',
+			rejected_at = NULL`
+	requeueArtifactOriginExportsSQL = `
+		INSERT INTO artifact_export_queue(session_id)
+		SELECT id FROM sessions
+		WHERE (
+			machine = 'local' OR machine = (
+				SELECT value FROM pg_sync_state
+				WHERE key = 'artifact_local_machine_name'
+			)
+		) AND deleted_at IS NULL
+		UNION
+		SELECT session_id FROM artifact_publications
+		WHERE origin = ?
+		ON CONFLICT(session_id) DO UPDATE SET
+			enqueued_at = CASE WHEN pending = 0
+				THEN strftime('%Y-%m-%dT%H:%M:%fZ','now') ELSE enqueued_at END,
+			generation = generation + 1,
+			pending = 1,
+			rejected_generation = NULL,
+			last_error = '',
+			rejected_at = NULL`
+)
+
+func requeueInvalidArtifactPublicationsLocked(w *writerHandle) error {
+	_, err := w.Exec(`
+		INSERT INTO artifact_export_queue(session_id)
+		SELECT session_id
+		FROM artifact_publications
+		WHERE origin = (
+			SELECT value FROM pg_sync_state WHERE key = 'artifact_origin_id'
+		) AND (session_id = '' OR instr(session_id, '~') > 0)
+		ON CONFLICT(session_id) DO UPDATE SET
+			enqueued_at = strftime('%Y-%m-%dT%H:%M:%fZ','now'),
+			generation = artifact_export_queue.generation + 1,
+			pending = 1,
+			rejected_generation = NULL,
+			last_error = '',
+			rejected_at = NULL
+		WHERE artifact_export_queue.pending = 0`)
+	if err != nil {
+		return fmt.Errorf("requeueing invalid artifact publications: %w", err)
+	}
+	return nil
+}
+
+var populateArtifactOriginQueueTx = func(tx *sql.Tx, origin string, requeue bool) error {
+	statement := bootstrapArtifactExportQueueSQL
+	action := "bootstrapping"
+	args := []any(nil)
+	if requeue {
+		statement = requeueArtifactOriginExportsSQL
+		action = "requeueing"
+		args = append(args, origin)
+	}
+	if _, err := tx.Exec(statement, args...); err != nil {
+		return fmt.Errorf("%s artifact export queue: %w", action, err)
+	}
+	return nil
+}
+
+// EnsureArtifactOrigin atomically persists candidate when no origin exists and
+// bootstraps every pre-existing local session into the export queue. A
+// concurrent initializer's committed origin wins and is returned unchanged.
+func (db *DB) EnsureArtifactOrigin(candidate string) (string, error) {
+	return db.setArtifactOrigin(candidate, false)
+}
+
+// AdoptArtifactOrigin atomically persists an authoritative configured origin
+// and populates its export queue. Replacing an established origin re-dirties
+// every live local session so clean rows from the previous origin are
+// published again.
+func (db *DB) AdoptArtifactOrigin(origin string) error {
+	_, err := db.setArtifactOrigin(origin, true)
+	return err
+}
+
+func (db *DB) setArtifactOrigin(origin string, adopt bool) (string, error) {
+	resolved := origin
+	err := db.Update(func(tx *sql.Tx) error {
+		if err := lockArtifactPublicationTx(context.Background(), tx); err != nil {
+			return err
+		}
+		var existing string
+		err := tx.QueryRow(
+			`SELECT value FROM pg_sync_state WHERE key = 'artifact_origin_id'`,
+		).Scan(&existing)
+		if err != nil && !errors.Is(err, sql.ErrNoRows) {
+			return fmt.Errorf("reading artifact origin: %w", err)
+		}
+		if err == nil && existing != "" {
+			if !adopt || existing == origin {
+				resolved = existing
+				return nil
+			}
+		}
+		if _, err := tx.Exec(
+			`INSERT INTO pg_sync_state (key, value)
+			 VALUES ('artifact_origin_id', ?)
+			 ON CONFLICT(key) DO UPDATE SET value = excluded.value`,
+			origin,
+		); err != nil {
+			return fmt.Errorf("persisting artifact origin: %w", err)
+		}
+		if err := populateArtifactOriginQueueTx(tx, origin, true); err != nil {
+			return err
+		}
+		resolved = origin
+		return nil
+	})
+	if err != nil {
+		return "", err
+	}
+	return resolved, nil
+}
+
+// BootstrapArtifactExportQueue enqueues every live locally-owned session
+// once. Called by maintenance and tests that already own origin lifecycle;
+// normal origin initialization uses EnsureArtifactOrigin so the origin and
+// queue commit atomically.
+func (db *DB) BootstrapArtifactExportQueue() error {
+	db.mu.Lock()
+	defer db.mu.Unlock()
+	_, err := db.getWriter().Exec(bootstrapArtifactExportQueueSQL)
+	if err != nil {
+		return fmt.Errorf("bootstrapping artifact export queue: %w", err)
+	}
+	return nil
+}
+
+// RequeueAllArtifactExports forces every live locally-owned session pending
+// with a bumped generation. Called when a divergent artifact origin is
+// adopted: BootstrapArtifactExportQueue is INSERT OR IGNORE, so a session
+// already acknowledged (pending=0) under the previous origin would be skipped
+// and never re-verified under the new origin. This re-dirties the ledger so
+// the new origin publishes every owned session. The ON CONFLICT clause matches
+// the session queue triggers' generation semantics.
+func (db *DB) RequeueAllArtifactExports() error {
+	db.mu.Lock()
+	defer db.mu.Unlock()
+	_, err := db.getWriter().Exec(requeueArtifactExportsSQL)
+	if err != nil {
+		return fmt.Errorf("requeueing artifact export queue: %w", err)
 	}
 	return nil
 }
@@ -2511,6 +3071,14 @@ func (db *DB) createPartialIndexesLocked(w *writerHandle) error {
 		 WHERE token_usage != ''
 		   AND model != ''
 		   AND model != '<synthetic>'`,
+		`CREATE INDEX IF NOT EXISTS idx_messages_claude_snapshot
+		 ON messages(claude_message_id, claude_request_id,
+		             timestamp, session_id, ordinal)
+		 WHERE token_usage != ''
+		   AND model != ''
+		   AND model != '<synthetic>'
+		   AND claude_message_id != ''
+		   AND claude_request_id != ''`,
 		`CREATE INDEX IF NOT EXISTS idx_sessions_has_secret
 		 ON sessions(secret_leak_count) WHERE secret_leak_count > 0`,
 	}
@@ -2558,6 +3126,11 @@ func (db *DB) createPartialIndexesLocked(w *writerHandle) error {
 		`DROP INDEX IF EXISTS idx_messages_usage_timestamp`,
 	); err != nil {
 		return fmt.Errorf("dropping legacy usage index: %w", err)
+	}
+	if _, err := w.Exec(
+		`DROP INDEX IF EXISTS idx_artifact_checkpoint_stage_pending`,
+	); err != nil {
+		return fmt.Errorf("dropping superseded artifact stage index: %w", err)
 	}
 	// Superseded by idx_recall_extract_progress_retry (schema.sql), whose
 	// trailing updated_at column serves the same prefix.
@@ -2864,6 +3437,7 @@ func (db *DB) backfillMessageTokenCoverageLocked(
 	}
 	defer stmt.Close()
 
+	sessions := make(map[string]struct{})
 	for _, candidate := range candidates {
 		if _, err := stmt.Exec(
 			candidate.hasContext, candidate.hasOutput, candidate.id,
@@ -2872,6 +3446,12 @@ func (db *DB) backfillMessageTokenCoverageLocked(
 				"updating message token backfill %d: %w",
 				candidate.id, err,
 			)
+		}
+		sessions[candidate.sessionID] = struct{}{}
+	}
+	for sessionID := range sessions {
+		if err := enqueueArtifactExportTx(tx, sessionID); err != nil {
+			return 0, err
 		}
 	}
 	if err := tx.Commit(); err != nil {
@@ -2887,7 +3467,7 @@ func (db *DB) messageTokenCoverageBackfillCandidatesLocked(
 	w *writerHandle,
 ) ([]messageTokenCoverageBackfillCandidate, error) {
 	rows, err := w.Query(
-		`SELECT id, token_usage, context_tokens, output_tokens,
+		`SELECT id, session_id, token_usage, context_tokens, output_tokens,
 			has_context_tokens, has_output_tokens
 		 FROM messages
 		 WHERE (has_context_tokens = 0 OR has_output_tokens = 0)
@@ -2905,11 +3485,12 @@ func (db *DB) messageTokenCoverageBackfillCandidatesLocked(
 	var candidates []messageTokenCoverageBackfillCandidate
 	for rows.Next() {
 		var id int64
+		var sessionID string
 		var tokenUsage string
 		var contextTokens, outputTokens int
 		var hasContextTokens, hasOutputTokens bool
 		if err := rows.Scan(
-			&id, &tokenUsage, &contextTokens,
+			&id, &sessionID, &tokenUsage, &contextTokens,
 			&outputTokens, &hasContextTokens,
 			&hasOutputTokens,
 		); err != nil {
@@ -2927,6 +3508,7 @@ func (db *DB) messageTokenCoverageBackfillCandidatesLocked(
 		}
 		candidates = append(candidates, messageTokenCoverageBackfillCandidate{
 			id:         id,
+			sessionID:  sessionID,
 			hasContext: hasContext,
 			hasOutput:  hasOutput,
 		})
@@ -2939,6 +3521,7 @@ func (db *DB) messageTokenCoverageBackfillCandidatesLocked(
 
 type messageTokenCoverageBackfillCandidate struct {
 	id         int64
+	sessionID  string
 	hasContext bool
 	hasOutput  bool
 }
@@ -3162,7 +3745,7 @@ func openAndInit(path string, schemaRepairNeeded bool) (*DB, error) {
 		return nil, fmt.Errorf("configuring wal: %w", err)
 	}
 
-	reader, err := sql.Open("sqlite3", makeDSN(path, true))
+	reader, err := sql.Open(sqliteUsageDriverName, makeDSN(path, true))
 	if err != nil {
 		writer.Close()
 		return nil, fmt.Errorf("opening reader: %w", err)
@@ -3780,7 +4363,7 @@ func (db *DB) reopenLocked() error {
 	}
 
 	reader, err := sql.Open(
-		"sqlite3", makeDSN(db.path, true),
+		sqliteUsageDriverName, makeDSN(db.path, true),
 	)
 	if err != nil {
 		writer.Close()
@@ -3999,6 +4582,16 @@ func (db *DB) DeleteSyncStateByPrefix(prefix string) error {
 	_, err := db.getWriter().Exec(
 		"DELETE FROM pg_sync_state WHERE key LIKE ? ESCAPE '\\'",
 		escaped+"%",
+	)
+	return err
+}
+
+// DeleteSyncState removes the pg_sync_state row for exactly key, if present.
+func (db *DB) DeleteSyncState(key string) error {
+	db.mu.Lock()
+	defer db.mu.Unlock()
+	_, err := db.getWriter().Exec(
+		"DELETE FROM pg_sync_state WHERE key = ?", key,
 	)
 	return err
 }

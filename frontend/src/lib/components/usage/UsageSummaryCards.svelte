@@ -2,10 +2,11 @@
   import { Card } from "@kenn-io/kit-ui";
   import { usage } from "../../stores/usage.svelte.js";
   import { m } from "../../i18n/index.js";
-
-  function fmtCost(v: number): string {
-    return `$${v.toFixed(2)}`;
-  }
+  import { ZERO_MONEY, compareMoney, divideMoney, formatMoney } from "../../money.js";
+  import {
+    ALL_TOKEN_TYPES,
+    sumSelectedTokens,
+  } from "../../stores/usageTokenTypes.js";
 
   function fmtTokens(v: number): string {
     if (v >= 1_000_000_000) {
@@ -46,7 +47,12 @@
   );
 
   const totalTokens = $derived(
-    inputTokens + outputTokens + cacheCreationTokens + cacheReadTokens,
+    usage.summary
+      ? sumSelectedTokens(
+          usage.summary.totals,
+          usage.selectedTokenTypes,
+        )
+      : 0,
   );
 
   // "cached" here means input tokens that were actually
@@ -61,63 +67,86 @@
 
   const dailyBurnCost = $derived.by(() => {
     const s = usage.summary;
-    if (!s || !s.daily || s.daily.length === 0) return 0;
-    return s.totals.totalCost / s.daily.length;
+    if (!s || !s.daily || s.daily.length === 0) return ZERO_MONEY;
+    return divideMoney(s.totals.totalCost, s.daily.length);
   });
 
   const dailyBurnTokens = $derived.by(() => {
-    const s = usage.summary;
-    if (!s || !s.daily || s.daily.length === 0) return 0;
-    let total = 0;
-    for (const d of s.daily) {
-      total += d.inputTokens + d.outputTokens + d.cacheCreationTokens + d.cacheReadTokens;
-    }
-    return total / s.daily.length;
+    const daily = usage.summary?.daily;
+    if (!daily || daily.length === 0) return 0;
+    return daily.reduce(
+      (total, day) =>
+        total + breakdownTokens(day),
+      0,
+    ) / daily.length;
   });
 
   const peakCost = $derived.by(() => {
     const s = usage.summary;
     if (!s || !s.daily || s.daily.length === 0) {
-      return { date: "", value: 0 };
+      return { date: "", cost: ZERO_MONEY };
     }
     let best = s.daily[0]!;
     for (const d of s.daily) {
-      if (d.totalCost > best.totalCost) best = d;
+      if (compareMoney(d.totalCost, best.totalCost) > 0) best = d;
     }
-    return { date: best.date, value: best.totalCost };
+    return { date: best.date, cost: best.totalCost };
   });
 
   const peakTokens = $derived.by(() => {
-    const s = usage.summary;
-    if (!s || !s.daily || s.daily.length === 0) {
+    const daily = usage.summary?.daily;
+    if (!daily || daily.length === 0) {
       return { date: "", value: 0 };
     }
-    let best = s.daily[0]!;
-    let bestTokens = best.inputTokens + best.outputTokens + best.cacheCreationTokens + best.cacheReadTokens;
-    for (const d of s.daily) {
-      const dTokens = d.inputTokens + d.outputTokens + d.cacheCreationTokens + d.cacheReadTokens;
-      if (dTokens > bestTokens) {
-        best = d;
-        bestTokens = dTokens;
+    let best = daily[0]!;
+    let bestTokens = breakdownTokens(best);
+    for (const day of daily) {
+      const tokens = breakdownTokens(day);
+      if (tokens > bestTokens) {
+        best = day;
+        bestTokens = tokens;
       }
     }
     return { date: best.date, value: bestTokens };
   });
 
+  function breakdownTokens(day: {
+    inputTokens: number;
+    outputTokens: number;
+    cacheCreationTokens: number;
+    cacheReadTokens: number;
+  }): number {
+    return sumSelectedTokens(day, usage.selectedTokenTypes);
+  }
+
+  function selectedTokenLabel(): string {
+    if (usage.selectedTokenTypes.length === ALL_TOKEN_TYPES.length) {
+      return m.usage_summary_total_tokens();
+    }
+    if (usage.selectedTokenTypes.length !== 1) {
+      return m.usage_selected_tokens();
+    }
+    switch (usage.selectedTokenTypes[0]) {
+      case "input":
+        return m.usage_summary_input_tokens();
+      case "cache_write":
+        return m.usage_cache_writes();
+      case "cache_read":
+        return m.usage_cache_reads();
+      case "output":
+        return m.analytics_metric_output_tokens();
+    }
+    return m.usage_selected_tokens();
+  }
+
   const activeDays = $derived.by(() => {
     const daily = usage.summary?.daily;
     if (!daily) return 0;
-    if (isTokenMode) {
-      return daily.filter(
-        (d) =>
-          d.inputTokens +
-            d.outputTokens +
-            d.cacheCreationTokens +
-            d.cacheReadTokens >
-          0,
-      ).length;
-    }
-    return daily.filter((d) => d.totalCost > 0).length;
+    return daily.filter((day) =>
+      isTokenMode
+        ? breakdownTokens(day) > 0
+        : day.totalCost.microdollars > 0
+    ).length;
   });
 
   const vsPrior = $derived.by(() => {
@@ -142,9 +171,9 @@
 
   const cards = $derived.by(() => {
     if (isTokenMode) {
-      const baseCards: Card[] = [
+      return [
         {
-          label: () => m.usage_summary_total_tokens(),
+          label: selectedTokenLabel,
           value: () => fmtTokens(totalTokens),
           featured: true,
         },
@@ -174,8 +203,7 @@
         },
         {
           label: () => m.usage_summary_cache_hit(),
-          value: () =>
-            fmtPct(usage.summary?.cacheStats.hitRate ?? 0),
+          value: () => fmtPct(usage.summary?.cacheStats.hitRate ?? 0),
         },
         {
           label: () => m.analytics_summary_projects(),
@@ -188,21 +216,19 @@
         },
         {
           label: () => m.usage_models(),
-          value: () =>
-            String(usage.summary?.modelTotals.length ?? 0),
+          value: () => String(usage.summary?.modelTotals.length ?? 0),
         },
         {
           label: () => m.analytics_summary_active_days(),
           value: () => String(activeDays),
         },
-      ];
-      return baseCards;
+      ] satisfies Card[];
     }
 
     const baseCards: Card[] = [
       {
         label: () => m.usage_summary_total_cost(),
-        value: () => fmtCost(usage.summary?.totals.totalCost ?? 0),
+        value: () => formatMoney(usage.summary?.totals.totalCost ?? ZERO_MONEY),
         sub: () => vsPrior ?? "",
         featured: true,
       },
@@ -230,12 +256,12 @@
       },
       {
         label: () => m.usage_summary_daily_burn(),
-        value: () => fmtCost(dailyBurnCost),
+        value: () => formatMoney(dailyBurnCost),
         sub: () => m.usage_summary_avg_day(),
       },
       {
         label: () => m.usage_summary_peak_day(),
-        value: () => fmtCost(peakCost.value),
+        value: () => formatMoney(peakCost.cost),
         sub: () => peakCost.date,
       },
       {

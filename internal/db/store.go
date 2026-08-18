@@ -68,6 +68,13 @@ type Store interface {
 	ListProjectIdentityObservations(ctx context.Context, labels []string) ([]export.ProjectIdentityObservation, error)
 	BuildProjectIdentityMap(ctx context.Context, labels []string) (map[string]export.ProjectMapEntry, error)
 
+	// Data (archive inventory).
+	GetProjectInventory(ctx context.Context) (ProjectInventory, error)
+	ListProjectRules(ctx context.Context, machine string) (ProjectRules, error)
+	ListArchiveWorktreeCandidates(
+		ctx context.Context, request ArchiveWorktreeCandidateRequest,
+	) ([]WorktreeReclassificationCandidate, error)
+
 	// Analytics.
 	GetAnalyticsSummary(ctx context.Context, f AnalyticsFilter) (AnalyticsSummary, error)
 	GetAnalyticsActivity(ctx context.Context, f AnalyticsFilter, granularity string) (ActivityResponse, error)
@@ -145,6 +152,27 @@ type Store interface {
 
 	// ReadOnly returns true for remote/PG-backed stores.
 	ReadOnly() bool
+}
+
+// ActivityReportArtifactStore is the scalable Activity report extension used
+// by the server and direct CLI. Keeping it separate lets narrow test stores
+// continue implementing Store while all production stores provide artifacts.
+type ActivityReportArtifactStore interface {
+	BuildActivityReportArtifacts(
+		ctx context.Context,
+		f AnalyticsFilter,
+		q activity.Query,
+		onProgress activity.ProgressFunc,
+	) (activity.CandidateArtifacts, error)
+}
+
+type ActivityReportProbeStore interface {
+	ActivityReportSourceProbe(ctx context.Context) (activity.SourceProbe, error)
+}
+
+type ActivityReportTokenStore interface {
+	EncodeActivityReportToken(payload []byte) (string, error)
+	DecodeActivityReportToken(token string) ([]byte, error)
 }
 
 // Compile-time check: *DB satisfies Store.

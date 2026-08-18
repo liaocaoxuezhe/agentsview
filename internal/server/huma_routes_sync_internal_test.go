@@ -7,11 +7,14 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"log"
 	"net/http"
 	"net/http/httptest"
 	"net/url"
 	"os"
 	"path/filepath"
+	"strconv"
+	"strings"
 	stdlibsync "sync"
 	"testing"
 	"time"
@@ -39,15 +42,26 @@ type syncRouteFixture struct {
 }
 
 type syncRouteFixtureConfig struct {
-	stale        bool
-	remoteHosts  []config.RemoteHost
-	broadcaster  *Broadcaster
-	engine       *syncpkg.Engine
-	syncRunner   LocalSyncRunner
-	resyncRunner LocalResyncRunner
+	stale          bool
+	remoteHosts    []config.RemoteHost
+	disabledAgents []parser.AgentType
+	extraAgentDirs map[parser.AgentType][]string
+	broadcaster    *Broadcaster
+	engine         *syncpkg.Engine
+	syncRunner     LocalSyncRunner
+	resyncRunner   LocalResyncRunner
 }
 
 type syncRouteFixtureOption func(*syncRouteFixtureConfig)
+
+func captureServerLogOutput(t *testing.T) *bytes.Buffer {
+	t.Helper()
+	var buf bytes.Buffer
+	previous := log.Writer()
+	log.SetOutput(&buf)
+	t.Cleanup(func() { log.SetOutput(previous) })
+	return &buf
+}
 
 func withStaleDB() syncRouteFixtureOption {
 	return func(c *syncRouteFixtureConfig) { c.stale = true }
@@ -63,6 +77,16 @@ func withLocalResyncRunner(r LocalResyncRunner) syncRouteFixtureOption {
 
 func withRemoteHosts(hosts ...config.RemoteHost) syncRouteFixtureOption {
 	return func(c *syncRouteFixtureConfig) { c.remoteHosts = hosts }
+}
+
+func withDisabledAgents(
+	disabled []parser.AgentType,
+	dirs map[parser.AgentType][]string,
+) syncRouteFixtureOption {
+	return func(c *syncRouteFixtureConfig) {
+		c.disabledAgents = append([]parser.AgentType(nil), disabled...)
+		c.extraAgentDirs = dirs
+	}
 }
 
 func withBroadcasterForSyncRoutes(b *Broadcaster) syncRouteFixtureOption {
@@ -107,7 +131,11 @@ func newSyncRouteFixture(
 		AgentDirs: map[parser.AgentType][]string{
 			parser.AgentClaude: {claudeDir},
 		},
-		RemoteHosts: cfg.remoteHosts,
+		RemoteHosts:    cfg.remoteHosts,
+		DisabledAgents: cfg.disabledAgents,
+	}
+	for agent, dirs := range cfg.extraAgentDirs {
+		serverConfig.AgentDirs[agent] = append([]string(nil), dirs...)
 	}
 	var serverOptions []Option
 	if cfg.broadcaster != nil {
@@ -292,6 +320,7 @@ func stubRunHTTPRemoteSync(
 type fakePreparedHTTPRebuild struct {
 	contributors []syncpkg.RebuildContributor
 	closed       int
+	committed    int
 	closeErrors  []error
 }
 
@@ -307,6 +336,20 @@ func (p *fakePreparedHTTPRebuild) Close() error {
 		return p.closeErrors[p.closed-1]
 	}
 	return nil
+}
+
+func (p *fakePreparedHTTPRebuild) Commit() error {
+	p.committed++
+	return nil
+}
+
+func TestPreparedHTTPRebuildLeaseForwardsCommitOnce(t *testing.T) {
+	prepared := &fakePreparedHTTPRebuild{}
+	lease := &preparedHTTPRebuildLease{prepared: prepared, release: func() {}}
+	require.NoError(t, lease.Commit())
+	require.NoError(t, lease.Commit())
+	assert.Equal(t, 1, prepared.committed)
+	assert.Zero(t, prepared.closed, "commit must not infer cleanup")
 }
 
 func TestHTTPCoordinatorFailurePrefersContributorOverCleanupHost(t *testing.T) {
@@ -448,6 +491,7 @@ func TestRebuildCleanupFailureIsRetainedByHTTPCleanupRegistry(t *testing.T) {
 			func() (syncpkg.RebuildOptions, syncpkg.RebuildCleanup, error) {
 				return syncpkg.RebuildOptions{}, cleanup, nil
 			},
+			nil,
 			func(bool, bool) error { return nil },
 		)
 		return remotesync.SyncStats{}, err
@@ -492,6 +536,7 @@ func TestRunRemoteSyncRequestUnifiedHTTPContributorFailureSkipsSSH(t *testing.T)
 	) (preparedHTTPRebuild, error) {
 		require.Len(t, syncs, 1)
 		assert.Equal(t, "alpha", syncs[0].Host)
+		assert.Equal(t, remotesync.FullImportExplicit, syncs[0].FullReason)
 		return prepared, nil
 	})
 	sshCalls := 0
@@ -586,6 +631,7 @@ func TestRunRemoteSyncRequestContributorFailurePrecedesRetainedCleanupHost(t *te
 func TestRunRemoteSyncRequestUnifiedHTTPUsesMirrorDeltaAndBulkRebuild(t *testing.T) {
 	broadcaster := NewBroadcaster(0)
 	f := newSyncRouteFixture(t, withBroadcasterForSyncRoutes(broadcaster))
+	logs := captureServerLogOutput(t)
 	events, unsubscribe := broadcaster.Subscribe()
 	t.Cleanup(unsubscribe)
 	f.writeClaudeSession(t, "proj/local.jsonl", "unified local")
@@ -605,6 +651,9 @@ func TestRunRemoteSyncRequestUnifiedHTTPUsesMirrorDeltaAndBulkRebuild(t *testing
 	archiveRequests := 0
 	serverErrors := make(chan error, 8)
 	ts := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		assert.Equal(t, strconv.Itoa(remotesync.ProtocolVersion),
+			r.Header.Get(remotesync.ProtocolHeader))
+		remotesync.SetProtocolHeader(w.Header())
 		switch r.URL.Path {
 		case "/api/v1/remote-sync/targets":
 			w.Header().Set("Content-Type", "application/json")
@@ -647,22 +696,39 @@ func TestRunRemoteSyncRequestUnifiedHTTPUsesMirrorDeltaAndBulkRebuild(t *testing
 		}
 	}))
 	t.Cleanup(ts.Close)
-	host := config.RemoteHost{
+	hostAlpha := config.RemoteHost{
 		Host: "alpha", Transport: config.RemoteTransportHTTP,
 		URL: ts.URL, Token: "remote-token",
 	}
+	hostGamma := config.RemoteHost{
+		Host: "gamma", Transport: config.RemoteTransportHTTP,
+		URL: ts.URL, Token: "remote-token",
+	}
+	sshCalls := 0
+	stubRunRemoteSync(t, func(
+		_ context.Context, rs *ssh.RemoteSync,
+	) (ssh.SyncStats, error) {
+		assert.Equal(t, "beta", rs.Host)
+		sshCalls++
+		return ssh.SyncStats{}, nil
+	})
 
 	for range 2 {
 		response := f.srv.runRemoteSyncRequest(
 			context.Background(), f.db, f.srv.syncEngineForLocal(f.db),
 			remoteSyncRequest{
-				Full: true, IncludeLocal: true, Hosts: []config.RemoteHost{host},
+				Full: true, IncludeLocal: true,
+				Hosts: []config.RemoteHost{
+					hostGamma,
+					{Host: "beta", Transport: config.RemoteTransportSSH},
+					hostAlpha,
+				},
 			}, nil,
 		)
 		assert.Empty(t, response.Failures)
 		require.NotNil(t, response.LocalStats)
 		assert.False(t, response.LocalStats.Aborted)
-		assert.Equal(t, 2, response.LocalStats.Synced)
+		assert.Equal(t, 3, response.LocalStats.Synced)
 		select {
 		case event := <-events:
 			assert.Equal(t, "sync", event.Scope)
@@ -671,9 +737,54 @@ func TestRunRemoteSyncRequestUnifiedHTTPUsesMirrorDeltaAndBulkRebuild(t *testing
 		}
 	}
 
-	assert.Equal(t, 1, archiveRequests,
+	assert.Equal(t, 2, archiveRequests,
 		"unchanged full rebuild should reuse the prepared mirror")
-	assertSessionCount(t, f.db, 2)
+	assert.Equal(t, 2, sshCalls)
+	assertSessionCount(t, f.db, 3)
+	output := logs.String()
+	assert.Contains(t, output,
+		"remote sync HTTP contributors started: hosts=2")
+	assert.Contains(t, output,
+		"remote sync HTTP contributors finished: hosts=2")
+	for _, host := range []string{"alpha", "gamma"} {
+		assert.Equal(t, 2, strings.Count(output,
+			"remote sync HTTP host preparation started: host="+host))
+		assert.Equal(t, 2, strings.Count(output,
+			"remote sync HTTP host preparation finished: host="+host))
+		assert.Regexp(t,
+			"remote sync HTTP host preparation finished: host="+host+
+				`[^\n]*duration=[^\n]*outcome=completed`,
+			output,
+		)
+		assert.Equal(t, 2, strings.Count(output,
+			"remote sync host started: host="+host+
+				" transport=http full=true mode=unified_rebuild"))
+		assert.Equal(t, 2, strings.Count(output,
+			"remote sync host finished: host="+host+" transport=http"))
+		assert.Regexp(t,
+			"remote sync host finished: host="+host+
+				` transport=http[^\n]*sessions_synced=1`+
+				`[^\n]*sessions_total=1[^\n]*outcome=completed`,
+			output,
+		)
+	}
+	httpFinished := strings.Index(output,
+		"remote sync HTTP contributors finished: hosts=2")
+	sshStarted := strings.Index(output,
+		"remote sync host started: host=beta transport=ssh")
+	require.NotEqual(t, -1, httpFinished)
+	require.NotEqual(t, -1, sshStarted)
+	for _, host := range []string{"alpha", "gamma"} {
+		hostFinished := strings.Index(output,
+			"remote sync host finished: host="+host+" transport=http")
+		require.NotEqual(t, -1, hostFinished)
+		assert.Less(t, hostFinished, sshStarted,
+			"each HTTP contributor must finish before post-rebuild SSH work")
+	}
+	assert.Less(t, httpFinished, sshStarted,
+		"HTTP contributor completion must precede post-rebuild SSH work")
+	assert.Contains(t, output, "aggregate_synced=3")
+	assert.NotContains(t, output, "local_synced=")
 	select {
 	case err := <-serverErrors:
 		require.NoError(t, err)
@@ -804,6 +915,7 @@ func TestServerUsesInjectedHTTPRemoteCleanupRegistry(t *testing.T) {
 
 func TestRunRemoteSyncRequestCanceledRebuildReportsCancellation(t *testing.T) {
 	f := newSyncRouteFixture(t)
+	logs := captureServerLogOutput(t)
 	stubPrepareHTTPRebuild(t, func(
 		context.Context, []remotesync.HTTPSync,
 	) (preparedHTTPRebuild, error) {
@@ -827,6 +939,121 @@ func TestRunRemoteSyncRequestCanceledRebuildReportsCancellation(t *testing.T) {
 	assert.Equal(t, context.Canceled.Error(), response.Error)
 	assert.NotEqual(t, syncpkg.ErrUnifiedRebuildAborted.Error(), response.Error)
 	assert.Empty(t, response.Failures)
+	output := logs.String()
+	assert.Contains(t, output,
+		"remote sync request started: include_local=true full=true hosts=1")
+	assert.Contains(t, output, "remote sync request finished: include_local=true full=true")
+	assert.Contains(t, output, "duration=")
+	assert.Contains(t, output, "outcome=canceled")
+	assert.Contains(t, output, "error=\"context canceled\"")
+	assert.NotContains(t, output, "secret")
+}
+
+func TestRunRemoteSyncHostsOwnedLogsPerHostLifecycle(t *testing.T) {
+	f := newSyncRouteFixture(t)
+	logs := captureServerLogOutput(t)
+	privateURL := "http://example.invalid/private/archive?token=secret-token"
+	stubRunHTTPRemoteSync(t, func(
+		_ context.Context, rh config.RemoteHost, _ bool,
+	) (remotesync.SyncStats, error) {
+		if rh.Host == "alpha" {
+			return remotesync.SyncStats{
+				SessionsSynced: 3, SessionsTotal: 5, Skipped: 1,
+			}, nil
+		}
+		return remotesync.SyncStats{}, &url.Error{
+			Op: "Get", URL: privateURL, Err: errors.New("private response"),
+		}
+	})
+
+	failures, totals, err := f.srv.runRemoteSyncHostsOwned(
+		context.Background(), f.db,
+		[]config.RemoteHost{
+			{Host: "alpha", Transport: config.RemoteTransportHTTP, Token: "secret-token"},
+			{Host: "beta", Transport: config.RemoteTransportHTTP, Token: "secret-token"},
+		}, true, nil, true,
+	)
+
+	require.NoError(t, err)
+	require.Len(t, failures, 1)
+	assert.Equal(t, 3, totals.SessionsSynced)
+	assert.Equal(t, 5, totals.SessionsTotal)
+	assert.Equal(t, 1, totals.Skipped)
+	output := logs.String()
+	assert.Contains(t, output,
+		"remote sync host started: host=alpha transport=http full=true")
+	assert.Contains(t, output,
+		"remote sync host finished: host=alpha transport=http")
+	assert.Contains(t, output, "sessions_synced=3")
+	assert.Contains(t, output, "outcome=completed")
+	assert.Contains(t, output,
+		"remote sync host started: host=beta transport=http full=true")
+	assert.Contains(t, output,
+		"remote sync host finished: host=beta transport=http")
+	assert.Contains(t, output, "outcome=failed")
+	assert.Contains(t, output, "error=\"HTTP remote sync failed\"")
+	assert.NotContains(t, output, privateURL)
+	assert.NotContains(t, output, "secret-token")
+}
+
+func TestRunRemoteSyncRequestLogsRemoteOnlyAggregateStats(t *testing.T) {
+	f := newSyncRouteFixture(t)
+	logs := captureServerLogOutput(t)
+	stubRunHTTPRemoteSync(t, func(
+		_ context.Context, _ config.RemoteHost, _ bool,
+	) (remotesync.SyncStats, error) {
+		return remotesync.SyncStats{
+			SessionsSynced: 3, SessionsTotal: 5, Skipped: 1, Failed: 1,
+		}, nil
+	})
+
+	response := f.srv.runRemoteSyncRequest(
+		context.Background(), f.db, f.srv.syncEngineForLocal(f.db),
+		remoteSyncRequest{
+			Hosts: []config.RemoteHost{{
+				Host: "alpha", Transport: config.RemoteTransportHTTP,
+			}},
+		}, nil,
+	)
+
+	require.Empty(t, response.Error)
+	output := logs.String()
+	assert.Contains(t, output,
+		"aggregate_synced=3 aggregate_total=5 aggregate_skipped=1 aggregate_failed=1")
+}
+
+func TestRunRemoteSyncRequestCombinesMixedTransportAggregateStats(t *testing.T) {
+	f := newSyncRouteFixture(t)
+	logs := captureServerLogOutput(t)
+	stubRunHTTPRemoteSync(t, func(
+		_ context.Context, _ config.RemoteHost, _ bool,
+	) (remotesync.SyncStats, error) {
+		return remotesync.SyncStats{
+			SessionsSynced: 2, SessionsTotal: 3, Skipped: 1,
+		}, nil
+	})
+	stubRunRemoteSync(t, func(
+		_ context.Context, _ *ssh.RemoteSync,
+	) (ssh.SyncStats, error) {
+		return ssh.SyncStats{
+			SessionsSynced: 4, SessionsTotal: 5, Skipped: 2, Failed: 1,
+		}, nil
+	})
+
+	response := f.srv.runRemoteSyncRequest(
+		context.Background(), f.db, f.srv.syncEngineForLocal(f.db),
+		remoteSyncRequest{
+			Hosts: []config.RemoteHost{
+				{Host: "alpha", Transport: config.RemoteTransportHTTP},
+				{Host: "beta", Transport: config.RemoteTransportSSH},
+			},
+		}, nil,
+	)
+
+	require.Empty(t, response.Error)
+	output := logs.String()
+	assert.Contains(t, output,
+		"aggregate_synced=6 aggregate_total=8 aggregate_skipped=3 aggregate_failed=1")
 }
 
 func TestRunRemoteSyncRequestSanitizesWrappedContextErrors(t *testing.T) {
@@ -952,8 +1179,10 @@ func TestRunRemoteSyncRequestRemoteOnlyKeepsActiveHTTPPath(t *testing.T) {
 	f := newSyncRouteFixture(t)
 	prepareCalls := 0
 	stubPrepareHTTPRebuild(t, func(
-		context.Context, []remotesync.HTTPSync,
+		_ context.Context, syncs []remotesync.HTTPSync,
 	) (preparedHTTPRebuild, error) {
+		require.Len(t, syncs, 1)
+		assert.Equal(t, remotesync.FullImportDataRebuild, syncs[0].FullReason)
 		prepareCalls++
 		return &fakePreparedHTTPRebuild{}, nil
 	})
@@ -1898,6 +2127,9 @@ func TestSyncRemotesRejectsAdHocHTTP(t *testing.T) {
 func TestRunHTTPRemoteSyncReachesMirrorPath(t *testing.T) {
 	manifestRequests := 0
 	ts := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		assert.Equal(t, strconv.Itoa(remotesync.ProtocolVersion),
+			r.Header.Get(remotesync.ProtocolHeader))
+		remotesync.SetProtocolHeader(w.Header())
 		switch r.URL.Path {
 		case "/api/v1/remote-sync/targets":
 			w.Header().Set("Content-Type", "application/json")
@@ -1929,4 +2161,100 @@ func TestRunHTTPRemoteSyncReachesMirrorPath(t *testing.T) {
 	require.NoError(t, err)
 	assert.Equal(t, 1, manifestRequests,
 		"configured DataDir must route HTTP sync through the manifest/mirror path")
+}
+
+func TestRunHTTPRemoteSyncImportsLocallyDisabledProvider(t *testing.T) {
+	remoteRoot := t.TempDir()
+	remoteSession := filepath.Join(
+		remoteRoot, "tmp", "project", "chats", "session-remote.json",
+	)
+	require.NoError(t, os.MkdirAll(filepath.Dir(remoteSession), 0o755))
+	require.NoError(t, os.WriteFile(remoteSession, []byte(testjsonl.GeminiSessionJSON(
+		"remote-gemini", "project",
+		"2026-08-09T10:00:00Z", "2026-08-09T10:01:00Z",
+		[]map[string]any{testjsonl.GeminiUserMsg(
+			"user", "2026-08-09T10:00:00Z", "import remote session",
+		)},
+	)), 0o644))
+	targets := remotesync.TargetSet{Dirs: map[parser.AgentType][]string{
+		parser.AgentGemini: {remoteRoot},
+	}}
+	manifest, err := remotesync.BuildManifest(targets)
+	require.NoError(t, err)
+	serverErrors := make(chan error, 4)
+	ts := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		remotesync.SetProtocolHeader(w.Header())
+		switch r.URL.Path {
+		case "/api/v1/remote-sync/targets":
+			w.Header().Set("Content-Type", "application/json")
+			serverErrors <- json.NewEncoder(w).Encode(targets)
+		case "/api/v1/remote-sync/manifest":
+			w.Header().Set("Content-Type", "application/json")
+			serverErrors <- json.NewEncoder(w).Encode(manifest)
+		case "/api/v1/remote-sync/archive":
+			w.Header().Set("Content-Type", "application/x-tar")
+			serverErrors <- remotesync.WriteArchive(w, targets)
+		default:
+			http.NotFound(w, r)
+		}
+	}))
+	t.Cleanup(ts.Close)
+	database := dbtest.OpenTestDB(t)
+
+	stats, err := runHTTPRemoteSync(
+		t.Context(),
+		config.Config{
+			DataDir:        t.TempDir(),
+			DisabledAgents: []parser.AgentType{parser.AgentGemini},
+		},
+		database,
+		config.RemoteHost{
+			Host: "devbox", Transport: config.RemoteTransportHTTP,
+			URL: ts.URL, Token: "remote-token",
+		},
+		false,
+		nil,
+	)
+
+	require.NoError(t, err)
+	assert.Equal(t, 1, stats.SessionsSynced)
+	close(serverErrors)
+	for serverErr := range serverErrors {
+		require.NoError(t, serverErr)
+	}
+	stored, err := database.GetSession(
+		t.Context(), "devbox~gemini:remote-gemini",
+	)
+	require.NoError(t, err)
+	require.NotNil(t, stored)
+	assert.Equal(t, string(parser.AgentGemini), stored.Agent)
+}
+
+func TestOnDemandSyncEngineExcludesDisabledProvider(t *testing.T) {
+	geminiDir := filepath.Join(t.TempDir(), "gemini")
+	f := newSyncRouteFixture(t, withDisabledAgents(
+		[]parser.AgentType{parser.AgentGemini},
+		map[parser.AgentType][]string{parser.AgentGemini: {geminiDir}},
+	))
+
+	engine := f.srv.syncEngineForLocal(f.db)
+
+	assert.Empty(t, engine.ReconciliationRootsForAgent(string(parser.AgentGemini)))
+	assert.Equal(t, []string{f.claudeDir},
+		engine.ReconciliationRootsForAgent(string(parser.AgentClaude)))
+}
+
+func TestOnDemandSyncEngineKeepsStartupProvidersUntilRestart(t *testing.T) {
+	geminiDir := filepath.Join(t.TempDir(), "gemini")
+	f := newSyncRouteFixture(t, withDisabledAgents(nil,
+		map[parser.AgentType][]string{parser.AgentGemini: {geminiDir}},
+	))
+	f.srv.mu.Lock()
+	f.srv.cfg.DisabledAgents = []parser.AgentType{parser.AgentGemini}
+	f.srv.mu.Unlock()
+
+	engine := f.srv.syncEngineForLocal(f.db)
+
+	assert.Equal(t, []string{geminiDir},
+		engine.ReconciliationRootsForAgent(string(parser.AgentGemini)))
 }

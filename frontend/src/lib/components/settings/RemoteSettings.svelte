@@ -2,7 +2,6 @@
   import { Button, TextInput, Toggle } from "@kenn-io/kit-ui";
   import { onDestroy } from "svelte";
   import { m } from "../../i18n/index.js";
-  import SettingsSection from "./SettingsSection.svelte";
   import { copyToClipboard } from "../../utils/clipboard.js";
   import { settings } from "../../stores/settings.svelte.js";
   import {
@@ -85,6 +84,7 @@
   }
 
   async function handleToggleRemote(requireAuth: boolean) {
+    if (settings.saving || settings.readOnly) return;
     pendingRequireAuth = requireAuth;
     remoteToggling = true;
     try {
@@ -105,17 +105,14 @@
   }
 </script>
 
-<SettingsSection
-  title={m.settings_remote_title()}
-  description={m.settings_remote_description()}
->
+<div class="remote-settings">
   {#if !isRemote}
     <div class="subsection">
       <div class="toggle-row">
         <span class="toggle-label">{m.settings_remote_require_auth()}</span>
         <Toggle
           checked={pendingRequireAuth}
-          disabled={remoteToggling}
+          disabled={remoteToggling || settings.saving || settings.readOnly}
           ariaLabel={m.settings_remote_require_auth()}
           onchange={handleToggleRemote}
         >
@@ -228,9 +225,15 @@
       {/if}
     {/if}
   </div>
-</SettingsSection>
+</div>
 
 <style>
+  .remote-settings {
+    display: flex;
+    flex-direction: column;
+    gap: var(--space-5);
+  }
+
   .subsection {
     display: flex;
     flex-direction: column;

@@ -17,6 +17,7 @@ import (
 	"go.kenn.io/agentsview/internal/db"
 	"go.kenn.io/agentsview/internal/postgres"
 	"go.kenn.io/agentsview/internal/server"
+	syncpkg "go.kenn.io/agentsview/internal/sync"
 )
 
 type PGPushConfig struct {
@@ -29,6 +30,17 @@ type PGPushConfig struct {
 	Debounce        time.Duration
 	Interval        time.Duration
 	NoVectors       bool
+	// ScopeVectorsToChangedSessions is set internally by the watch
+	// loop for change-triggered pushes; it has no CLI flag.
+	ScopeVectorsToChangedSessions bool
+	// LastReconciledVectorGeneration is set internally by the watch
+	// loop so a scoped push can promote to generation-wide when the
+	// active generation id has changed; it has no CLI flag.
+	LastReconciledVectorGeneration int64
+	// WatchBatch and WatchRecovery are internal watch-loop scope. Explicit
+	// pushes leave them nil and retain the historical unscoped sync.
+	WatchBatch    *syncpkg.WatchBatch
+	WatchRecovery *syncpkg.WatchRecoveryScope
 }
 
 type PGStatusConfig struct {
@@ -317,7 +329,7 @@ func writePGVectorPushSummary(w io.Writer, v postgres.VectorPushResult) {
 	if v.SessionsDeferred > 0 {
 		fmt.Fprintf(
 			w,
-			"Warning: deferred vectors for %d session(s) whose session push failed; the next successful push sends them\n",
+			"Warning: deferred vectors for %d session(s); the next generation-wide reconciliation sends them\n",
 			v.SessionsDeferred,
 		)
 	}
@@ -497,6 +509,10 @@ func preparePGServeImpl(appCfg config.Config, basePath string) (pgServeStartup, 
 		return pgServeStartup{}, fmt.Errorf("pg serve: %w", err)
 	}
 	cleanupStore := func() { _ = store.Close() }
+	if err := applyRequiredCursorSecret(store, appCfg); err != nil {
+		cleanupStore()
+		return pgServeStartup{}, fmt.Errorf("pg serve: %w", err)
+	}
 
 	if len(appCfg.CustomModelPricing) > 0 {
 		store.SetCustomPricing(appCfg.CustomModelPricing)

@@ -48,9 +48,11 @@ batch_size = 32                   # inputs per HTTP call (default 32)
 concurrency = 4                   # documents embedded in parallel during a build (default 4)
 timeout = "30s"                   # per-HTTP-call timeout (default "30s")
 max_retries = 3                   # attempts on 429/5xx/network errors; 4xx fails fast (default 3)
+# ollama_cpu_fallback = true      # Ollama only: retry invalid Metal vectors once on CPU
 
 [vector.embed]
 run_after_sync = true             # daemon embeds deltas after each sync, debounced ~30s (default true)
+recall = false                    # default; set true to permit automatic Recall embedding
 backstop_interval = "24h"         # periodic full reconciliation scan; negative disables (default "24h")
 ```
 
@@ -59,6 +61,18 @@ entry with an `endpoint` are required once `enabled = true`; `agentsview` fails
 fast with an actionable message if any is missing or a duration field doesn't
 parse. Restart the daemon (or run a CLI command) after editing the file.
 
+Automatic Recall embedding has a separate, default-off consent gate. Setting
+`[vector.embed] recall = true` permits daemon startup, corpus mutations, and
+periodic backstops to send accepted Recall entry titles, bodies, and triggers to
+the configured embeddings endpoint. `run_after_sync` controls only session
+archive sync notifications; it does not suppress Recall startup or Recall
+corpus-mutation refreshes after that consent is enabled. A manual
+`agentsview embeddings build --store recall` remains available without this
+setting because invoking that command is an explicit one-time request. Recall
+vector and hybrid queries also fail closed as unavailable whenever the served
+Recall corpus is newer than the last completed build; lexical queries remain
+available while an automatic or manual refresh catches up.
+
 ### Named embeddings servers
 
 Model identity — `model`, `dimension`, `request_dimensions`, `max_input_chars`,
@@ -66,7 +80,8 @@ Model identity — `model`, `dimension`, `request_dimensions`, `max_input_chars`
 in the `servers` table must serve that same model and input recipe, so vectors
 produced by any of them are interchangeable and land in the same generation.
 What varies per server is transport and capacity: `endpoint`, `api_key_env`,
-`timeout`, `max_retries`, `batch_size`, and `concurrency`.
+`timeout`, `max_retries`, `batch_size`, `concurrency`, and
+`ollama_cpu_fallback`.
 
 This split exists so you can encode search queries against a fast local server
 while offloading bulk index builds to a bigger remote machine:
@@ -94,6 +109,8 @@ with more than one it is required.
 different server without touching the default. Because the model identity is
 global, the server choice is not part of the generation fingerprint — a build
 started on one server can be topped up incrementally from another.
+`ollama_cpu_fallback` is also transport-only: enabling or disabling it does not
+change the generation fingerprint or rebuild the index.
 
 One caveat: the same model served at different quantizations (say F16 on one
 box, Q8 on another) produces slightly different vectors for the same text. They
@@ -128,24 +145,23 @@ document_prefix = "title: none | text: "
 ```
 
 Nomic uses `search_query: ` and `search_document: `, as shown in the initial
-configuration example. E5 models commonly use `query: ` and `passage: `.
-Models such as Qwen3-Embedding that recommend an instruction only for queries
-can leave `document_prefix` unset.
+configuration example. E5 models commonly use `query: ` and `passage: `. Models
+such as Qwen3-Embedding that recommend an instruction only for queries can leave
+`document_prefix` unset.
 
-Prefixes are applied after document content is chunked, so
-`max_input_chars` limits the original chunk rather than the final affixed
-request. If the embedding endpoint has a strict context limit, leave enough
-headroom for the configured prefix and suffix. When an endpoint explicitly
-rejects an input for exceeding its token or context limit, AgentsView logs the
-rejection and skip-stamps that document for the generation so one oversized
-input cannot block the rest of the archive. Lower `max_input_chars` and rebuild
-to include it.
+Prefixes are applied after document content is chunked, so `max_input_chars`
+limits the original chunk rather than the final affixed request. If the
+embedding endpoint has a strict context limit, leave enough headroom for the
+configured prefix and suffix. When an endpoint explicitly rejects an input for
+exceeding its token or context limit, AgentsView logs the rejection and
+skip-stamps that document for the generation so one oversized input cannot block
+the rest of the archive. Lower `max_input_chars` and rebuild to include it.
 
 Both prefixes are part of the generation fingerprint. Adding, removing, or
 changing either one creates a new generation and re-embeds the archive on the
 next build. This intentionally treats the query/document recipe as one
-reproducible embedding configuration, even though changing only
-`query_prefix` would not alter stored document vectors.
+reproducible embedding configuration, even though changing only `query_prefix`
+would not alter stored document vectors.
 
 `input_suffix` is appended verbatim to every text sent to the endpoint —
 documents at build time and queries at search time — for models that expect a
@@ -243,6 +259,7 @@ dimension = 768
 
 [vector.embeddings.servers.local]
 endpoint = "http://localhost:11434/v1"
+ollama_cpu_fallback = true
 ```
 
 The encoder POSTs to `<endpoint>/embeddings` with an OpenAI-style
@@ -254,6 +271,31 @@ rejected. AgentsView also rejects non-finite components (`NaN` or infinity),
 JSON `null` components, and zero-norm vectors before they can be written to the
 index. Those failures are retried according to `max_retries`; if every attempt
 is invalid, the build stops and leaves the document pending.
+
+For Ollama on Apple Metal, `ollama_cpu_fallback = true` adds one explicit
+recovery attempt after those normal retries are exhausted. AgentsView keeps the
+valid vectors from the final Metal response and sends only the invalid inputs to
+Ollama's native `/api/embed` route with `options.num_gpu = 0`,
+`truncate = false`, and `keep_alive = "0s"`. This requests a CPU-only runner and
+asks Ollama to unload it immediately after the response. The configured endpoint
+must be an absolute HTTP(S) URL ending in `/v1`, from which AgentsView derives
+the native route while preserving proxy prefixes and query parameters.
+
+Each CPU recovery can incur model-load and CPU-inference latency, followed by
+another model load for the next Metal request. AgentsView gates primary and
+fallback traffic only among fallback-enabled encoders whose derived native URL
+matches exactly. The process-local gate does not cover fallback-disabled server
+entries, differently spelled aliases or query strings, or external Ollama
+clients; reserve the endpoint for AgentsView during fallback, or configure every
+AgentsView entry for that Ollama instance with the same endpoint and opt-in.
+Canceled requests leave the gate queue promptly.
+
+With Ollama 0.32.7 during diagnosis, the CPU request was observed to replace the
+Metal runner, unload after its response, and cause the next request to load a
+fresh Metal runner. That sequence is observed behavior, not an Ollama scheduler
+guarantee, and AgentsView does not attempt to verify Ollama's internal runner
+lifecycle. The setting is therefore intended as automatic recovery for rare
+invalid output, not as a permanent CPU serving mode.
 
 ### Direct `llama-server` for high-throughput Ollama models
 
@@ -275,19 +317,21 @@ llama-server \
 
 These are `llama-server` command-line flags, not `ollama serve` environment
 variables. Its prompt cache stores reusable inference state rather than a final
-embedding API result. Independent document embeddings do not need conversational
-prefix reuse, and bad or saturated slot state can yield non-finite output for
-otherwise valid input. Some llama.cpp builds do not apply the global
-`--no-cache-prompt` default to embedding tasks; without
-`--slot-prompt-similarity 0`, an exact retry can then be routed back to the same
-bad slot. Disabling similarity routing lets retries use the least-recently-used
-slot while retaining multiple request slots and large physical/logical batches.
+embedding API result, so disabling it can still be useful for a dedicated
+embedding service that does not benefit from conversational prefix reuse. It is
+not, however, a fix for the Metal corruption diagnosed here: repeated Metal
+embedding requests were observed to become non-finite even with prompt caching,
+context checkpoints, and slot-similarity routing disabled. Cache and slot
+settings therefore do not replace output validation or recovery through an
+Ollama-managed CPU runner.
 
 Run `llama-server --help` for the installed binary before adopting this direct
 setup. If any of these flags are unavailable, upgrade the bundled llama.cpp
 binary or use Ollama's normal `/v1/embeddings` route instead. AgentsView's
 validation remains the final safety boundary either way: invalid endpoint output
-aborts the build and is never written.
+is never written. The explicit `ollama_cpu_fallback` recovery is available only
+through Ollama's `/v1` endpoint because it depends on Ollama's native
+`/api/embed` runner controls; it does not apply to a standalone `llama-server`.
 
 ## What gets embedded: units, not messages
 
@@ -465,11 +509,19 @@ at most one result per session, and remember the selected mode across palette
 openings and browser sessions.
 
 Semantic and Hybrid depend on the same enabled `[vector]` configuration and
-active embeddings index described above. Configuration and index builds remain
-CLI/config-file operations; the palette surfaces actionable setup or rebuild
-errors and stays in the selected mode. To continue with Full text after an
-error, choose it explicitly—the UI never falls back automatically. The
-in-session find bar remains unchanged and does not support semantic search.
+active embeddings index described above. If `[vector]` is not configured, the
+palette shows a copyable configuration example plus the build and restart steps.
+If vector search is configured but no active index exists, **Build embeddings**
+starts the build through the local daemon and reports scanning, progress,
+throughput, and completion in place. The palette follows an already running
+build and retries the query after a successful build.
+
+![Guided semantic-search setup in the command palette](/assets/generated/screenshots/semantic-search-setup.png)
+
+Setup and rebuild errors remain visible in the selected mode. To continue with
+Full text after an error, choose it explicitly—the UI never falls back
+automatically. The in-session find bar remains unchanged and does not support
+semantic search.
 
 Palette searches run after a 300ms typing pause. Each Semantic or Hybrid query
 must be encoded, so a remote embeddings server can add latency and per-request

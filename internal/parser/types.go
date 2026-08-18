@@ -4,6 +4,8 @@ import (
 	"encoding/json"
 	"strings"
 	"time"
+
+	"go.kenn.io/agentsview/internal/money"
 )
 
 // AgentType identifies the AI agent that produced a session.
@@ -14,8 +16,10 @@ const (
 	AgentOpenClaude     AgentType = "openclaude"
 	AgentCowork         AgentType = "cowork"
 	AgentCodex          AgentType = "codex"
+	AgentTraeX          AgentType = "traex"
 	AgentCopilot        AgentType = "copilot"
 	AgentGemini         AgentType = "gemini"
+	AgentGeminiApps     AgentType = "gemini-apps"
 	AgentMiMoCode       AgentType = "mimocode"
 	AgentOpenCode       AgentType = "opencode"
 	AgentKilo           AgentType = "kilo"
@@ -30,6 +34,7 @@ const (
 	AgentTrae           AgentType = "trae"
 	AgentVSCopilot      AgentType = "visualstudio-copilot"
 	AgentPi             AgentType = "pi"
+	AgentPrimeAgent     AgentType = "prime-agent"
 	AgentOMP            AgentType = "omp"
 	AgentQwen           AgentType = "qwen"
 	AgentCommandCode    AgentType = "commandcode"
@@ -45,6 +50,7 @@ const (
 	AgentCortex         AgentType = "cortex"
 	AgentHermes         AgentType = "hermes"
 	AgentGrok           AgentType = "grok"
+	AgentGoose          AgentType = "goose"
 	AgentWorkBuddy      AgentType = "workbuddy"
 	AgentForge          AgentType = "forge"
 	AgentDevin          AgentType = "devin"
@@ -65,7 +71,13 @@ const (
 	AgentReasonix       AgentType = "reasonix"
 	AgentIcodemate      AgentType = "icodemate"
 	AgentRooCode        AgentType = "roocode"
+	AgentPoolside       AgentType = "poolside"
+	AgentOmnigent       AgentType = "omnigent"
+	AgentCodebuff       AgentType = "codebuff"
+	AgentFreebuff       AgentType = "freebuff"
 )
+
+const AgentDeepSeekHarness AgentType = "deepseek-harness"
 
 // AgentDef describes a supported coding agent's filesystem
 // layout, configuration keys, and session ID conventions.
@@ -82,11 +94,18 @@ type AgentDef struct {
 	FileBased         bool     // false for DB-backed agents
 	Usage             UsageCapabilities
 
-	// PeriodicReconcile opts the agent into the scheduled scoped
-	// reconciliation because its declared watch coverage is shallow and
-	// subdirectory changes are invisible to the watcher. Expensive
-	// scheduling inputs default to unsupported.
+	// PeriodicReconcile opts the agent into scheduled scoped reconciliation
+	// when its declared watcher coverage is deliberately non-authoritative,
+	// such as shallow directory watches or bounded database change cursors.
+	// Expensive scheduling inputs default to unsupported.
 	PeriodicReconcile bool
+
+	// RemoteSyncExcluded keeps every path under the agent's roots out of
+	// remote sync artifacts: resolve scripts, manifests, archives, delta
+	// roots, and tar commands. Set for stores that co-locate transcripts
+	// with secrets or state that cannot be copied safely; each artifact
+	// seam checks it so exclusion fails closed.
+	RemoteSyncExcluded bool
 
 	// WatchRootsFunc resolves the directories to watch for live
 	// updates under a configured root, for agents whose watch
@@ -153,6 +172,30 @@ var Registry = []AgentDef{
 		IDPrefix:              "codex:",
 		FileBased:             true,
 		ShallowWatchRootsFunc: ResolveCodexShallowWatchRoots,
+	},
+	{
+		// TRAE CLI 2.0 is a closed-source fork of codex-rs and writes
+		// byte-compatible rollout JSONL, so it reuses the Codex parser
+		// through a relabel hook. It is a distinct agent rather than a
+		// Codex source because resuming needs `traex resume` and the two
+		// tools keep separate session archives. Unlike the Trae IDE entry
+		// below, nothing here is encrypted, so remote sync is not excluded.
+		Type:        AgentTraeX,
+		DisplayName: "TraeX",
+		EnvVar:      "TRAEX_SESSIONS_DIR",
+		ConfigKey:   "traex_sessions_dirs",
+		DefaultDirs: []string{
+			".trae/cli/sessions",
+			// `traex archive <id>` moves a rollout out of the dated tree into
+			// this flat directory, exactly as `codex archive` does.
+			".trae/cli/archived_sessions",
+		},
+		IDPrefix:  "traex:",
+		FileBased: true,
+		// No ShallowWatchRootsFunc: that hook exists for Codex's sibling
+		// session_index.jsonl, which TraeX never writes. Watching
+		// ~/.trae/cli shallowly would deliver nothing but churn from the
+		// SQLite WALs TRAE CLI keeps there.
 	},
 	{
 		Type:         AgentCopilot,
@@ -268,9 +311,6 @@ var Registry = []AgentDef{
 		DefaultDirs: []string{".cursor/projects"},
 		IDPrefix:    "cursor:",
 		FileBased:   true,
-		Usage: UsageCapabilities{
-			NoPerMessageTokenData: true,
-		},
 	},
 	{
 		Type:        AgentAmp,
@@ -378,6 +418,10 @@ var Registry = []AgentDef{
 		WatchSubdirs: []string{"workspaceStorage", "globalStorage"},
 		FileBased:    true,
 		Usage:        UsageCapabilities{NoPerMessageTokenData: true},
+		// Trae's modern layout stores sessions as encrypted state that a
+		// remote machine cannot read; shipping it would copy opaque
+		// encrypted blobs.
+		RemoteSyncExcluded: true,
 	},
 	{
 		Type:        AgentVSCopilot,
@@ -406,6 +450,15 @@ var Registry = []AgentDef{
 		ConfigKey:   "pi_dirs",
 		DefaultDirs: []string{".pi/agent/sessions"},
 		IDPrefix:    "pi:",
+		FileBased:   true,
+	},
+	{
+		Type:        AgentPrimeAgent,
+		DisplayName: "Prime Agent",
+		EnvVar:      "PRIME_AGENT_SESSION_DIR",
+		ConfigKey:   "prime_agent_dirs",
+		DefaultDirs: []string{".prime/agent/sessions"},
+		IDPrefix:    "prime-agent:",
 		FileBased:   true,
 	},
 	{
@@ -449,6 +502,16 @@ var Registry = []AgentDef{
 		},
 		IDPrefix:  "deepseek-tui:",
 		FileBased: true,
+	},
+	{
+		Type:              AgentDeepSeekHarness,
+		DisplayName:       "DeepSeek Harness",
+		EnvVar:            "DEEPSEEK_HARNESS_SESSIONS_DIR",
+		DefaultRootEnvVar: "DSH_HOME",
+		ConfigKey:         "deepseek_harness_sessions_dirs",
+		DefaultDirs:       []string{".dsh/sessions"},
+		IDPrefix:          "deepseek-harness:",
+		FileBased:         true,
 	},
 	{
 		Type:        AgentOpenClaw,
@@ -519,6 +582,12 @@ var Registry = []AgentDef{
 		FileBased:   false,
 	},
 	{
+		Type:        AgentGeminiApps,
+		DisplayName: "Gemini Apps",
+		IDPrefix:    "gemini-apps:",
+		FileBased:   false,
+	},
+	{
 		Type:        AgentKiro,
 		DisplayName: "Kiro",
 		EnvVar:      "KIRO_SESSIONS_DIR",
@@ -569,6 +638,19 @@ var Registry = []AgentDef{
 		DefaultDirs: []string{".grok/sessions"},
 		IDPrefix:    "grok:",
 		FileBased:   true,
+	},
+	{
+		Type:              AgentGoose,
+		DisplayName:       "Goose",
+		EnvVar:            "GOOSE_PATH_ROOT",
+		ConfigKey:         "goose_dirs",
+		DefaultDirs:       gooseDefaultDirs(),
+		IDPrefix:          "goose:",
+		FileBased:         false,
+		PeriodicReconcile: true,
+		Usage: UsageCapabilities{
+			NoPerMessageTokenData: true,
+		},
 	},
 	{
 		Type:        AgentWorkBuddy,
@@ -727,12 +809,9 @@ var Registry = []AgentDef{
 		DisplayName: "Qoder",
 		EnvVar:      "QODER_PROJECTS_DIR",
 		ConfigKey:   "qoder_project_dirs",
-		DefaultDirs: []string{
-			".qoder/projects",
-			".qoderwork/projects",
-		},
-		IDPrefix:  "qoder:",
-		FileBased: true,
+		DefaultDirs: qoderDefaultDirs(),
+		IDPrefix:    "qoder:",
+		FileBased:   true,
 	},
 	{
 		// Shelley (exe.dev) stores all conversations in a single
@@ -824,17 +903,64 @@ var Registry = []AgentDef{
 		IDPrefix:  "roocode:",
 		FileBased: true,
 	},
-}
-
-// NonFileBackedAgents returns agent types where FileBased is false.
-func NonFileBackedAgents() []AgentType {
-	var agents []AgentType
-	for _, def := range Registry {
-		if !def.FileBased {
-			agents = append(agents, def.Type)
-		}
-	}
-	return agents
+	{
+		Type:        AgentPoolside,
+		DisplayName: "Poolside",
+		EnvVar:      "POOLSIDE_DIR",
+		ConfigKey:   "poolside_dirs",
+		DefaultDirs: []string{
+			// macOS
+			"Library/Application Support/poolside",
+			// Linux
+			".local/state/poolside",
+			// Windows
+			"AppData/Roaming/poolside",
+		},
+		IDPrefix:  "poolside:",
+		FileBased: true,
+	},
+	{
+		// Omnigent stores every conversation in one shared SQLite database
+		// (chat.db); the provider fans it out into one session per conversation
+		// addressed by a "<db>#<id>" virtual path.
+		Type:              AgentOmnigent,
+		DisplayName:       "Omnigent",
+		EnvVar:            "OMNIGENT_DIR",
+		ConfigKey:         "omnigent_dirs",
+		DefaultDirs:       []string{".omnigent"},
+		IDPrefix:          "omnigent:",
+		FileBased:         true,
+		PeriodicReconcile: true,
+		// chat.db co-locates transcripts with authentication secrets, and
+		// copying or sanitizing the source database can retain deleted
+		// pages. Remote sync stays disabled until Omnigent has a fresh,
+		// allowlisted export schema.
+		RemoteSyncExcluded: true,
+	},
+	{
+		// Codebuff and Freebuff share the same on-disk layout under
+		// ~/.config/manicode/projects/<project>/chats/<timestamp>/. Each
+		// session directory holds chat-messages.json (primary),
+		// run-state.json (model/token metadata), and chat-meta.json.
+		// Freebuff sessions do carry their own agent type: the parser
+		// sets Agent = AgentFreebuff and emits freebuff:-prefixed IDs
+		// when run-state.json agentType contains "free". Freebuff has
+		// no separate registry entry or provider factory, though; sync
+		// canonicalizes freebuff onto this Codebuff def (AgentByPrefix
+		// maps freebuff: IDs here), which avoids double-discovery and
+		// skip-cache contention over the shared roots.
+		Type:              AgentCodebuff,
+		DisplayName:       "Codebuff",
+		EnvVar:            "CODEBUFF_DIR",
+		ConfigKey:         "codebuff_dirs",
+		DefaultDirs:       []string{".config/manicode/projects"},
+		IDPrefix:          "codebuff:",
+		FileBased:         true,
+		PeriodicReconcile: true,
+		Usage: UsageCapabilities{
+			NoPerMessageTokenData: true,
+		},
+	},
 }
 
 // AgentByType returns the AgentDef for the given type.
@@ -847,19 +973,33 @@ func AgentByType(t AgentType) (AgentDef, bool) {
 	return AgentDef{}, false
 }
 
+// RemoteSyncExcludedAgent reports whether the agent's raw source tree must
+// stay out of every remote sync artifact. Unknown agents are not excluded.
+func RemoteSyncExcludedAgent(agent AgentType) bool {
+	def, ok := AgentByType(agent)
+	return ok && def.RemoteSyncExcluded
+}
+
 // AgentNameLacksPerMessageTokenData reports whether the named agent
 // records no per-message token data. Names match registry types
 // exactly and unknown names fail closed; CSV filter parsing trims its
-// parts before calling.
+// parts before calling. Freebuff is treated as a Codebuff alias.
 func AgentNameLacksPerMessageTokenData(agent string) bool {
 	def, ok := AgentByType(AgentType(agent))
+	if !ok && AgentType(agent) == AgentFreebuff {
+		def, ok = AgentByType(AgentCodebuff)
+	}
 	return ok && def.Usage.NoPerMessageTokenData
 }
 
 // AgentNameUsesAICredits reports whether the named agent's cost is
-// denominated in AI credits rather than USD.
+// denominated in AI credits rather than USD. Freebuff is treated as
+// a Codebuff alias.
 func AgentNameUsesAICredits(agent string) bool {
 	def, ok := AgentByType(AgentType(agent))
+	if !ok && AgentType(agent) == AgentFreebuff {
+		def, ok = AgentByType(AgentCodebuff)
+	}
 	return ok && def.Usage.AICreditsDenominated
 }
 
@@ -912,14 +1052,6 @@ func AgentFilterIsCopilot(agentFilter string) bool {
 	return agentFilterMatches(agentFilter, AgentNameIsCopilot)
 }
 
-// AgentFilterIsCursor reports whether a (possibly comma-separated) agent
-// filter selects only Cursor, with at least one entry.
-func AgentFilterIsCursor(agentFilter string) bool {
-	return agentFilterMatches(agentFilter, func(agent string) bool {
-		return AgentType(agent) == AgentCursor
-	})
-}
-
 // StripHostPrefix splits a remote session ID into its host
 // and raw ID parts. Remote IDs use the form "host~rawID"
 // where the "~" separator avoids conflict with both agent
@@ -940,6 +1072,16 @@ func StripHostPrefix(id string) (host, rawID string) {
 // stripped before matching.
 func AgentByPrefix(sessionID string) (AgentDef, bool) {
 	_, rawID := StripHostPrefix(sessionID)
+	// Freebuff shares the Codebuff provider but emits sessions with the
+	// "freebuff:" prefix. Return a copy with the freebuff prefix so
+	// callers that strip the prefix (FindSourceFile, ProviderNormalizeRawSessionID)
+	// work correctly.
+	if strings.HasPrefix(rawID, string(AgentFreebuff)+":") {
+		if def, ok := AgentByType(AgentCodebuff); ok {
+			def.IDPrefix = string(AgentFreebuff) + ":"
+			return def, true
+		}
+	}
 	for _, def := range Registry {
 		if def.IDPrefix != "" &&
 			strings.HasPrefix(rawID, def.IDPrefix) {
@@ -1000,12 +1142,16 @@ type FileInfo struct {
 
 // ParsedSession holds session metadata extracted from a JSONL file.
 type ParsedSession struct {
-	ID               string
-	Project          string
-	Machine          string
-	Agent            AgentType
-	AgentLabel       string
-	Entrypoint       string
+	ID         string
+	Project    string
+	Machine    string
+	Agent      AgentType
+	AgentLabel string
+	Entrypoint string
+	// SessionKind is the top-level Claude Code session-kind marker
+	// (e.g. "bg" for background/headless sessions); empty for
+	// interactive sessions and for agents that do not emit it.
+	SessionKind      string
 	ParentSessionID  string
 	RelationshipType RelationshipType
 	Cwd              string
@@ -1028,11 +1174,16 @@ type ParsedSession struct {
 	IsTruncated             bool
 	FirstMessage            string
 	SessionName             string
-	StartedAt               time.Time
-	EndedAt                 time.Time
-	MessageCount            int
-	UserMessageCount        int
-	File                    FileInfo
+	// SessionNamePresent distinguishes an explicitly present provider title
+	// (including a blank title) from no title signal. Codex needs this because
+	// current releases may omit session_index.jsonl entirely, while an older
+	// index entry with a blank thread_name explicitly clears a stored title.
+	SessionNamePresent bool
+	StartedAt          time.Time
+	EndedAt            time.Time
+	MessageCount       int
+	UserMessageCount   int
+	File               FileInfo
 
 	// TerminationStatus describes how the session appears to have
 	// ended. Empty string = unknown (parser did not classify, or
@@ -1129,8 +1280,13 @@ type ParsedMessage struct {
 	ClaudeMessageID string
 	ClaudeRequestID string
 
-	SourceType        string
-	SourceSubtype     string
+	SourceType    string
+	SourceSubtype string
+	// PromptSource is the Claude Code per-entry prompt-origin marker
+	// on user turns (e.g. "typed", "queued", "system", "sdk"); empty
+	// on older transcripts that predate the field and for agents that
+	// do not emit it.
+	PromptSource      string
 	SourceUUID        string
 	SourceParentUUID  string
 	IsSidechain       bool
@@ -1161,7 +1317,7 @@ type ParsedUsageEvent struct {
 	CacheCreationInputTokens int
 	CacheReadInputTokens     int
 	ReasoningTokens          int
-	CostUSD                  *float64
+	Cost                     *money.Money
 	CostStatus               string
 	CostSource               string
 	OccurredAt               string

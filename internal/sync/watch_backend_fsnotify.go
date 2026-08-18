@@ -30,7 +30,7 @@ type fsnotifyBackend struct {
 	watchOwners       map[string]map[string]struct{}
 	watchBudgetCost   map[string]int
 	runtimeBudget     int
-	rootScopes        map[string][]string
+	rootScopes        map[string][]PollingScope
 	degradedRoots     map[string]struct{}
 	onPollingRequired func(PollingObligation) error
 	lifecycleMu       sync.Mutex
@@ -67,7 +67,7 @@ func newFSNotifyBackend(excludes []string) (*fsnotifyBackend, error) {
 		excludes:        normalizeExcludePatterns(excludes),
 		watchOwners:     make(map[string]map[string]struct{}),
 		watchBudgetCost: make(map[string]int),
-		rootScopes:      make(map[string][]string),
+		rootScopes:      make(map[string][]PollingScope),
 		degradedRoots:   make(map[string]struct{}),
 		stop:            make(chan struct{}),
 		done:            make(chan struct{}),
@@ -105,7 +105,23 @@ func (b *fsnotifyBackend) AddRecursive(root string, budget int) RecursiveWatchRe
 			if path != root && b.shouldExcludeForRoot(path, root) {
 				return filepath.SkipDir
 			}
-			if remaining <= 0 {
+			// A directory an earlier root already watches natively is shared,
+			// not installed again: the kernel watch is already paid for, so
+			// settle reuse before the budget check or an overlapping root
+			// would be refused coverage that already exists.
+			if len(b.watchOwners[path]) > 0 {
+				b.addWatchOwner(path, root)
+				result.Watched++
+				return nil
+			}
+			// The root's own directory is the mandatory part of a recursive
+			// registration and its subtree is the discretionary part. A
+			// shallow unit's watch is installed unconditionally, so a plan
+			// that merges one into a recursive unit at the same path would
+			// lose that coverage the moment the budget ran out. The subtree
+			// below still reports BudgetExhausted and hands off to polling.
+			mandatory := path == root
+			if remaining <= 0 && !mandatory {
 				result.BudgetExhausted = true
 				return filepath.SkipAll
 			}
@@ -118,9 +134,17 @@ func (b *fsnotifyBackend) AddRecursive(root string, budget int) RecursiveWatchRe
 				}
 				return nil
 			}
-			b.watchBudgetCost[path]++
+			// A mandatory watch installed past the budget sits outside the
+			// accounting entirely, the way a shallow root already does: it is
+			// not charged, so removing it must not refund a slot the process
+			// never spent. Charging it and refunding it would leave headroom
+			// above the cap that runtime subtree adds could then claim.
+			if remaining > 0 {
+				b.watchBudgetCost[path]++
+				remaining--
+				result.Allocated++
+			}
 			b.addWatchOwner(path, root)
-			remaining--
 			result.Watched++
 			return nil
 		})
@@ -134,16 +158,24 @@ func (b *fsnotifyBackend) AddRecursive(root string, budget int) RecursiveWatchRe
 func (b *fsnotifyBackend) setWatchRootPlan(roots []WatchRoot) {
 	b.watchMu.Lock()
 	defer b.watchMu.Unlock()
-	b.rootScopes = make(map[string][]string, len(roots))
+	b.rootScopes = make(map[string][]PollingScope, len(roots))
 	for _, root := range roots {
 		path := filepath.Clean(root.Path)
 		for _, scope := range root.Scopes {
-			if scope.SyncDir != "" {
-				b.rootScopes[path] = append(b.rootScopes[path], scope.SyncDir)
+			if scope.SyncDir == "" {
+				continue
+			}
+			ps := PollingScope{Agent: scope.Agent, Root: filepath.Clean(scope.SyncDir)}
+			if !slices.Contains(b.rootScopes[path], ps) {
+				b.rootScopes[path] = append(b.rootScopes[path], ps)
 			}
 		}
-		slices.Sort(b.rootScopes[path])
-		b.rootScopes[path] = slices.Compact(b.rootScopes[path])
+		slices.SortFunc(b.rootScopes[path], func(a, b PollingScope) int {
+			if a.Agent != b.Agent {
+				return strings.Compare(a.Agent, b.Agent)
+			}
+			return strings.Compare(a.Root, b.Root)
+		})
 	}
 }
 
@@ -493,10 +525,10 @@ func (b *fsnotifyBackend) requireRuntimePolling(roots []string) {
 			continue
 		}
 		required := b.onPollingRequired
-		scopes := append([]string(nil), b.rootScopes[root]...)
+		scopes := append([]PollingScope(nil), b.rootScopes[root]...)
 		b.watchMu.Unlock()
 		if len(scopes) == 0 {
-			scopes = []string{root}
+			scopes = []PollingScope{{Root: root}}
 		}
 		if required == nil {
 			b.reportError(fmt.Errorf(
@@ -505,7 +537,7 @@ func (b *fsnotifyBackend) requireRuntimePolling(roots []string) {
 			continue
 		}
 		if err := required(PollingObligation{
-			Key: "fsnotify-runtime:" + root, Roots: scopes, Probe: root,
+			Key: "fsnotify-runtime:" + root, Scopes: scopes, Probe: root,
 		}); err != nil {
 			b.reportError(fmt.Errorf(
 				"transfer fsnotify coverage for %s to polling: %w", root, err,

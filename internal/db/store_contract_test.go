@@ -3,7 +3,6 @@ package db
 import (
 	"context"
 	"errors"
-	"math"
 	"os"
 	"path/filepath"
 	"slices"
@@ -13,6 +12,9 @@ import (
 
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
+
+	"go.kenn.io/agentsview/internal/export"
+	"go.kenn.io/agentsview/internal/money"
 )
 
 type storeContractBackend struct {
@@ -129,6 +131,7 @@ func TestStoreContract(t *testing.T) {
 		{"stars_and_pins", contractStarsAndPins},
 		{"analytics_trends_and_usage", contractAnalyticsTrendsAndUsage},
 		{"local_only_methods", contractLocalOnlyMethods},
+		{"data_inventory_rules_candidates", contractDataInventoryRulesCandidates},
 	}
 
 	for _, backend := range storeContractBackends() {
@@ -550,7 +553,7 @@ func contractAnalyticsTrendsAndUsage(
 	require.GreaterOrEqual(t, len(daily.Daily), 2)
 	require.Equal(t, 315, daily.Totals.InputTokens)
 	require.Equal(t, 130, daily.Totals.OutputTokens)
-	require.InDelta(t, 0.002435, daily.Totals.TotalCost, 0.00001)
+	require.Equal(t, money.MustParseDollars("0.002435"), daily.Totals.TotalCost)
 
 	top, err := store.GetTopSessionsByCost(ctx, UsageFilter{
 		From: "2026-01-10",
@@ -574,7 +577,13 @@ func contractAnalyticsTrendsAndUsage(
 	require.True(t, usage.HasTokenData)
 	require.True(t, usage.HasCost)
 	require.Equal(t, []string{"claude-sonnet-contract"}, usage.Models)
-	require.InDelta(t, 0.002355, usage.CostUSD, 0.00001)
+	require.Equal(t, money.MustParseDollars("0.002355"), usage.Cost)
+	// cost_usd is a deprecated compatibility alias for
+	// cost.microdollars/1e6; every backend must report the same value
+	// for the same cost (see db.CostUSDFromCost).
+	require.NotNil(t, usage.CostUSD)
+	assert.InDelta(t,
+		float64(usage.Cost.Microdollars)/1e6, *usage.CostUSD, 1e-9)
 }
 
 func contractLocalOnlyMethods(
@@ -659,6 +668,64 @@ func contractLocalOnlyMethods(
 	})
 	require.NoError(t, err)
 	require.NotEmpty(t, queryID)
+}
+
+// contractDataInventoryRulesCandidates exercises the three Data reads
+// (GetProjectInventory, ListProjectRules, ListArchiveWorktreeCandidates)
+// through the Store interface against the shared contract fixture, which has
+// no worktree mapping rules and no session cwds. That keeps rules and
+// candidates at their baseline: zero rules, and archive-wide candidates that
+// fall back to "unavailable" evidence, grouped only by machine.
+func contractDataInventoryRulesCandidates(
+	t *testing.T,
+	store Store,
+	_ storeContractFixture,
+	_ storeContractBackend,
+) {
+	t.Helper()
+	ctx := context.Background()
+
+	inventory, err := store.GetProjectInventory(ctx)
+	require.NoError(t, err)
+	assert.Equal(t, 3, inventory.TotalProjects)
+	assert.Equal(t, 6, inventory.TotalSessions,
+		"visible sessions include the alpha subagent child, excluding the trashed one")
+	assert.Equal(t, 0, inventory.GovernedSessions, "no worktree mapping rules seeded")
+
+	var alphaRow *ProjectInventoryRow
+	for i := range inventory.Projects {
+		if inventory.Projects[i].Label == "alpha" {
+			alphaRow = &inventory.Projects[i]
+		}
+	}
+	require.NotNil(t, alphaRow, "alpha project row present")
+	assert.Equal(t, 4, alphaRow.Sessions,
+		"alpha, gamma, old, and the alpha subagent child")
+	assert.Equal(t, 0, alphaRow.EnabledRulesTargeting)
+
+	rules, err := store.ListProjectRules(ctx, "mac")
+	require.NoError(t, err)
+	assert.Equal(t, "mac", rules.Machine)
+	assert.Empty(t, rules.Rules, "no worktree mapping rules seeded")
+	assert.Contains(t, rules.Machines, "mac")
+	assert.Contains(t, rules.Machines, "linux")
+
+	projects, err := store.BuildProjectIdentityMap(ctx, []string{"alpha"})
+	require.NoError(t, err)
+	candidates, err := store.ListArchiveWorktreeCandidates(ctx, ArchiveWorktreeCandidateRequest{
+		ProjectLabel: export.SafeProjectDisplayLabel("alpha"),
+		ProjectKey:   projects["alpha"].ProjectKey,
+	})
+	require.NoError(t, err)
+	require.NotEmpty(t, candidates, "cwd-less alpha sessions still form fallback groups")
+	totalContributing := 0
+	for _, c := range candidates {
+		assert.Equal(t, "unavailable", c.EvidenceKind, "no cwd or identity evidence seeded")
+		assert.False(t, c.Available)
+		totalContributing += c.ContributingSessions
+	}
+	assert.Equal(t, alphaRow.Sessions, totalContributing,
+		"every alpha session lands in exactly one archive-wide candidate group")
 }
 
 func TestStoreContractGetUsageMatchingSessionCountCountsCopilotSessionsWithoutUsageRows(
@@ -753,17 +820,17 @@ func seedStoreContractSQLite(
 	require.NoError(t, pricingStore.UpsertModelPricing([]ModelPricing{
 		{
 			ModelPattern:         "claude-sonnet-contract",
-			InputPerMTok:         3,
-			OutputPerMTok:        15,
-			CacheCreationPerMTok: 3.75,
-			CacheReadPerMTok:     0.3,
+			InputPerMTok:         money.MustParseDollars("3"),
+			OutputPerMTok:        money.MustParseDollars("15"),
+			CacheCreationPerMTok: money.MustParseDollars("3.75"),
+			CacheReadPerMTok:     money.MustParseDollars("0.3"),
 		},
 		{
 			ModelPattern:         "codex-mini-contract",
-			InputPerMTok:         1,
-			OutputPerMTok:        5,
-			CacheCreationPerMTok: 1,
-			CacheReadPerMTok:     0.1,
+			InputPerMTok:         money.MustParseDollars("1"),
+			OutputPerMTok:        money.MustParseDollars("5"),
+			CacheCreationPerMTok: money.MustParseDollars("1"),
+			CacheReadPerMTok:     money.MustParseDollars("0.1"),
 		},
 	}))
 
@@ -920,7 +987,7 @@ func seedStoreContractSQLite(
 					Model:        "codex-mini-contract",
 					InputTokens:  0,
 					OutputTokens: 30,
-					CostUSD:      floatPtr(0.00005),
+					Cost:         Ptr(money.MustParseDollars("0.00005")),
 					CostStatus:   "reported",
 					CostSource:   "fixture",
 					OccurredAt:   "2026-01-12T10:04:00Z",
@@ -1174,13 +1241,6 @@ func requireReadOnly(t *testing.T, err error) {
 	t.Helper()
 	require.Error(t, err)
 	require.True(t, errors.Is(err, ErrReadOnly), "expected ErrReadOnly, got %v", err)
-}
-
-func floatPtr(v float64) *float64 {
-	if math.IsNaN(v) {
-		return nil
-	}
-	return &v
 }
 
 func TestStoreContractBackendsAreRegisteredExplicitly(t *testing.T) {

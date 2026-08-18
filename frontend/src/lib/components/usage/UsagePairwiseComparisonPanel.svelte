@@ -3,14 +3,9 @@
   import { usage } from "../../stores/usage.svelte.js";
   import { m } from "../../i18n/index.js";
   import type { UsagePairwiseDimension } from "../../api/types/usage.js";
-
-  function fmtCost(value: number): string {
-    return `$${value.toFixed(2)}`;
-  }
-
-  function fmtSignedCost(value: number): string {
-    return `${value >= 0 ? "+" : "-"}$${Math.abs(value).toFixed(2)}`;
-  }
+  import type { Money } from "../../money.js";
+  import { formatMoney, formatSignedMoney } from "../../money.js";
+  import { sumSelectedTokens } from "../../stores/usageTokenTypes.js";
 
   function fmtCount(value: number): string {
     return String(value);
@@ -44,9 +39,9 @@
     return `${prefix}${(value * 100).toFixed(1)}%`;
   }
 
-  function fmtMaybeCost(value: number | null | undefined): string {
+  function fmtMaybeCost(value: Money | null | undefined): string {
     if (value == null) return m.shared_none();
-    return fmtCost(value);
+    return formatMoney(value);
   }
 
   function fmtMaybeTokens(value: number | null | undefined): string {
@@ -54,9 +49,9 @@
     return fmtTokens(value);
   }
 
-  function fmtMaybeSignedCost(value: number | null | undefined): string {
+  function fmtMaybeSignedCost(value: Money | null | undefined): string {
     if (value == null) return m.shared_none();
-    return fmtSignedCost(value);
+    return formatSignedMoney(value);
   }
 
   function fmtMaybeSignedTokens(value: number | null | undefined): string {
@@ -118,13 +113,40 @@
     if (!comparison) return [];
 
     if (isTokenMode) {
+      const leftTokens = sumSelectedTokens(
+        comparison.left,
+        usage.selectedTokenTypes,
+      );
+      const rightTokens = sumSelectedTokens(
+        comparison.right,
+        usage.selectedTokenTypes,
+      );
+      const tokenDelta = rightTokens - leftTokens;
+      const tokenRatio = leftTokens === 0
+        ? null
+        : tokenDelta / leftTokens;
+      const leftPerSession = comparison.left.sessionCount > 0
+        ? leftTokens / comparison.left.sessionCount
+        : null;
+      const rightPerSession = comparison.right.sessionCount > 0
+        ? rightTokens / comparison.right.sessionCount
+        : null;
+      const perSessionDelta =
+        leftPerSession === null || rightPerSession === null
+          ? null
+          : rightPerSession - leftPerSession;
+      const perSessionRatio =
+        leftPerSession === null || leftPerSession === 0 ||
+          perSessionDelta === null
+          ? null
+          : perSessionDelta / leftPerSession;
       return [
         {
           label: m.usage_pairwise_total_tokens(),
-          left: fmtTokens(comparison.left.totalTokens),
-          right: fmtTokens(comparison.right.totalTokens),
-          delta: fmtSignedTokens(comparison.deltas.totalTokensDelta),
-          ratio: fmtRatio(comparison.deltas.totalTokensDeltaRatio),
+          left: fmtTokens(leftTokens),
+          right: fmtTokens(rightTokens),
+          delta: fmtSignedTokens(tokenDelta),
+          ratio: fmtRatio(tokenRatio),
         },
         {
           label: m.analytics_col_sessions(),
@@ -135,10 +157,10 @@
         },
         {
           label: m.usage_pairwise_tokens_per_session(),
-          left: fmtMaybeTokens(comparison.left.tokensPerSession),
-          right: fmtMaybeTokens(comparison.right.tokensPerSession),
-          delta: fmtMaybeSignedTokens(comparison.deltas.tokensPerSessionDelta),
-          ratio: fmtRatio(comparison.deltas.tokensPerSessionRatio),
+          left: fmtMaybeTokens(leftPerSession),
+          right: fmtMaybeTokens(rightPerSession),
+          delta: fmtMaybeSignedTokens(perSessionDelta),
+          ratio: fmtRatio(perSessionRatio),
         },
         {
           label: m.usage_input_tokens(),
@@ -160,9 +182,9 @@
     return [
       {
         label: m.usage_total_cost(),
-        left: fmtCost(comparison.left.totalCost),
-        right: fmtCost(comparison.right.totalCost),
-        delta: fmtSignedCost(comparison.deltas.totalCostDelta),
+        left: formatMoney(comparison.left.totalCost),
+        right: formatMoney(comparison.right.totalCost),
+        delta: formatSignedMoney(comparison.deltas.totalCostDelta),
         ratio: fmtRatio(comparison.deltas.totalCostDeltaRatio),
       },
       {

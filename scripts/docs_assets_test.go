@@ -69,6 +69,15 @@ func TestHydrateAssetsForceFetchesRemoteAssetBranches(t *testing.T) {
 	screenshot, err := os.ReadFile(filepath.Join(localRepo, "docs", "assets", "generated", "screenshots", "dashboard.png"))
 	require.NoError(t, err)
 	assert.Equal(t, "generated", strings.TrimRight(string(screenshot), "\r\n"))
+
+	semanticSetup, err := os.ReadFile(filepath.Join(
+		localRepo, "docs", "assets", "generated", "screenshots",
+		"semantic-search-setup.png",
+	))
+	require.NoError(t, err)
+	assert.Equal(t, "generated", strings.TrimRight(
+		string(semanticSetup), "\r\n",
+	))
 }
 
 func TestAssetPublishersRejectUnexpectedFiles(t *testing.T) {
@@ -110,6 +119,33 @@ func TestAssetPublishersRejectUnexpectedFiles(t *testing.T) {
 			assert.Contains(t, string(output), ".env.local")
 		})
 	}
+}
+
+func TestGeneratedAssetPublisherAcceptsSemanticSetupScreenshot(t *testing.T) {
+	tempDir := t.TempDir()
+	repo := filepath.Join(tempDir, "repo")
+	sourceDir := filepath.Join(tempDir, "source")
+	require.NoError(t, os.MkdirAll(repo, 0o755))
+	git(t, repo, "init")
+	writeGeneratedAssets(t, sourceDir, "asset")
+
+	scriptPath := installScript(
+		t, repo,
+		filepath.Join("docs", "screenshots", "update-generated-assets-branch.sh"),
+	)
+	cmd := exec.Command("bash", scriptPath, "--source", sourceDir)
+	cmd.Dir = repo
+	output, err := cmd.CombinedOutput()
+	require.NoError(t, err, string(output))
+
+	show := exec.Command(
+		"git", "show",
+		"docs-generated-assets:screenshots/semantic-search-setup.png",
+	)
+	show.Dir = repo
+	published, err := show.Output()
+	require.NoError(t, err)
+	assert.Equal(t, "asset", strings.TrimRight(string(published), "\r\n"))
 }
 
 func TestCheckDocsRejectsCorruptedMarkdownSyntax(t *testing.T) {
@@ -362,7 +398,8 @@ var builtDocsRoutes = []string{
 	"/mcp/",
 	"/token-usage/",
 	"/chat-import/",
-	"/insights/",
+	"/quality/",
+	"/recall/",
 	"/commands/",
 	"/stats/",
 	"/session-api/",
@@ -474,6 +511,8 @@ func writeGeneratedAssets(t *testing.T, dir, content string) {
 		"screenshots/block-filter.png",
 		"screenshots/code-block-copy-btn.png",
 		"screenshots/command-palette.png",
+		"screenshots/data-inventory.png",
+		"screenshots/data-workspace.png",
 		"screenshots/dashboard.png",
 		"screenshots/date-range.png",
 		"screenshots/focused-transcript.png",
@@ -486,8 +525,8 @@ func writeGeneratedAssets(t *testing.T, dir, content string) {
 		"screenshots/import-modal-chatgpt.png",
 		"screenshots/import-modal-claude.png",
 		"screenshots/in-session-search.png",
-		"screenshots/insight-content.png",
-		"screenshots/insights.png",
+		"screenshots/quality.png",
+		"screenshots/recall-generated-insights.png",
 		"screenshots/layout-compact.png",
 		"screenshots/layout-stream.png",
 		"screenshots/machine-labels.png",
@@ -495,10 +534,12 @@ func writeGeneratedAssets(t *testing.T, dir, content string) {
 		"screenshots/message-viewer.png",
 		"screenshots/project-breakdown.png",
 		"screenshots/publish-modal.png",
+		"screenshots/recall-corpus.png",
 		"screenshots/recent-edits.png",
 		"screenshots/resync-modal.png",
 		"screenshots/search-grouped.png",
 		"screenshots/search-results.png",
+		"screenshots/semantic-search-setup.png",
 		"screenshots/session-filtered.png",
 		"screenshots/session-filters-active.png",
 		"screenshots/session-filters.png",
@@ -508,6 +549,7 @@ func writeGeneratedAssets(t *testing.T, dir, content string) {
 		"screenshots/session-resume-menu.png",
 		"screenshots/session-shape.png",
 		"screenshots/session-vital-signs.png",
+		"screenshots/settings-chart-colors.png",
 		"screenshots/settings-embeddings.png",
 		"screenshots/settings-remote.png",
 		"screenshots/settings.png",
@@ -524,6 +566,7 @@ func writeGeneratedAssets(t *testing.T, dir, content string) {
 		"screenshots/tool-block-copy-btn.png",
 		"screenshots/tool-blocks.png",
 		"screenshots/tool-groups.png",
+		"screenshots/tool-output-formatted.png",
 		"screenshots/tool-usage.png",
 		"screenshots/top-sessions.png",
 		"screenshots/top-skills.png",

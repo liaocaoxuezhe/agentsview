@@ -2,9 +2,11 @@ package parser
 
 import (
 	"context"
+	"fmt"
 	"os"
 	"path/filepath"
 	"testing"
+	"time"
 
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
@@ -14,10 +16,24 @@ import (
 // format Kimi Work persists (protocol 1.4 metadata header followed by
 // top-level turn.prompt / context.append_loop_event records).
 func kimiWorkFixture(firstMessage string) string {
-	return `{"type":"metadata","protocol_version":"1.4","created_at":1704067200000}` + "\n" +
-		`{"timestamp":1704067200.0,"type":"turn.prompt","input":[{"type":"text","text":"` + firstMessage + `"}]}` + "\n" +
-		`{"timestamp":1704067201.0,"type":"context.append_loop_event","event":{"type":"content.part","part":{"type":"text","text":"Done."}}}` + "\n" +
-		`{"timestamp":1704067202.0,"type":"context.append_loop_event","event":{"type":"step.end","finishReason":"stop","usage":{"output":42}}}` + "\n"
+	return kimiWorkFixtureAt(firstMessage, 1704067200)
+}
+
+func kimiWorkSessionUsageFixture() string {
+	return `{"timestamp":1704067200.0,"message":{"type":"TurnBegin","payload":{"user_input":[{"type":"text","text":"usage question"}]}}}` + "\n" +
+		`{"timestamp":1704067201.0,"message":{"type":"ContentPart","payload":{"type":"text","text":"Done."}}}` + "\n" +
+		`{"timestamp":1704067202.0,"message":{"type":"StatusUpdate","payload":{"token_usage":{"output":42}}}}` + "\n" +
+		`{"timestamp":1704067203.0,"message":{"type":"TurnEnd","payload":{}}}` + "\n"
+}
+
+func kimiWorkFixtureAt(firstMessage string, timestamp int64) string {
+	return fmt.Sprintf(
+		`{"type":"metadata","protocol_version":"1.4","created_at":%d}`+"\n"+
+			`{"timestamp":%d.0,"type":"turn.prompt","input":[{"type":"text","text":"%s"}]}`+"\n"+
+			`{"timestamp":%d.0,"type":"context.append_loop_event","event":{"type":"content.part","part":{"type":"text","text":"Done."}}}`+"\n"+
+			`{"timestamp":%d.0,"type":"context.append_loop_event","event":{"type":"step.end","finishReason":"stop","usage":{"output":42}}}`+"\n",
+		timestamp*1000, timestamp, firstMessage, timestamp+1, timestamp+2,
+	)
 }
 
 func TestKimiWorkProviderDiscoveryFiltersAuxSessions(t *testing.T) {
@@ -208,6 +224,82 @@ func TestKimiWorkProviderParse(t *testing.T) {
 		assert.Equal(t, result.Session.ID, ev.SessionID)
 		assert.Contains(t, ev.DedupKey, "kimi-work:session:")
 		assert.NotContains(t, ev.DedupKey, "kimi:session:")
+	}
+}
+
+func TestKimiWorkProviderParseRetainsProviderCwd(t *testing.T) {
+	root := t.TempDir()
+	wd := "wd_agentsview_e901f41e2366"
+	sessionDir := "conv-cwd"
+	sourcePath := filepath.Join(
+		root, wd, sessionDir, "agents", "main", "wire.jsonl",
+	)
+	writeSourceFile(t, sourcePath, kimiConfigUpdateCwdLine(t)+"\n"+
+		kimiWorkSessionUsageFixture())
+
+	provider, ok := NewProvider(AgentKimiWork, ProviderConfig{Roots: []string{root}})
+	require.True(t, ok)
+	sources, err := provider.Discover(context.Background())
+	require.NoError(t, err)
+	require.Len(t, sources, 1)
+	outcome, err := provider.Parse(context.Background(), ParseRequest{Source: sources[0]})
+	require.NoError(t, err)
+	require.Len(t, outcome.Results, 1)
+	result := outcome.Results[0].Result
+	assert.Equal(t, "/Users/helix/Code/mcp-hub", result.Session.Cwd)
+	require.Len(t, result.Session.UsageEvents, 1)
+	assert.Equal(t, result.Session.ID, result.Session.UsageEvents[0].SessionID)
+	assert.Equal(t, "kimi-work:session:"+wd+":main:"+sessionDir, result.Session.UsageEvents[0].DedupKey)
+	assert.Equal(t, 42, result.Session.UsageEvents[0].OutputTokens)
+}
+
+func TestKimiWorkProviderMissingModelUsesDateAmbiguousAlias(t *testing.T) {
+	tests := []struct {
+		name      string
+		timestamp int64
+		wantStart time.Time
+	}{
+		{
+			name:      "before K3 cutoff",
+			timestamp: 1784376000,
+			wantStart: time.Date(2026, 7, 18, 12, 0, 0, 0, time.UTC),
+		},
+		{
+			name:      "after K3 cutoff",
+			timestamp: 1784548800,
+			wantStart: time.Date(2026, 7, 20, 12, 0, 0, 0, time.UTC),
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			root := t.TempDir()
+			sourcePath := filepath.Join(
+				root, "wd_agentsview_e901f41e2366",
+				"conv-3fac68340656963a67a35ba9",
+				"agents", "main", "wire.jsonl",
+			)
+			writeSourceFile(t, sourcePath,
+				kimiWorkFixtureAt("missing model", tt.timestamp))
+
+			provider, ok := NewProvider(AgentKimiWork, ProviderConfig{
+				Roots: []string{root},
+			})
+			require.True(t, ok)
+			sources, err := provider.Discover(context.Background())
+			require.NoError(t, err)
+			require.Len(t, sources, 1)
+
+			outcome, err := provider.Parse(context.Background(), ParseRequest{
+				Source: sources[0],
+			})
+			require.NoError(t, err)
+			require.Len(t, outcome.Results, 1)
+			result := outcome.Results[0].Result
+			assert.Equal(t, tt.wantStart, result.Session.StartedAt.UTC())
+			require.Len(t, result.Messages, 2)
+			assert.Equal(t, "daimon-kimi-code", result.Messages[1].Model)
+		})
 	}
 }
 

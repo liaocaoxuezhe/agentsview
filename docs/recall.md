@@ -18,32 +18,135 @@ warnings as entries that can be listed, queried, and packed into a task brief.
 This is different from [semantic search](/semantic-search/). Semantic search
 finds relevant passages in the transcript archive. Recall searches a separate
 set of distilled entries and keeps the transcript region supporting each entry
-as evidence. Recall entry retrieval is lexical today; it does not use the
-embedding index.
+as evidence. Recall queries support lexical, vector, and hybrid retrieval; the
+default remains lexical while this feature is experimental.
 
 ## Current surface
 
 The current implementation is local and SQLite-only. The CLI provides:
 
 - `recall list`, `get`, and `stats` for inspection;
-- `recall query` for ranked lexical retrieval;
+- `recall query` for ranked lexical, vector, or hybrid retrieval;
 - `recall brief` for a packed, trusted task briefing;
 - `recall extract` for opt-in model-backed extraction (see
   [Automatic extraction](#automatic-extraction)), including
   `recall extract preview` for previewing deterministic session chunks; and
 - `recall import --dry-run` for validating reviewed JSONL candidates.
 
+The top-level **Recall** page has two tabs:
+
+- **Corpus** is a read-only browser for distilled entries. It shows extraction
+  coverage and generation state, and filters entries by text, project, entry
+  type, generation, and review state. Expand an entry to inspect its body,
+  trigger, uncertainty, provenance metadata, and evidence links back to the
+  source transcript.
+- **Generated insights** creates and stores longer reports over an explicit
+  session scope. Its form always shows the date range, project, session agent,
+  automated-session scope, report template, generator, and optional focus used
+  for the next report. Saved reports can be exported, published, linked, or
+  deleted from the archive.
+
+Open Recall from the header or navigate directly to `/recall`. Generated-report
+links use `/recall?tab=generated&insight=<id>`.
+
+![Recall corpus browser](/assets/generated/screenshots/recall-corpus.png)
+
+![Generated insights](/assets/generated/screenshots/recall-generated-insights.png)
+
+Generated insights use the configured OpenAI-compatible endpoint when
+`[insights]` has both an `endpoint` and `model`; when `[insights]` is absent,
+they use the selected agent CLI on your machine. Partial endpoint configuration
+is rejected during configuration validation. Endpoint mode sends one non-streaming
+`POST /chat/completions` request with the generated prompt as a user message.
+It accepts the first choice's `assistant` message with string `message.content`
+and optional response `model`. It does not support streaming, `/responses`, legacy completions,
+tool calls, or content-part arrays. An endpoint failure returns an error and
+does not retry through a CLI.
+
+```toml
+[insights]
+endpoint = "http://127.0.0.1:11434/v1"
+model = "llama3.1"
+api_key_env = "OPENAI_API_KEY" # optional; the value is read at runtime
+# allow_http = true            # required for non-loopback HTTP endpoints
+```
+
+Loopback HTTP endpoints are allowed for local models. Remote endpoints must
+use HTTPS unless `allow_http = true` explicitly opts into plaintext transport.
+The endpoint receives transcript-derived content, so review the provider's
+privacy and retention behavior. API keys stay in the environment and are sent
+only as a bearer header; they are not stored in the AgentsView configuration.
+Canned insight cache keys include the effective backend, model, and a safe
+endpoint identity, so changing `[insights]` after restarting the server selects
+a separate cached report. Changes to credentials or transport opt-ins do not
+change that identity; use force refresh when those changes should regenerate a
+report under the same endpoint and model.
+
+### Configuring agent binaries
+
+AgentsView normally resolves `claude`, `codex`, `copilot`, `gemini`, and
+`kiro-cli` through `PATH`. To pin a particular executable, configure its agent
+table:
+
+```toml
+[agent.claude]
+binary = "/usr/local/bin/claude"
+
+[agent.gemini]
+binary = "/usr/local/bin/gemini"
+```
+
+Each known agent has an independent override. This setting affects report
+generation only; session discovery continues to read the configured session
+directories.
+
 Reviewed JSONL import is a guarded laboratory inlet, not a stable or recommended
 end-user workflow. Use an isolated `AGENTSVIEW_DATA_DIR` for experiments. The
 import command refuses the default data directory unless the operator explicitly
 overrides that guard.
 
-Recall is not available through PostgreSQL or DuckDB stores. It also has no web
-UI and no semantic retrieval over Recall entries.
+The Corpus tab is not available through PostgreSQL or DuckDB stores, so those
+read-only servers open Recall on Generated insights instead. On the local SQLite
+UI, Session Vital Signs also includes a read-only Recall panel for the open
+session and links each evidence range back to the transcript. Corpus population,
+review, extraction-generation management, and ranked querying remain CLI and
+HTTP API workflows.
 
 The daemon exposes the same inspection and query operations over its HTTP API.
 Ordinary queries record measurement data when the SQLite store is writable, but
 read-only archives remain queryable without recording.
+
+## Vector and hybrid retrieval
+
+`recall query` and `recall brief` accept `--mode lexical`, `--mode vector`, or
+`--mode hybrid`. Lexical is the default. Vector search ranks the separate Recall
+embedding store, while hybrid search combines lexical and vector ranks.
+
+Recall uses the same `[vector]` model and embeddings servers as session semantic
+search, but it has an independent index generation. Build it explicitly with:
+
+```bash
+agentsview embeddings build --store recall
+```
+
+Automatic Recall embedding requires separate consent because accepted entries
+may contain distilled private content:
+
+```toml
+[vector.embed]
+recall = true
+```
+
+That setting permits startup, corpus-mutation, and periodic refresh work to send
+accepted Recall entry titles, bodies, and triggers to the configured embeddings
+endpoint. It is off by default; manually running the build command is treated as
+one-time consent for that invocation.
+
+Vector and hybrid queries fail closed when the active Recall corpus is newer
+than its last completed vector build. Rebuild the Recall store, or continue
+using lexical mode while an automatic refresh catches up. See
+[Semantic Search](/semantic-search/#enabling-vector) for the shared embedding
+configuration and endpoint privacy considerations.
 
 ## Automatic extraction
 
@@ -63,13 +166,28 @@ model = "your-model-name"
 endpoint = "http://127.0.0.1:30000/v1"
 ```
 
+For a remote OpenAI-compatible provider such as Atlas Cloud, keep the key in the
+environment and point the server entry at the provider's `/v1` base URL:
+
+```toml
+[recall.extract]
+enabled = true
+model = "deepseek-ai/deepseek-v4-pro"
+server = "atlascloud"
+
+[recall.extract.servers.atlascloud]
+endpoint = "https://api.atlascloud.ai/v1"
+api_key_env = "ATLASCLOUD_API_KEY"
+timeout = "120s"
+```
+
 Optional keys: `deployment` (labels which serving instance produced the corpus),
 `server` (selects among multiple named servers), `quiet_period` (default `"30m"`
 — how long a session must have been ended before extraction),
 `backstop_interval` (default `"1h"`), `failure_backoff` (default `"1h"`),
-`max_window_chars` (default 50000), `max_tokens`, a `[recall.extract.prompts]`
-table (`profile`, `dir`), and a `[recall.extract.request]` table (`temperature`,
-`extra_body`).
+`max_window_chars` (default 50000), `max_tokens`, per-server `api_key_env`, a
+`[recall.extract.prompts]` table (`profile`, `dir`), and a
+`[recall.extract.request]` table (`temperature`, `extra_body`).
 
 Non-loopback endpoints must use HTTPS: extraction sends transcript content to
 the endpoint, and plaintext HTTP off the machine could be intercepted. A server
@@ -180,65 +298,10 @@ rebuilt when schemas, parsers, scoring, or extraction policies change. Reset
 only the experimental Recall corpus through an explicit future workflow. Never
 delete or recreate the session archive as a Recall reset strategy.
 
-## Research direction
+## Experimental limits
 
-The Recall substrate introduced in 0.38.0 is the population foundation. It
-deliberately does not ship a model runner, automatic write-through, bulk
-extraction, automatic promotion, or per-session generated summaries. The next
-work is intended to earn those capabilities in stages.
-
-### Local extractor calibration
-
-Calibration will run against isolated laboratory copies of real session rows and
-exact host-built ordinal windows. One frozen, tools-disabled local model
-configuration will extract structured candidates at a time. Each run should
-record model and prompt versions, schema and decoding settings, input digests,
-latency, and token or resource cost.
-
-Independent judge models will evaluate correctness, semantic evidence support,
-scope, transferability, harmfulness, and candidate duplication. Judges are local
-by default, preferably from a different model family than the extractor. Small
-blind human audits estimate judge error; the user is not expected to hand-label
-the primary evaluation corpus.
-
-A remote frontier judge is permitted only after an explicit per-run opt-in names
-the endpoint and model and states that candidate text and supporting transcript
-material will leave the machine. There is no automatic cloud fallback. Synthetic
-or otherwise non-sensitive sessions can be selected for remote runs.
-
-Calibration reports yield and abstention alongside keeper precision, harmful
-output, transferability, semantic provenance, duplicate detection quality, and
-local resource cost. Exposure records alone are not usefulness labels. Model
-generation or judging never confers `human_reviewed`; automated entries remain
-outside trusted Recall until a separate promotion policy is approved.
-
-### Explicit write-through pilot
-
-The first population pilot is an explicit callback after an answered Recall
-miss, not an invisible side effect of reading:
-
-1. `recall query` or `recall brief` returns a query ID and mechanical miss
-   reason.
-1. The agent or user finds supporting transcript regions with archive search and
-   message reads.
-1. A future proposal command submits the query ID and selected ordinal windows.
-1. The host rebuilds and verifies those windows, runs the local distiller, and
-   applies calibrated duplicate detection.
-1. Candidates are stored as `unreviewed_auto`; the pilot requires an explicit
-   promotion decision before they enter trusted Recall.
-
-This bounds model cost to explicitly answered misses and keeps the actor, input,
-evidence, and output auditable.
-
-### Earned automation and benchmarks
-
-Demand-driven backfill over sessions surfaced by recorded misses comes before
-end-of-session extraction. Broad extraction is deferred until measured
-precision, provenance, duplicate control, yield, cost, and explicit helpfulness
-outcomes justify it. Semantic or hybrid retrieval over Recall entries is a
-separate later experiment rather than part of population.
-
-LongMemEval-v2 is planned as a complementary long-horizon benchmark once the
-local extraction and population interfaces stabilize. It can measure whether a
-populated corpus answers questions over time, but it does not replace
-candidate-level provenance, harmfulness, and duplication evaluation.
+Recall remains an opt-in research feature. Automatic extraction never promotes
+entries into trusted Recall, and the session panel is inspection-only. There is
+no PostgreSQL or DuckDB Recall backend, no stable end-user import workflow, and
+no pruning policy for the measurement ledger yet. Expect corpus rebuilds as the
+schema, scoring, extraction policy, and trust model evolve.

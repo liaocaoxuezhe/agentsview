@@ -23,6 +23,7 @@ import (
 	"testing"
 	"time"
 
+	"github.com/BurntSushi/toml"
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
 
@@ -1741,6 +1742,7 @@ func TestSidebarIndexValidatesParams(t *testing.T) {
 		"/api/v1/sessions/sidebar-index?min_user_messages=bad",
 		"/api/v1/sessions/sidebar-index?date=2024-99-99",
 		"/api/v1/sessions/sidebar-index?date_from=2024-06-02&date_to=2024-06-01",
+		"/api/v1/sessions/sidebar-index?timezone=Fake%2FZone",
 		"/api/v1/sessions/sidebar-index?active_since=not-a-timestamp",
 	}
 
@@ -1750,6 +1752,73 @@ func TestSidebarIndexValidatesParams(t *testing.T) {
 			assertStatus(t, w, http.StatusBadRequest)
 		})
 	}
+}
+
+func TestSessionDateFilterUsesRequestedTimezoneAndDefaultsToUTC(t *testing.T) {
+	te := setup(t)
+	te.seedSession(t, "utc-only", "my-app", 2, func(s *db.Session) {
+		s.UserMessageCount = 2
+		s.StartedAt = new("2024-06-16T01:00:00Z")
+		s.EndedAt = new("2024-06-16T02:00:00Z")
+	})
+	te.seedSession(t, "new-york-day", "my-app", 2, func(s *db.Session) {
+		s.UserMessageCount = 2
+		s.StartedAt = new("2024-06-16T05:00:00Z")
+		s.EndedAt = new("2024-06-16T06:00:00Z")
+	})
+
+	w := te.get(t, "/api/v1/sessions?date=2024-06-16")
+	assertStatus(t, w, http.StatusOK)
+	list := decode[sessionListResponse](t, w)
+	listIDs := make([]string, len(list.Sessions))
+	for i, session := range list.Sessions {
+		listIDs[i] = session.ID
+	}
+	assert.ElementsMatch(t, []string{"utc-only", "new-york-day"},
+		listIDs)
+
+	w = te.get(t,
+		"/api/v1/sessions?date=2024-06-16&timezone=America%2FNew_York")
+	assertStatus(t, w, http.StatusOK)
+	list = decode[sessionListResponse](t, w)
+	require.Len(t, list.Sessions, 1)
+	assert.Equal(t, "new-york-day", list.Sessions[0].ID)
+
+	w = te.get(t,
+		"/api/v1/sessions/sidebar-index?date=2024-06-16&timezone=America%2FNew_York")
+	assertStatus(t, w, http.StatusOK)
+	index := decode[db.SidebarSessionIndex](t, w)
+	assert.Equal(t, []string{"new-york-day"},
+		sidebarIndexRowIDs(index.Sessions))
+
+	w = te.get(t, "/api/v1/sessions?timezone=Fake%2FZone")
+	assertStatus(t, w, http.StatusBadRequest)
+	assertBodyContains(t, w, "invalid timezone: Fake/Zone")
+}
+
+func TestContentSearchDateFilterUsesRequestedTimezone(t *testing.T) {
+	te := setup(t)
+	te.seedSession(t, "search-new-york-previous-day", "my-app", 2, func(s *db.Session) {
+		s.StartedAt = new("2024-06-16T01:00:00Z")
+		s.EndedAt = new("2024-06-16T02:00:00Z")
+	})
+	te.seedMessages(t, "search-new-york-previous-day", 1, func(_ int, m *db.Message) {
+		m.Content = "TIMEZONE_NEEDLE"
+	})
+	te.seedSession(t, "search-new-york-requested-day", "my-app", 2, func(s *db.Session) {
+		s.StartedAt = new("2024-06-16T05:00:00Z")
+		s.EndedAt = new("2024-06-16T06:00:00Z")
+	})
+	te.seedMessages(t, "search-new-york-requested-day", 1, func(_ int, m *db.Message) {
+		m.Content = "TIMEZONE_NEEDLE"
+	})
+
+	w := te.get(t, "/api/v1/search/content?pattern=TIMEZONE_NEEDLE"+
+		"&date=2024-06-16&timezone=America%2FNew_York")
+	assertStatus(t, w, http.StatusOK)
+	result := decode[service.ContentSearchResult](t, w)
+	require.Len(t, result.Matches, 1)
+	assert.Equal(t, "search-new-york-requested-day", result.Matches[0].SessionID)
 }
 
 func TestGetSession_Found(t *testing.T) {
@@ -1763,6 +1832,19 @@ func TestGetSession_Found(t *testing.T) {
 	if resp.ID != "s1" {
 		t.Fatalf("expected id=s1, got %v", resp.ID)
 	}
+}
+
+func TestGetSession_RoundTripsReservedIDCharacters(t *testing.T) {
+	te := setup(t)
+	const sessionID = "deepseek-harness:child%7E/%25?#"
+	te.seedSession(t, sessionID, "my-app", 2)
+
+	w := te.get(t, "/api/v1/sessions/"+
+		"deepseek-harness%3Achild%257E%2F%2525%3F%23")
+	assertStatus(t, w, http.StatusOK)
+
+	resp := decode[db.Session](t, w)
+	assert.Equal(t, sessionID, resp.ID)
 }
 
 func TestGetSession_NotFound(t *testing.T) {
@@ -3140,6 +3222,83 @@ func TestAuthRequiredProtectsPing(t *testing.T) {
 	assertStatus(t, w, http.StatusOK)
 }
 
+func TestPingReportsStalledSyncWithoutLosingDaemonIdentity(t *testing.T) {
+	dir := tempDirWithRetryCleanup(t)
+	cfg := config.Config{
+		Host: "127.0.0.1", Port: 0, DataDir: dir,
+		DBPath: filepath.Join(dir, "test.db"), WriteTimeout: 30 * time.Second,
+	}
+	database := dbtest.OpenTestDBAt(t, cfg.DBPath)
+	engine := sync.NewEngine(database, sync.EngineConfig{
+		Machine: "test", ProgressStallAfter: time.Nanosecond,
+	})
+	t.Cleanup(engine.Close)
+	te := &testEnv{
+		srv: server.New(cfg, database, engine), db: database, engine: engine,
+		dataDir: dir,
+	}
+	te.handler = wrapTestHandler(cfg, te.srv.Handler())
+	type pingResponse struct {
+		OK      bool `json:"ok"`
+		Healthy bool `json:"healthy"`
+		Sync    *struct {
+			Phase     sync.Phase `json:"phase"`
+			Stalled   bool       `json:"stalled"`
+			StartedAt string     `json:"started_at"`
+			UpdatedAt string     `json:"updated_at"`
+		} `json:"sync,omitempty"`
+	}
+
+	healthy := decode[pingResponse](t, te.get(t, "/api/ping"))
+	assert.True(t, healthy.OK)
+	assert.True(t, healthy.Healthy)
+	assert.Nil(t, healthy.Sync)
+
+	progressSeen := make(chan struct{})
+	release := make(chan struct{})
+	var releaseOnce stdlibsync.Once
+	defer releaseOnce.Do(func() { close(release) })
+	done := make(chan struct{})
+	var once stdlibsync.Once
+	go func() {
+		engine.SyncAll(t.Context(), func(sync.Progress) {
+			once.Do(func() { close(progressSeen) })
+			<-release
+		})
+		close(done)
+	}()
+	select {
+	case <-progressSeen:
+	case <-time.After(time.Second):
+		require.FailNow(t, "sync did not publish progress")
+	}
+	require.Eventually(t, func() bool {
+		progress, active := engine.CurrentProgress()
+		return active && progress.Stalled
+	}, time.Second, time.Millisecond,
+		"sync progress did not age into the stalled state")
+
+	stalled := decode[pingResponse](t, te.get(t, "/api/ping"))
+	assert.True(t, stalled.OK,
+		"ping must keep proving the running daemon's identity")
+	assert.False(t, stalled.Healthy)
+	require.NotNil(t, stalled.Sync)
+	assert.Equal(t, sync.PhaseDiscovering, stalled.Sync.Phase)
+	assert.True(t, stalled.Sync.Stalled)
+	assert.NotEmpty(t, stalled.Sync.StartedAt)
+	assert.NotEmpty(t, stalled.Sync.UpdatedAt)
+
+	releaseOnce.Do(func() { close(release) })
+	select {
+	case <-done:
+	case <-time.After(time.Second):
+		require.FailNow(t, "sync did not finish after progress callback returned")
+	}
+	finished := decode[pingResponse](t, te.get(t, "/api/ping"))
+	assert.True(t, finished.Healthy)
+	assert.Nil(t, finished.Sync)
+}
+
 func TestGetGithubConfig(t *testing.T) {
 	t.Setenv("AGENTSVIEW_GITHUB_TOKEN", "")
 	t.Setenv("PATH", t.TempDir())
@@ -3366,6 +3525,176 @@ func TestGetSettings_UsesGitHubCLIAuthTokenFallback(t *testing.T) {
 	assert.True(t, resp.GithubConfigured)
 }
 
+func TestSettingsChartPaletteRoundTrip(t *testing.T) {
+	te := setup(t)
+	putSettings := func(body string) *httptest.ResponseRecorder {
+		req := httptest.NewRequest(http.MethodPut, "/api/v1/settings",
+			strings.NewReader(body))
+		req.Header.Set("Content-Type", "application/json")
+		req.Header.Set("Origin", "http://127.0.0.1:0")
+		w := httptest.NewRecorder()
+		te.handler.ServeHTTP(w, req)
+		return w
+	}
+
+	w := te.get(t, "/api/v1/settings")
+	assertStatus(t, w, http.StatusOK)
+	var initial struct {
+		ChartPalette config.ChartPalette `json:"chart_palette"`
+	}
+	require.NoError(t, json.Unmarshal(w.Body.Bytes(), &initial))
+	assert.Equal(t, config.ChartPaletteAgentsview, initial.ChartPalette)
+
+	w = putSettings(`{"chart_palette":"matplotlib"}`)
+	assertStatus(t, w, http.StatusOK)
+	var updated struct {
+		ChartPalette config.ChartPalette `json:"chart_palette"`
+	}
+	require.NoError(t, json.Unmarshal(w.Body.Bytes(), &updated))
+	assert.Equal(t, config.ChartPaletteMatplotlib, updated.ChartPalette)
+
+	var persisted struct {
+		ChartPalette config.ChartPalette `toml:"chart_palette"`
+	}
+	_, err := toml.DecodeFile(filepath.Join(te.dataDir, "config.toml"), &persisted)
+	require.NoError(t, err)
+	assert.Equal(t, config.ChartPaletteMatplotlib, persisted.ChartPalette)
+}
+
+func TestSettingsRejectInvalidChartPaletteWithoutChangingSelection(t *testing.T) {
+	te := setup(t)
+	putSettings := func(body string) *httptest.ResponseRecorder {
+		req := httptest.NewRequest(http.MethodPut, "/api/v1/settings",
+			strings.NewReader(body))
+		req.Header.Set("Content-Type", "application/json")
+		req.Header.Set("Origin", "http://127.0.0.1:0")
+		w := httptest.NewRecorder()
+		te.handler.ServeHTTP(w, req)
+		return w
+	}
+
+	w := putSettings(`{"chart_palette":"matplotlib"}`)
+	assertStatus(t, w, http.StatusOK)
+
+	w = putSettings(`{"chart_palette":"neon"}`)
+	assertStatus(t, w, http.StatusBadRequest)
+	assertBodyContains(t, w, `chart_palette must be`)
+	w = putSettings(`{"chart_palette":""}`)
+	assertStatus(t, w, http.StatusBadRequest)
+	assertBodyContains(t, w, `chart_palette must be`)
+
+	w = te.get(t, "/api/v1/settings")
+	assertStatus(t, w, http.StatusOK)
+	var got struct {
+		ChartPalette config.ChartPalette `json:"chart_palette"`
+	}
+	require.NoError(t, json.Unmarshal(w.Body.Bytes(), &got))
+	assert.Equal(t, config.ChartPaletteMatplotlib, got.ChartPalette)
+}
+
+func TestSettingsDisabledProvidersRoundTrip(t *testing.T) {
+	geminiDir := filepath.Join(t.TempDir(), "gemini")
+	te := setup(t, func(cfg *config.Config) {
+		cfg.AgentDirs = map[parser.AgentType][]string{
+			parser.AgentClaude: {"/sessions/claude"},
+			parser.AgentGemini: {geminiDir},
+		}
+	})
+	put := func(body string) *httptest.ResponseRecorder {
+		req := httptest.NewRequest(http.MethodPut, "/api/v1/settings",
+			strings.NewReader(body))
+		req.Header.Set("Content-Type", "application/json")
+		w := httptest.NewRecorder()
+		te.handler.ServeHTTP(w, req)
+		return w
+	}
+
+	w := put(`{"disabled_agents":["gemini","claude","gemini"]}`)
+	assertStatus(t, w, http.StatusOK)
+	type sessionProvider struct {
+		ID          parser.AgentType `json:"id"`
+		DisplayName string           `json:"display_name"`
+		Dirs        []string         `json:"dirs"`
+	}
+	var got struct {
+		SessionProviders []sessionProvider  `json:"session_providers"`
+		DisabledAgents   []parser.AgentType `json:"disabled_agents"`
+	}
+	require.NoError(t, json.Unmarshal(w.Body.Bytes(), &got))
+	assert.Equal(t,
+		[]parser.AgentType{parser.AgentClaude, parser.AgentGemini},
+		got.DisabledAgents,
+	)
+	require.NotEmpty(t, got.SessionProviders)
+	assert.Equal(t, parser.AgentClaude, got.SessionProviders[0].ID)
+	assert.Equal(t, "Claude Code", got.SessionProviders[0].DisplayName)
+	assert.Equal(t, []string{"/sessions/claude"}, got.SessionProviders[0].Dirs)
+	geminiIndex := slices.IndexFunc(got.SessionProviders,
+		func(provider sessionProvider) bool {
+			return provider.ID == parser.AgentGemini
+		})
+	require.NotEqual(t, -1, geminiIndex)
+	gemini := got.SessionProviders[geminiIndex]
+	assert.Equal(t, "Gemini", gemini.DisplayName)
+	assert.Equal(t, []string{geminiDir}, gemini.Dirs)
+
+	var persisted struct {
+		DisabledAgents []parser.AgentType `toml:"disabled_agents"`
+	}
+	_, err := toml.DecodeFile(filepath.Join(te.dataDir, "config.toml"), &persisted)
+	require.NoError(t, err)
+	assert.Equal(t, got.DisabledAgents, persisted.DisabledAgents)
+}
+
+func TestSettingsDisabledProvidersDefaultToEmptyArray(t *testing.T) {
+	te := setup(t)
+
+	w := te.get(t, "/api/v1/settings")
+	assertStatus(t, w, http.StatusOK)
+	var got struct {
+		DisabledAgents json.RawMessage `json:"disabled_agents"`
+	}
+	require.NoError(t, json.Unmarshal(w.Body.Bytes(), &got))
+	assert.JSONEq(t, `[]`, string(got.DisabledAgents))
+}
+
+func TestSettingsRejectInvalidDisabledProviderWithoutMutation(t *testing.T) {
+	te := setup(t)
+	put := func(body string) *httptest.ResponseRecorder {
+		req := httptest.NewRequest(http.MethodPut, "/api/v1/settings",
+			strings.NewReader(body))
+		req.Header.Set("Content-Type", "application/json")
+		w := httptest.NewRecorder()
+		te.handler.ServeHTTP(w, req)
+		return w
+	}
+
+	assertStatus(t, put(`{"disabled_agents":["gemini"]}`), http.StatusOK)
+	w := put(`{"disabled_agents":["nope"]}`)
+	assertStatus(t, w, http.StatusBadRequest)
+	assertBodyContains(t, w, "unknown session provider")
+
+	w = te.get(t, "/api/v1/settings")
+	assertStatus(t, w, http.StatusOK)
+	var got struct {
+		DisabledAgents []parser.AgentType `json:"disabled_agents"`
+	}
+	require.NoError(t, json.Unmarshal(w.Body.Bytes(), &got))
+	assert.Equal(t, []parser.AgentType{parser.AgentGemini}, got.DisabledAgents)
+}
+
+func TestSettingsDisabledProvidersRemainLockedInPGMode(t *testing.T) {
+	te := setupPGMode(t)
+	req := httptest.NewRequest(http.MethodPut, "/api/v1/settings",
+		strings.NewReader(`{"disabled_agents":["gemini"]}`))
+	req.Header.Set("Content-Type", "application/json")
+	w := httptest.NewRecorder()
+	te.handler.ServeHTTP(w, req)
+
+	assertStatus(t, w, http.StatusNotImplemented)
+	assertBodyContains(t, w, "settings cannot be modified")
+}
+
 func TestSettingsRemainLockedInPGMode(t *testing.T) {
 	te := setupPGMode(t)
 	te.srv.SetGithubToken("settings-test-token")
@@ -3379,7 +3708,7 @@ func TestSettingsRemainLockedInPGMode(t *testing.T) {
 	assert.True(t, resp.ReadOnly)
 
 	req := httptest.NewRequest(http.MethodPut, "/api/v1/settings",
-		strings.NewReader(`{"require_auth":true}`))
+		strings.NewReader(`{"chart_palette":"matplotlib"}`))
 	req.Header.Set("Content-Type", "application/json")
 	req.Header.Set("Origin", "http://127.0.0.1:0")
 	w = httptest.NewRecorder()
@@ -3845,8 +4174,10 @@ func TestUploadSession_ReuploadPreservesPins(t *testing.T) {
 	_, err = te.db.PinMessage("upload-pinned", msgs[0].ID, &note)
 	require.NoError(t, err, "PinMessage")
 
+	// The pinned message is unchanged; only the reply was edited, so
+	// the pin re-attaches to its message through the identity rules.
 	updated := testjsonl.NewSessionBuilder().
-		AddClaudeUser(tsEarly, "updated upload").
+		AddClaudeUser(tsEarly, "original upload").
 		AddClaudeAssistant(tsEarlyS5, "updated reply").
 		String()
 	w = te.upload(t, "upload-pinned.jsonl", updated,
@@ -3864,6 +4195,133 @@ func TestUploadSession_ReuploadPreservesPins(t *testing.T) {
 	if pins[0].Note == nil || *pins[0].Note != note {
 		t.Fatalf("pin note = %v, want %q", pins[0].Note, note)
 	}
+}
+
+// TestUploadSession_ReuploadDropsPinOnEditedMessage documents the
+// intended limit: a re-upload that edits the pinned UUID-less message
+// itself destroys the only identity the pin can follow, so the pin is
+// dropped rather than guessed onto the edited row. Both stores apply
+// the same rule, keeping SQLite and PostgreSQL consistent.
+func TestUploadSession_ReuploadDropsPinOnEditedMessage(t *testing.T) {
+	te := setup(t)
+
+	initial := testjsonl.NewSessionBuilder().
+		AddClaudeUser(tsEarly, "original upload").
+		AddClaudeAssistant(tsEarlyS5, "original reply").
+		String()
+	w := te.upload(t, "upload-pin-edited.jsonl", initial,
+		"project=myproj&machine=remote")
+	assertStatus(t, w, http.StatusOK)
+
+	msgs, err := te.db.GetAllMessages(
+		context.Background(), "upload-pin-edited",
+	)
+	require.NoError(t, err, "GetAllMessages")
+	require.Len(t, msgs, 2, "initial messages")
+	_, err = te.db.PinMessage("upload-pin-edited", msgs[0].ID, nil)
+	require.NoError(t, err, "PinMessage")
+
+	updated := testjsonl.NewSessionBuilder().
+		AddClaudeUser(tsEarly, "edited upload").
+		AddClaudeAssistant(tsEarlyS5, "original reply").
+		String()
+	w = te.upload(t, "upload-pin-edited.jsonl", updated,
+		"project=myproj&machine=remote")
+	assertStatus(t, w, http.StatusOK)
+
+	pins, err := te.db.ListPinnedMessages(
+		context.Background(), "upload-pin-edited", "",
+	)
+	require.NoError(t, err, "ListPinnedMessages")
+	assert.Empty(t, pins,
+		"editing the pinned message drops the pin")
+}
+
+func TestUploadSession_ReuploadDoesNotMoveLegacyPinToIDEEnvelope(t *testing.T) {
+	te := setup(t)
+	const sessionID = "upload-pinned-envelope"
+	const mixedPrompt = "<ide_opened_file>The user opened /workspace/app/README.md.</ide_opened_file> Explain this file."
+
+	require.NoError(t, te.db.UpsertSession(db.Session{
+		ID: sessionID, Project: "myproj", Machine: "remote", Agent: "claude",
+	}), "seed legacy uploaded session")
+	require.NoError(t, te.db.ReplaceSessionMessages(sessionID, []db.Message{{
+		SessionID: sessionID, Ordinal: 0, Role: "user",
+		Content: mixedPrompt, ContentLength: len(mixedPrompt),
+	}}), "seed legacy mixed prompt")
+	msgs, err := te.db.GetAllMessages(context.Background(), sessionID)
+	require.NoError(t, err, "GetAllMessages before re-upload")
+	require.Len(t, msgs, 1, "legacy messages")
+	_, err = te.db.PinMessage(sessionID, msgs[0].ID, nil)
+	require.NoError(t, err, "PinMessage")
+
+	updated := testjsonl.NewSessionBuilder().
+		AddClaudeUser(tsEarly, mixedPrompt).
+		String()
+	w := te.upload(t, sessionID+".jsonl", updated,
+		"project=myproj&machine=remote")
+	assertStatus(t, w, http.StatusOK)
+
+	pins, err := te.db.ListPinnedMessages(context.Background(), sessionID, "")
+	require.NoError(t, err, "ListPinnedMessages")
+	assert.Empty(t, pins,
+		"legacy pin must not move from the prompt to hidden IDE metadata")
+
+	msgs, err = te.db.GetAllMessages(context.Background(), sessionID)
+	require.NoError(t, err, "GetAllMessages after re-upload")
+	require.Len(t, msgs, 2, "split messages")
+	assert.True(t, msgs[0].IsSystem, "IDE envelope must remain hidden")
+	assert.Equal(t, "Explain this file.", msgs[1].Content)
+}
+
+func TestUploadSession_ReuploadFollowsLegacyPinAcrossIDEEnvelopeSplit(t *testing.T) {
+	te := setup(t)
+	const sessionID = "upload-pinned-after-envelope"
+	const mixedPrompt = "<ide_opened_file>The user opened /workspace/app/README.md.</ide_opened_file> Explain this file."
+
+	require.NoError(t, te.db.UpsertSession(db.Session{
+		ID: sessionID, Project: "myproj", Machine: "remote", Agent: "claude",
+	}), "seed legacy uploaded session")
+	require.NoError(t, te.db.ReplaceSessionMessages(sessionID, []db.Message{
+		{
+			SessionID: sessionID, Ordinal: 0, Role: "user",
+			Content: mixedPrompt, ContentLength: len(mixedPrompt),
+		},
+		{
+			SessionID: sessionID, Ordinal: 1, Role: "assistant",
+			Content: "Legacy reply", ContentLength: len("Legacy reply"),
+		},
+	}), "seed legacy messages")
+	msgs, err := te.db.GetAllMessages(context.Background(), sessionID)
+	require.NoError(t, err, "GetAllMessages before re-upload")
+	require.Len(t, msgs, 2, "legacy messages")
+	_, err = te.db.PinMessage(sessionID, msgs[1].ID, nil)
+	require.NoError(t, err, "PinMessage")
+
+	updated := testjsonl.NewSessionBuilder().
+		AddClaudeUser(tsEarly, mixedPrompt).
+		AddClaudeAssistant(tsEarlyS5, "Legacy reply").
+		String()
+	w := te.upload(t, sessionID+".jsonl", updated,
+		"project=myproj&machine=remote")
+	assertStatus(t, w, http.StatusOK)
+
+	// The envelope split shifts the whole visible tail. The pin's
+	// role, content, and occurrence rank identify its message, so the
+	// pin follows "Legacy reply" to its shifted ordinal instead of
+	// re-attaching to the visible prompt at the saved ordinal.
+	pins, err := te.db.ListPinnedMessages(context.Background(), sessionID, "")
+	require.NoError(t, err, "ListPinnedMessages")
+	require.Len(t, pins, 1, "legacy pin must survive the envelope split")
+	assert.Equal(t, 2, pins[0].Ordinal,
+		"pin follows its message, not the saved ordinal")
+
+	msgs, err = te.db.GetAllMessages(context.Background(), sessionID)
+	require.NoError(t, err, "GetAllMessages after re-upload")
+	require.Len(t, msgs, 3, "split messages")
+	assert.True(t, msgs[0].IsSystem, "IDE envelope must remain hidden")
+	assert.Equal(t, "Explain this file.", msgs[1].Content)
+	assert.Equal(t, "Legacy reply", msgs[2].Content)
 }
 
 func TestUploadSession_EmptyFile(t *testing.T) {
@@ -4537,7 +4995,8 @@ func TestFindAvailablePortSkipsOccupied(t *testing.T) {
 
 	occupied := ln.Addr().(*net.TCPAddr).Port
 
-	got := server.FindAvailablePort("127.0.0.1", occupied)
+	got, err := server.FindAvailablePort("127.0.0.1", occupied)
+	require.NoError(t, err)
 	if got == occupied {
 		t.Errorf(
 			"FindAvailablePort returned occupied port %d", occupied,
@@ -4545,11 +5004,55 @@ func TestFindAvailablePortSkipsOccupied(t *testing.T) {
 	}
 }
 
+func TestFindAvailablePortWildcardSkipsIPv4OccupiedPort(t *testing.T) {
+	// A dual-stack wildcard listen can succeed on IPv6 while an unrelated
+	// process still owns the port on IPv4 (observed on macOS), so wildcard
+	// availability must check the IPv4 wildcard address on its own.
+	ln, err := net.Listen("tcp4", "0.0.0.0:0")
+	require.NoError(t, err, "bind IPv4 wildcard")
+	defer ln.Close()
+
+	occupied := ln.Addr().(*net.TCPAddr).Port
+
+	got, err := server.FindAvailablePort("0.0.0.0", occupied)
+	require.NoError(t, err)
+	assert.NotEqual(t, occupied, got,
+		"wildcard port selection must skip an IPv4-occupied port")
+}
+
+func TestFindAvailablePortWildcardSkipsIPv6OccupiedPort(t *testing.T) {
+	ln, err := net.Listen("tcp6", "[::]:0")
+	if err != nil {
+		t.Skipf("IPv6 unavailable: %v", err)
+	}
+	defer ln.Close()
+
+	occupied := ln.Addr().(*net.TCPAddr).Port
+
+	got, err := server.FindAvailablePort("0.0.0.0", occupied)
+	require.NoError(t, err)
+	assert.NotEqual(t, occupied, got,
+		"wildcard port selection must skip an IPv6-occupied port")
+}
+
 func TestFindAvailablePortZeroReturnsAssignedPort(t *testing.T) {
-	got := server.FindAvailablePort("127.0.0.1", 0)
+	got, err := server.FindAvailablePort("127.0.0.1", 0)
+	require.NoError(t, err)
 	if got == 0 {
 		t.Fatal("FindAvailablePort returned literal port 0")
 	}
+}
+
+func TestFindAvailablePortDoesNotReturnExhaustedCandidate(t *testing.T) {
+	ln, err := net.Listen("tcp4", "127.0.0.1:65535")
+	if err != nil {
+		t.Skipf("reserve final TCP port: %v", err)
+	}
+	defer ln.Close()
+
+	_, err = server.FindAvailablePort("127.0.0.1", 65535)
+	require.Error(t, err,
+		"an exhausted search must report that no candidate is available")
 }
 
 func TestEvents_StreamsDataChangedAfterSync(t *testing.T) {

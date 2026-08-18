@@ -222,7 +222,13 @@ describe("SessionsStore", () => {
   let sessions: ReturnType<typeof createSessionsStore>;
 
   beforeEach(() => {
+    vi.restoreAllMocks();
     vi.clearAllMocks();
+    const resolvedOptions = Intl.DateTimeFormat().resolvedOptions();
+    vi.spyOn(Intl.DateTimeFormat.prototype, "resolvedOptions").mockReturnValue({
+      ...resolvedOptions,
+      timeZone: "America/New_York",
+    });
     vi.mocked(callGenerated).mockImplementation(
       (request: () => Promise<unknown>) => request(),
     );
@@ -306,6 +312,95 @@ describe("SessionsStore", () => {
       // Defaults for fields not in localStorage
       expect(store.filters.minMessages).toBe(0);
       expect(store.filters.includeOneShot).toBe(true);
+    });
+
+    it("holds saved filters through root loads and refreshes", async () => {
+      const saved = JSON.stringify({
+        version: 2,
+        project: "saved-project",
+        agent: "codex",
+      });
+      localStorage.setItem("session-filters", saved);
+      const store = createSessionsStore();
+      store.resetFiltersForRoot();
+
+      await store.load();
+      expect(store.filters.project).toBe("");
+      expect(localStorage.getItem("session-filters")).toBe(saved);
+
+      const detach = store.attachSidebar();
+      store.refreshSidebarIfAttached();
+      await vi.waitFor(() => {
+        expect(api.getSidebarSessionIndex).toHaveBeenCalledTimes(2);
+      });
+      expect(localStorage.getItem("session-filters")).toBe(saved);
+      detach();
+    });
+
+    it("restores saved filters and resumes persistence", async () => {
+      const saved = JSON.stringify({
+        version: 2,
+        project: "saved-project",
+        agent: "codex",
+      });
+      localStorage.setItem("session-filters", saved);
+      const store = createSessionsStore();
+      store.resetFiltersForRoot();
+
+      store.restoreSavedFilters();
+      expect(store.filters.project).toBe("saved-project");
+      expect(store.filters.agent).toBe("codex");
+
+      store.filters.project = "updated-project";
+      await store.load();
+      const persisted = JSON.parse(
+        localStorage.getItem("session-filters") ?? "{}",
+      );
+      expect(persisted).toMatchObject({
+        project: "updated-project",
+        agent: "codex",
+        version: 2,
+      });
+    });
+
+    it("releases the root hold when filters diverge", async () => {
+      const saved = JSON.stringify({
+        version: 2,
+        project: "saved-project",
+        agent: "codex",
+      });
+      localStorage.setItem("session-filters", saved);
+      const store = createSessionsStore();
+      store.resetFiltersForRoot();
+      store.filters.project = "new-project";
+
+      await store.load();
+
+      const persisted = JSON.parse(
+        localStorage.getItem("session-filters") ?? "{}",
+      );
+      expect(persisted).toMatchObject({
+        project: "new-project",
+        agent: "",
+        version: 2,
+      });
+    });
+
+    it("keeps the root hold through session deselection", async () => {
+      const saved = JSON.stringify({
+        version: 2,
+        project: "saved-project",
+        agent: "codex",
+      });
+      localStorage.setItem("session-filters", saved);
+      const store = createSessionsStore();
+      store.resetFiltersForRoot();
+      store.selectSession("session-a");
+      store.deselectSession();
+
+      await store.load();
+
+      expect(localStorage.getItem("session-filters")).toBe(saved);
     });
 
     it("should fall back to defaults on corrupted localStorage", () => {
@@ -1107,24 +1202,71 @@ describe("SessionsStore", () => {
       });
     });
 
-    it("delete removes an index row locally and invalidates metadata", async () => {
-      mockSidebarIndex([
-        makeSkinnyRow({ id: "remove-me" }),
-        makeSkinnyRow({ id: "keep-me" }),
-      ]);
+    it("reloads the canonical group total after deleting a child", async () => {
+      vi.mocked(api.getSidebarSessionIndex)
+        .mockResolvedValueOnce({
+          sessions: [
+            makeSkinnyRow({ id: "root" }),
+            makeSkinnyRow({
+              id: "child",
+              parent_session_id: "root",
+            }),
+          ],
+          total: 1,
+          next_cursor: null,
+        })
+        .mockResolvedValueOnce({
+          sessions: [makeSkinnyRow({ id: "root" })],
+          total: 1,
+          next_cursor: null,
+        });
       vi.mocked((api as any).deleteSession).mockResolvedValue(undefined);
       vi.mocked(api.getProjects).mockResolvedValue({ projects: [] });
       vi.mocked(api.getAgents).mockResolvedValue({ agents: [] });
       vi.mocked((api as any).getMachines).mockResolvedValue({ machines: [] });
 
       await sessions.load();
-      await sessions.deleteSession("remove-me");
+      await sessions.deleteSession("child");
 
-      expect(sessions.sessions.map((s) => s.id)).toEqual(["keep-me"]);
+      expect(api.getSidebarSessionIndex).toHaveBeenCalledTimes(2);
+      expect(sessions.sessions.map((s) => s.id)).toEqual(["root"]);
       expect(sessions.total).toBe(1);
       expect(api.getProjects).toHaveBeenCalled();
       expect(api.getAgents).toHaveBeenCalled();
       expect((api as any).getMachines).toHaveBeenCalled();
+    });
+
+    it("reloads the canonical group after deleting its root", async () => {
+      vi.mocked(api.getSidebarSessionIndex)
+        .mockResolvedValueOnce({
+          sessions: [
+            makeSkinnyRow({ id: "root" }),
+            makeSkinnyRow({
+              id: "child",
+              parent_session_id: "root",
+            }),
+          ],
+          total: 1,
+          next_cursor: null,
+        })
+        .mockResolvedValueOnce({
+          sessions: [
+            makeSkinnyRow({
+              id: "child",
+              parent_session_id: "root",
+            }),
+          ],
+          total: 1,
+          next_cursor: null,
+        });
+      vi.mocked((api as any).deleteSession).mockResolvedValue(undefined);
+
+      await sessions.load();
+      await sessions.deleteSession("root");
+
+      expect(api.getSidebarSessionIndex).toHaveBeenCalledTimes(2);
+      expect(sessions.sessions.map((s) => s.id)).toEqual(["child"]);
+      expect(sessions.total).toBe(1);
     });
 
     it("batch delete creates one undo entry for the whole batch", async () => {
@@ -1559,6 +1701,14 @@ describe("SessionsStore", () => {
   });
 
   describe("load serialization", () => {
+    it("should pass the browser timezone", async () => {
+      await sessions.load();
+
+      expectSidebarIndexCalledWith({
+        timezone: "America/New_York",
+      });
+    });
+
     it("should omit min/max_messages when 0", async () => {
       sessions.filters.minMessages = 0;
       sessions.filters.maxMessages = 0;
@@ -1668,6 +1818,17 @@ describe("SessionsStore", () => {
   });
 
   describe("loadMore serialization", () => {
+    it("should pass the browser timezone in loadMore", async () => {
+      sessions.nextCursor = "cur-timezone";
+
+      mockSidebarPage();
+      await sessions.loadMore();
+
+      expectPaginatedSidebarIndexCalledWith({
+        timezone: "America/New_York",
+      });
+    });
+
     it("should load the sidebar index once with consistent filters", async () => {
       mockSidebarIndex([
         makeSkinnyRow({ id: "s1" }),
@@ -3271,6 +3432,42 @@ describe("SessionsStore live refresh", () => {
     detach();
     spy.mockRestore();
     vi.useRealTimers();
+  });
+
+  it("sessions events replace cached project filter options", async () => {
+    const { events } = await import("./events.svelte.js");
+    let registered: ((e: { scope: string }) => void) | null = null;
+    const spy = vi
+      .spyOn(events, "subscribe")
+      .mockImplementation((fn) => {
+        registered = fn as (e: { scope: string }) => void;
+        return () => {};
+      });
+
+    vi.mocked(api.getProjects)
+      .mockResolvedValueOnce({
+        projects: [{ name: "old-project", session_count: 1 }],
+      })
+      .mockResolvedValueOnce({
+        projects: [{ name: "new-project", session_count: 1 }],
+      });
+    const sessions = createSessionsStore();
+    const detach = sessions.attachSidebar();
+    await sessions.loadProjects();
+    expect(sessions.projects).toEqual([
+      { name: "old-project", session_count: 1 },
+    ]);
+
+    registered!({ scope: "sessions" });
+    await vi.waitFor(() => {
+      expect(sessions.projects).toEqual([
+        { name: "new-project", session_count: 1 },
+      ]);
+    });
+    expect(api.getProjects).toHaveBeenCalledTimes(2);
+
+    detach();
+    spy.mockRestore();
   });
 
   it("refetches on the 5-minute safety-net interval", async () => {

@@ -237,6 +237,8 @@ func TestVectorConfigDefaults(t *testing.T) {
 	assert.Empty(t, cfg.Vector.Embeddings.Servers)
 	assert.True(t, cfg.Vector.Embed.RunAfterSyncEnabled(),
 		"run_after_sync defaults to true when unset")
+	assert.False(t, cfg.Vector.Embed.Recall,
+		"automatic Recall embedding requires explicit opt-in")
 
 	disabled := false
 	cfg.Vector.Embed.RunAfterSync = &disabled
@@ -346,6 +348,25 @@ func TestVectorConfigTOMLLoad(t *testing.T) {
 		assert.Equal(t, 256, cfg.Vector.Embeddings.Dimension)
 	})
 
+	t.Run("Ollama CPU fallback loads explicitly", func(t *testing.T) {
+		cfg := loadMinimalWithConfig(t, map[string]any{
+			"vector": map[string]any{
+				"enabled": true,
+				"embeddings": map[string]any{
+					"model":     "qwen3-embedding:4b-8k",
+					"dimension": 2560,
+					"servers": map[string]any{
+						"local": map[string]any{
+							"endpoint":            "http://localhost:11434/proxy/v1/",
+							"ollama_cpu_fallback": true,
+						},
+					},
+				},
+			},
+		})
+		assert.True(t, cfg.Vector.Embeddings.Servers["local"].OllamaCPUFallback)
+	})
+
 	t.Run("named servers with default_server load and resolve", func(t *testing.T) {
 		cfg := loadMinimalWithConfig(t, map[string]any{
 			"vector": map[string]any{
@@ -396,6 +417,23 @@ func TestVectorConfigTOMLLoad(t *testing.T) {
 			},
 		})
 		assert.True(t, cfg.Vector.IncludeAutomated)
+	})
+
+	t.Run("automatic Recall embedding opt-in is loaded", func(t *testing.T) {
+		cfg := loadMinimalWithConfig(t, map[string]any{
+			"vector": map[string]any{
+				"enabled": true,
+				"embeddings": map[string]any{
+					"model":     "nomic-embed-text",
+					"dimension": 768,
+					"servers":   minimalServers(),
+				},
+				"embed": map[string]any{
+					"recall": true,
+				},
+			},
+		})
+		assert.True(t, cfg.Vector.Embed.Recall)
 	})
 
 	t.Run("enabled without servers fails to load", func(t *testing.T) {
@@ -467,6 +505,22 @@ func TestVectorConfigTOMLLoad(t *testing.T) {
 				name:    "explicit zero timeout",
 				server:  map[string]any{"timeout": "0s"},
 				wantErr: "timeout",
+			},
+			{
+				name: "Ollama CPU fallback without v1 endpoint",
+				server: map[string]any{
+					"endpoint":            "http://localhost:11434/openai",
+					"ollama_cpu_fallback": true,
+				},
+				wantErr: "ollama_cpu_fallback requires an endpoint ending in /v1",
+			},
+			{
+				name: "Ollama CPU fallback with relative endpoint",
+				server: map[string]any{
+					"endpoint":            "/v1",
+					"ollama_cpu_fallback": true,
+				},
+				wantErr: "ollama_cpu_fallback requires an absolute HTTP(S) endpoint",
 			},
 			{
 				name:    "explicit zero backstop_interval",

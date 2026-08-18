@@ -117,6 +117,78 @@ func TestForkDetection_SmallGapRetry(t *testing.T) {
 	assertMessage(t, results[0].Messages[3], RoleAssistant, "retry answer")
 }
 
+func TestForkDetection_ReminderPrefixedIDEContextDoesNotPromoteObsoleteBranch(
+	t *testing.T,
+) {
+	const reminder = "<system-reminder>context</system-reminder>\n"
+	content := testjsonl.NewSessionBuilder().
+		AddClaudeUserWithUUID("2024-01-01T10:00:00Z", "start", "a", "").
+		AddClaudeAssistantWithUUID("2024-01-01T10:00:01Z", "ok", "b", "a").
+		AddClaudeUserWithUUID(
+			"2024-01-01T10:00:02Z",
+			reminder+"<ide_opened_file>one</ide_opened_file>",
+			"c", "b",
+		).
+		AddClaudeUserWithUUID(
+			"2024-01-01T10:00:03Z",
+			reminder+"<ide_selection>two</ide_selection>",
+			"d", "c",
+		).
+		AddClaudeUserWithUUID(
+			"2024-01-01T10:00:04Z",
+			reminder+"<ide_opened_file>three</ide_opened_file>",
+			"e", "d",
+		).
+		AddClaudeUserWithUUID(
+			"2024-01-01T10:00:05Z",
+			reminder+"<ide_selection>four</ide_selection>",
+			"f", "e",
+		).
+		AddClaudeUserWithUUID(
+			"2024-01-01T10:01:00Z", "real retry", "z", "b",
+		).
+		AddClaudeAssistantWithUUID(
+			"2024-01-01T10:01:01Z", "retry answer", "zz", "z",
+		).
+		String()
+
+	results := parseTestContent(t, "ide-context-fork.jsonl", content, 1)
+	require.Len(t, results[0].Messages, 4)
+	assert.Equal(t, "real retry", results[0].Messages[2].Content)
+	assert.Equal(t, "retry answer", results[0].Messages[3].Content)
+}
+
+func TestForkDetection_IDEEnvelopeWithDiscardedRemainderDoesNotPromoteObsoleteBranch(
+	t *testing.T,
+) {
+	const discardedRemainder = "<ide_opened_file>context</ide_opened_file>\n" +
+		"<command-name></command-name>"
+	content := testjsonl.NewSessionBuilder().
+		AddClaudeUserWithUUID("2024-01-01T10:00:00Z", "start", "a", "").
+		AddClaudeAssistantWithUUID("2024-01-01T10:00:01Z", "ok", "b", "a").
+		AddClaudeUserWithUUID("2024-01-01T10:00:02Z", "q1", "c", "b").
+		AddClaudeAssistantWithUUID("2024-01-01T10:00:03Z", "a1", "d", "c").
+		AddClaudeUserWithUUID("2024-01-01T10:00:04Z", "q2", "e", "d").
+		AddClaudeAssistantWithUUID("2024-01-01T10:00:05Z", "a2", "f", "e").
+		AddClaudeUserWithUUID("2024-01-01T10:00:06Z", "q3", "g", "f").
+		AddClaudeAssistantWithUUID("2024-01-01T10:00:07Z", "a3", "h", "g").
+		AddClaudeUserWithUUID(
+			"2024-01-01T10:00:08Z", discardedRemainder, "i", "h",
+		).
+		AddClaudeUserWithUUID(
+			"2024-01-01T10:01:00Z", "real retry", "z", "b",
+		).
+		AddClaudeAssistantWithUUID(
+			"2024-01-01T10:01:01Z", "retry answer", "zz", "z",
+		).
+		String()
+
+	results := parseTestContent(t, "ide-command-fork.jsonl", content, 1)
+	require.Len(t, results[0].Messages, 4)
+	assert.Equal(t, "real retry", results[0].Messages[2].Content)
+	assert.Equal(t, "retry answer", results[0].Messages[3].Content)
+}
+
 func TestForkDetection_NoUUIDs(t *testing.T) {
 	// Entries without uuid fields — should work as before, 1 result.
 	content := testjsonl.NewSessionBuilder().

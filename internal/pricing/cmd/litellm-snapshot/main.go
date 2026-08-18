@@ -3,6 +3,7 @@ package main
 import (
 	"bytes"
 	"compress/gzip"
+	"context"
 	"crypto/sha256"
 	"encoding/hex"
 	"encoding/json"
@@ -13,10 +14,12 @@ import (
 	"os"
 	"os/exec"
 	"path/filepath"
+	"regexp"
 	"sort"
 	"strings"
 	"time"
 
+	"go.kenn.io/agentsview/internal/money"
 	"go.kenn.io/agentsview/internal/pricing/catalog"
 )
 
@@ -24,21 +27,33 @@ var defaultOutputPath = filepath.FromSlash(
 	"internal/pricing/snapshot/litellm_snapshot.json.gz",
 )
 
+func mustRate(dollars string) money.Money {
+	rate, err := money.ParseDollars(dollars)
+	if err != nil {
+		panic(err)
+	}
+	return rate
+}
+
 const (
-	defaultSnapshotRef     = "97c961ef945546cf463faed5de0d5521b302adcf"
-	defaultSnapshotSHA256  = "bef918527f538fed72c8f17b711dfbced1ca7f8964d3624174b3d101c6e21435"
-	defaultSnapshotBranch  = "litellm-pricing-snapshot"
-	defaultSnapshotFile    = "litellm_snapshot.json.gz"
-	defaultSnapshotBaseURL = "https://raw.githubusercontent.com/kenn-io/agentsview"
+	defaultSnapshotRef      = "db257992fb8e3048af8c1cec9da738c28b4fe603"
+	defaultSnapshotSHA256   = "0e89b636ccf858edbf95a3f6188476b6eab6cf21f66d16a65c2184229ef81cbe"
+	defaultSnapshotBranch   = "litellm-pricing-snapshot"
+	defaultSnapshotFile     = "litellm_snapshot.json.gz"
+	defaultSnapshotBaseURL  = "https://raw.githubusercontent.com/kenn-io/agentsview"
+	defaultLiteLLMSourceRef = "551e5d097c11f08fd2400a25a651b1844fcf89c2"
 )
+
+var immutableGitRefPattern = regexp.MustCompile(`^[0-9a-f]{40}$`)
 
 const maxSnapshotCompressedBytes = 1 << 20
 const maxSnapshotJSONBytes = 8 << 20
 const maxSnapshotModels = 100_000
 
 type snapshotBundle struct {
-	Version string                 `json:"version"`
-	Models  []catalog.ModelPricing `json:"models"`
+	Version   string                 `json:"version"`
+	SourceRef string                 `json:"source_ref"`
+	Models    []catalog.ModelPricing `json:"models"`
 }
 
 func main() {
@@ -50,6 +65,11 @@ func main() {
 	restoreSHA256 := flag.String("sha256", defaultSnapshotSHA256, "expected snapshot SHA256")
 	restoreBranch := flag.String("branch", defaultSnapshotBranch, "artifact branch to fetch when ref is missing")
 	restoreURL := flag.String("url", defaultSnapshotURL(), "snapshot URL to use when git restore is unavailable")
+	litellmSourceRef := flag.String(
+		"litellm-ref",
+		defaultLiteLLMSourceRef,
+		"immutable LiteLLM commit used to generate the snapshot",
+	)
 	flag.Parse()
 
 	if *validatePath != "" {
@@ -73,7 +93,13 @@ func main() {
 		return
 	}
 
-	prices, err := catalog.FetchLiteLLMPricing()
+	if !immutableGitRefPattern.MatchString(*litellmSourceRef) {
+		panic("litellm-ref must be a full lowercase commit SHA")
+	}
+	prices, err := catalog.FetchLiteLLMPricingAtRef(
+		context.Background(),
+		*litellmSourceRef,
+	)
 	if err != nil {
 		panic(err)
 	}
@@ -90,8 +116,9 @@ func main() {
 
 	version := computeVersion(modelsJSON)
 	bundle := snapshotBundle{
-		Version: version,
-		Models:  prices,
+		Version:   version,
+		SourceRef: *litellmSourceRef,
+		Models:    prices,
 	}
 
 	raw, err := json.Marshal(bundle)
@@ -165,6 +192,9 @@ func validateSnapshotFile(path string) error {
 	if snapshot.Version == "" {
 		return fmt.Errorf("missing snapshot version")
 	}
+	if !immutableGitRefPattern.MatchString(snapshot.SourceRef) {
+		return fmt.Errorf("missing immutable LiteLLM source ref")
+	}
 	if len(snapshot.Models) == 0 {
 		return fmt.Errorf("missing snapshot models")
 	}
@@ -174,6 +204,9 @@ func validateSnapshotFile(path string) error {
 	for _, model := range snapshot.Models {
 		if strings.TrimSpace(model.ModelPattern) == "" {
 			return fmt.Errorf("snapshot contains model with empty pattern")
+		}
+		if err := catalog.NormalizePricingBands(model.ModelPattern, model.Bands); err != nil {
+			return err
 		}
 	}
 
@@ -415,149 +448,149 @@ func appendModelOverlay(models []catalog.ModelPricing) []catalog.ModelPricing {
 	overlay := map[string]catalog.ModelPricing{
 		"claude-opus-4-6": {
 			ModelPattern:         "claude-opus-4-6",
-			InputPerMTok:         5.0,
-			OutputPerMTok:        25.0,
-			CacheCreationPerMTok: 6.25,
-			CacheReadPerMTok:     0.50,
+			InputPerMTok:         mustRate("5.0"),
+			OutputPerMTok:        mustRate("25.0"),
+			CacheCreationPerMTok: mustRate("6.25"),
+			CacheReadPerMTok:     mustRate("0.50"),
 		},
 		"claude-opus-4-7": {
 			ModelPattern:         "claude-opus-4-7",
-			InputPerMTok:         5.0,
-			OutputPerMTok:        25.0,
-			CacheCreationPerMTok: 6.25,
-			CacheReadPerMTok:     0.50,
+			InputPerMTok:         mustRate("5.0"),
+			OutputPerMTok:        mustRate("25.0"),
+			CacheCreationPerMTok: mustRate("6.25"),
+			CacheReadPerMTok:     mustRate("0.50"),
 		},
 		"claude-opus-4-8": {
 			ModelPattern:         "claude-opus-4-8",
-			InputPerMTok:         5.0,
-			OutputPerMTok:        25.0,
-			CacheCreationPerMTok: 6.25,
-			CacheReadPerMTok:     0.50,
+			InputPerMTok:         mustRate("5.0"),
+			OutputPerMTok:        mustRate("25.0"),
+			CacheCreationPerMTok: mustRate("6.25"),
+			CacheReadPerMTok:     mustRate("0.50"),
 		},
 		"claude-opus-4-20250514": {
 			ModelPattern:         "claude-opus-4-20250514",
-			InputPerMTok:         15.0,
-			OutputPerMTok:        75.0,
-			CacheCreationPerMTok: 18.75,
-			CacheReadPerMTok:     1.50,
+			InputPerMTok:         mustRate("15.0"),
+			OutputPerMTok:        mustRate("75.0"),
+			CacheCreationPerMTok: mustRate("18.75"),
+			CacheReadPerMTok:     mustRate("1.50"),
 		},
 		"claude-fable-5": {
 			ModelPattern:         "claude-fable-5",
-			InputPerMTok:         10.0,
-			OutputPerMTok:        50.0,
-			CacheCreationPerMTok: 12.50,
-			CacheReadPerMTok:     1.00,
+			InputPerMTok:         mustRate("10.0"),
+			OutputPerMTok:        mustRate("50.0"),
+			CacheCreationPerMTok: mustRate("12.50"),
+			CacheReadPerMTok:     mustRate("1.00"),
 		},
 		"claude-sonnet-4-6": {
 			ModelPattern:         "claude-sonnet-4-6",
-			InputPerMTok:         3.0,
-			OutputPerMTok:        15.0,
-			CacheCreationPerMTok: 3.75,
-			CacheReadPerMTok:     0.30,
+			InputPerMTok:         mustRate("3.0"),
+			OutputPerMTok:        mustRate("15.0"),
+			CacheCreationPerMTok: mustRate("3.75"),
+			CacheReadPerMTok:     mustRate("0.30"),
 		},
 		"claude-sonnet-4-20250514": {
 			ModelPattern:         "claude-sonnet-4-20250514",
-			InputPerMTok:         3.0,
-			OutputPerMTok:        15.0,
-			CacheCreationPerMTok: 3.75,
-			CacheReadPerMTok:     0.30,
+			InputPerMTok:         mustRate("3.0"),
+			OutputPerMTok:        mustRate("15.0"),
+			CacheCreationPerMTok: mustRate("3.75"),
+			CacheReadPerMTok:     mustRate("0.30"),
 		},
 		"claude-sonnet-4-5-20250514": {
 			ModelPattern:         "claude-sonnet-4-5-20250514",
-			InputPerMTok:         3.0,
-			OutputPerMTok:        15.0,
-			CacheCreationPerMTok: 3.75,
-			CacheReadPerMTok:     0.30,
+			InputPerMTok:         mustRate("3.0"),
+			OutputPerMTok:        mustRate("15.0"),
+			CacheCreationPerMTok: mustRate("3.75"),
+			CacheReadPerMTok:     mustRate("0.30"),
 		},
 		"claude-haiku-4-5-20251001": {
 			ModelPattern:         "claude-haiku-4-5-20251001",
-			InputPerMTok:         1.0,
-			OutputPerMTok:        5.0,
-			CacheCreationPerMTok: 1.25,
-			CacheReadPerMTok:     0.10,
+			InputPerMTok:         mustRate("1.0"),
+			OutputPerMTok:        mustRate("5.0"),
+			CacheCreationPerMTok: mustRate("1.25"),
+			CacheReadPerMTok:     mustRate("0.10"),
 		},
 		"claude-haiku-3-5-20241022": {
 			ModelPattern:         "claude-haiku-3-5-20241022",
-			InputPerMTok:         0.80,
-			OutputPerMTok:        4.0,
-			CacheCreationPerMTok: 1.0,
-			CacheReadPerMTok:     0.08,
+			InputPerMTok:         mustRate("0.80"),
+			OutputPerMTok:        mustRate("4.0"),
+			CacheCreationPerMTok: mustRate("1.0"),
+			CacheReadPerMTok:     mustRate("0.08"),
 		},
 		"gpt-5.5": {
 			ModelPattern:     "gpt-5.5",
-			InputPerMTok:     5.0,
-			OutputPerMTok:    30.0,
-			CacheReadPerMTok: 0.50,
+			InputPerMTok:     mustRate("5.0"),
+			OutputPerMTok:    mustRate("30.0"),
+			CacheReadPerMTok: mustRate("0.50"),
 		},
 		"gpt-5.4": {
 			ModelPattern:     "gpt-5.4",
-			InputPerMTok:     2.50,
-			OutputPerMTok:    15.0,
-			CacheReadPerMTok: 0.25,
+			InputPerMTok:     mustRate("2.50"),
+			OutputPerMTok:    mustRate("15.0"),
+			CacheReadPerMTok: mustRate("0.25"),
 		},
 		"gpt-5.4-mini": {
 			ModelPattern:     "gpt-5.4-mini",
-			InputPerMTok:     0.75,
-			OutputPerMTok:    4.50,
-			CacheReadPerMTok: 0.075,
+			InputPerMTok:     mustRate("0.75"),
+			OutputPerMTok:    mustRate("4.50"),
+			CacheReadPerMTok: mustRate("0.075"),
 		},
 		"gpt-5.4-nano": {
 			ModelPattern:     "gpt-5.4-nano",
-			InputPerMTok:     0.20,
-			OutputPerMTok:    1.25,
-			CacheReadPerMTok: 0.02,
+			InputPerMTok:     mustRate("0.20"),
+			OutputPerMTok:    mustRate("1.25"),
+			CacheReadPerMTok: mustRate("0.02"),
 		},
 		"gpt-5.3-codex": {
 			ModelPattern:     "gpt-5.3-codex",
-			InputPerMTok:     1.75,
-			OutputPerMTok:    14.0,
-			CacheReadPerMTok: 0.175,
+			InputPerMTok:     mustRate("1.75"),
+			OutputPerMTok:    mustRate("14.0"),
+			CacheReadPerMTok: mustRate("0.175"),
 		},
 		"gpt-5.2-codex": {
 			ModelPattern:     "gpt-5.2-codex",
-			InputPerMTok:     1.75,
-			OutputPerMTok:    14.0,
-			CacheReadPerMTok: 0.175,
+			InputPerMTok:     mustRate("1.75"),
+			OutputPerMTok:    mustRate("14.0"),
+			CacheReadPerMTok: mustRate("0.175"),
 		},
 		"gpt-5.1-codex-max": {
 			ModelPattern:     "gpt-5.1-codex-max",
-			InputPerMTok:     1.25,
-			OutputPerMTok:    10.0,
-			CacheReadPerMTok: 0.125,
+			InputPerMTok:     mustRate("1.25"),
+			OutputPerMTok:    mustRate("10.0"),
+			CacheReadPerMTok: mustRate("0.125"),
 		},
 		"mistral-large": {
 			ModelPattern:  "mistral-large",
-			InputPerMTok:  4.0,
-			OutputPerMTok: 4.0,
+			InputPerMTok:  mustRate("4.0"),
+			OutputPerMTok: mustRate("4.0"),
 		},
 		"mistral-large-3": {
 			ModelPattern:         "mistral-large-3",
-			InputPerMTok:         4.0,
-			OutputPerMTok:        4.0,
-			CacheCreationPerMTok: 4.0,
-			CacheReadPerMTok:     0.30,
+			InputPerMTok:         mustRate("4.0"),
+			OutputPerMTok:        mustRate("4.0"),
+			CacheCreationPerMTok: mustRate("4.0"),
+			CacheReadPerMTok:     mustRate("0.30"),
 		},
 		"mistral-medium": {
 			ModelPattern:  "mistral-medium",
-			InputPerMTok:  2.75,
-			OutputPerMTok: 2.75,
+			InputPerMTok:  mustRate("2.75"),
+			OutputPerMTok: mustRate("2.75"),
 		},
 		"mistral-medium-3": {
 			ModelPattern:  "mistral-medium-3",
-			InputPerMTok:  2.75,
-			OutputPerMTok: 2.75,
+			InputPerMTok:  mustRate("2.75"),
+			OutputPerMTok: mustRate("2.75"),
 		},
 		"mistral-medium-3.5": {
 			ModelPattern:         "mistral-medium-3.5",
-			InputPerMTok:         1.5,
-			OutputPerMTok:        7.5,
-			CacheCreationPerMTok: 1.5,
-			CacheReadPerMTok:     0.25,
+			InputPerMTok:         mustRate("1.5"),
+			OutputPerMTok:        mustRate("7.5"),
+			CacheCreationPerMTok: mustRate("1.5"),
+			CacheReadPerMTok:     mustRate("0.25"),
 		},
 		"openrouter/owl-alpha": {
 			ModelPattern:  "openrouter/owl-alpha",
-			InputPerMTok:  0,
-			OutputPerMTok: 0,
+			InputPerMTok:  mustRate("0"),
+			OutputPerMTok: mustRate("0"),
 		},
 	}
 

@@ -10,6 +10,9 @@ import { messages } from "../../stores/messages.svelte.js";
 import { sessions } from "../../stores/sessions.svelte.js";
 import { setLocale } from "../../i18n/index.js";
 import { router } from "../../stores/router.svelte.js";
+import { ui } from "../../stores/ui.svelte.js";
+import { testMoney } from "../../test/money.js";
+import type { Money } from "../../money.js";
 import { copyToClipboard } from "../../utils/clipboard.js";
 
 const { generateForSession } = vi.hoisted(() => ({
@@ -93,9 +96,9 @@ interface SessionUsage {
   total_output_tokens: number;
   peak_context_tokens: number;
   has_token_data: boolean;
-  cost_usd: number;
+  cost: Money;
   has_cost: boolean;
-  rollup_cost_usd?: number;
+  rollup_cost?: Money;
   has_rollup_cost?: boolean;
   rollup_subagent_count?: number;
   models: string[];
@@ -116,7 +119,7 @@ interface SessionUsageBreakdownEntry {
   output_tokens: number;
   cache_creation_input_tokens: number;
   cache_read_input_tokens: number;
-  cost_usd: number;
+  cost: Money;
   has_cost: boolean;
 }
 
@@ -128,7 +131,7 @@ function makeUsage(overrides: Partial<SessionUsage> = {}): SessionUsage {
     total_output_tokens: 0,
     peak_context_tokens: 0,
     has_token_data: false,
-    cost_usd: 0,
+    cost: testMoney(0),
     has_cost: false,
     models: [],
     unpriced_models: [],
@@ -187,6 +190,7 @@ async function flushPromises() {
 
 beforeEach(() => {
   generateForSession.mockReset();
+  vi.mocked(copyToClipboard).mockReset().mockResolvedValue(true);
   openersService.getApiV1Openers.mockReset().mockResolvedValue({ openers: [] });
   sessionsService.getApiV1SessionsIdDirectory.mockReset().mockResolvedValue({ path: "" });
   sessionsService.getApiV1SessionsIdUsage.mockReset().mockResolvedValue(makeUsage());
@@ -194,14 +198,74 @@ beforeEach(() => {
   sessions.activeSessionId = null;
   sessions.activeSessionUsageVersion = 0;
   sessions.childSessions = new Map();
+  ui.sidebarOpen = true;
+  ui.isMobileViewport = false;
 });
 
 afterEach(() => {
   setLocale("en");
   document.body.innerHTML = "";
+  ui.sidebarOpen = true;
+  ui.isMobileViewport = false;
 });
 
 describe("SessionBreadcrumb", () => {
+  it("places the desktop expand control to the left of the relocated filter", async () => {
+    ui.sidebarOpen = false;
+
+    const component = mount(SessionBreadcrumb, {
+      target: document.body,
+      props: {
+        session: makeSession("claude"),
+        onBack: () => {},
+      },
+    });
+    await tick();
+
+    const controls = document.querySelector<HTMLElement>(
+      ".sidebar-controls",
+    );
+    const expandButton = controls?.querySelector<HTMLButtonElement>(
+      'button[aria-label="Open sidebar"]',
+    );
+    const filterButton = controls?.querySelector<HTMLButtonElement>(
+      ".filter-btn",
+    );
+
+    expect(controls).not.toBeNull();
+    expect(expandButton).not.toBeNull();
+    expect(filterButton).not.toBeNull();
+    expect(expandButton?.nextElementSibling).toBe(filterButton);
+    expect(expandButton?.title).toBe("Toggle sidebar (b)");
+
+    expandButton!.click();
+    await tick();
+
+    expect(ui.sidebarOpen).toBe(true);
+    await unmount(component);
+  });
+
+  it("does not duplicate collapsed sidebar controls below the mobile title bar", async () => {
+    ui.sidebarOpen = false;
+    ui.isMobileViewport = true;
+
+    const component = mount(SessionBreadcrumb, {
+      target: document.body,
+      props: {
+        session: makeSession("claude"),
+        onBack: () => {},
+      },
+    });
+    await tick();
+
+    expect(document.querySelector(".sidebar-controls")).toBeNull();
+    expect(
+      document.querySelector('button[aria-label="Open sidebar"]'),
+    ).toBeNull();
+
+    await unmount(component);
+  });
+
   it("renders session reading controls in Simplified Chinese", async () => {
     setLocale("zh-CN");
     openersService.getApiV1Openers.mockResolvedValue({
@@ -263,6 +327,46 @@ describe("SessionBreadcrumb", () => {
 
     expect(document.body.textContent).toContain("重命名");
     expect(document.body.textContent).toContain("删除");
+
+    unmount(component);
+  });
+
+  it("shows clipboard failures as errors when copying the directory path", async () => {
+    vi.mocked(copyToClipboard).mockResolvedValue(false);
+    sessionsService.getApiV1SessionsIdDirectory.mockResolvedValue({
+      path: "/tmp/project",
+    });
+
+    const component = mount(SessionBreadcrumb, {
+      target: document.body,
+      props: {
+        session: makeSession("claude", {
+          file_path: "/tmp/project/session.jsonl",
+        }),
+        onBack: () => {},
+      },
+    });
+
+    await vi.waitFor(() => {
+      expect(document.querySelector(".resume-btn")).toBeTruthy();
+    });
+    document.querySelector<HTMLButtonElement>(".resume-btn")?.click();
+    await tick();
+
+    const copyPathButton = Array.from(
+      document.querySelectorAll<HTMLButtonElement>(".open-menu-item"),
+    ).find((button) => button.textContent?.includes("Copy directory path"));
+    expect(copyPathButton).toBeTruthy();
+    copyPathButton!.click();
+
+    await vi.waitFor(() => {
+      const feedback = document.querySelector<HTMLButtonElement>(".resume-btn");
+      expect(feedback?.textContent?.trim()).toBe("Failed");
+      expect(feedback?.classList.contains("has-feedback-error")).toBe(true);
+      expect(feedback?.classList.contains("has-feedback-success")).toBe(false);
+      expect(feedback?.querySelector(".lucide-triangle-alert")).toBeTruthy();
+      expect(feedback?.querySelector(".lucide-check")).toBeNull();
+    });
 
     unmount(component);
   });
@@ -858,7 +962,9 @@ describe("SessionBreadcrumb", () => {
     button!.click();
 
     expect(generateForSession).toHaveBeenCalledWith(session);
-    expect(navigateSpy).toHaveBeenCalledWith("insights");
+    expect(navigateSpy).toHaveBeenCalledWith("recall", {
+      tab: "generated",
+    });
 
     navigateSpy.mockRestore();
     unmount(component);
@@ -1128,7 +1234,7 @@ describe("SessionBreadcrumb", () => {
 
     it("renders the session cost when usage reports a priced cost", async () => {
       sessionsService.getApiV1SessionsIdUsage.mockResolvedValue(
-        makeUsage({ has_cost: true, cost_usd: 1.234 }),
+        makeUsage({ has_cost: true, cost: testMoney(1.234) }),
       );
 
       const component = mount(SessionBreadcrumb, {
@@ -1151,9 +1257,9 @@ describe("SessionBreadcrumb", () => {
       sessionsService.getApiV1SessionsIdUsage.mockResolvedValue(
         makeUsage({
           has_cost: true,
-          cost_usd: 1,
+          cost: testMoney(1),
           has_rollup_cost: true,
-          rollup_cost_usd: 3,
+          rollup_cost: testMoney(3),
           rollup_subagent_count: 2,
         }),
       );
@@ -1181,7 +1287,7 @@ describe("SessionBreadcrumb", () => {
       sessionsService.getApiV1SessionsIdUsage.mockResolvedValue(
         makeUsage({
           has_cost: true,
-          cost_usd: 1,
+          cost: testMoney(1),
           has_rollup_cost: false,
           rollup_subagent_count: 1,
         }),
@@ -1201,7 +1307,7 @@ describe("SessionBreadcrumb", () => {
 
     it("renders the cost badge between the token badges and the model badge", async () => {
       sessionsService.getApiV1SessionsIdUsage.mockResolvedValue(
-        makeUsage({ has_cost: true, cost_usd: 4.12 }),
+        makeUsage({ has_cost: true, cost: testMoney(4.12) }),
       );
       messages.sessionId = "run:123456789abcdef";
       messages.messages = [makeAssistantMessage("claude-opus-4-8")];
@@ -1245,7 +1351,7 @@ describe("SessionBreadcrumb", () => {
 
     it("renders no cost badge when the session has no priced cost", async () => {
       sessionsService.getApiV1SessionsIdUsage.mockResolvedValue(
-        makeUsage({ has_cost: false, cost_usd: 0 }),
+        makeUsage({ has_cost: false, cost: testMoney(0) }),
       );
 
       const component = mount(SessionBreadcrumb, {
@@ -1300,7 +1406,7 @@ describe("SessionBreadcrumb", () => {
           output_tokens: 500,
           cache_creation_input_tokens: 200,
           cache_read_input_tokens: 300,
-          cost_usd: 0.017,
+          cost: testMoney(0.017),
           has_cost: true,
         },
         {
@@ -1313,7 +1419,7 @@ describe("SessionBreadcrumb", () => {
           output_tokens: 20,
           cache_creation_input_tokens: 0,
           cache_read_input_tokens: 0,
-          cost_usd: 0.005,
+          cost: testMoney(0.005),
           has_cost: true,
         },
       ];
@@ -1322,7 +1428,7 @@ describe("SessionBreadcrumb", () => {
           Promise.resolve(
             makeUsage({
               has_cost: true,
-              cost_usd: 0.022,
+              cost: testMoney(0.022),
               breakdown_count: 2,
               breakdown: breakdown ? rows : [],
             }),
@@ -1410,7 +1516,7 @@ describe("SessionBreadcrumb", () => {
                     output_tokens: 10 + i,
                     cache_creation_input_tokens: 0,
                     cache_read_input_tokens: 0,
-                    cost_usd: 0,
+                    cost: testMoney(0),
                     has_cost: false,
                   }))
                 : [],
@@ -1477,7 +1583,7 @@ describe("SessionBreadcrumb", () => {
               output_tokens: 10,
               cache_creation_input_tokens: 0,
               cache_read_input_tokens: 0,
-              cost_usd: 0,
+              cost: testMoney(0),
               has_cost: false,
             },
           ],
@@ -1527,7 +1633,7 @@ describe("SessionBreadcrumb", () => {
             makeUsage({
               session_id: "run:bbb",
               has_cost: true,
-              cost_usd: 2,
+              cost: testMoney(2),
               breakdown_count: 1,
               breakdown: breakdown
                 ? [
@@ -1541,7 +1647,7 @@ describe("SessionBreadcrumb", () => {
                       output_tokens: 2,
                       cache_creation_input_tokens: 0,
                       cache_read_input_tokens: 0,
-                      cost_usd: 2,
+                      cost: testMoney(2),
                       has_cost: true,
                     },
                   ]
@@ -1577,7 +1683,7 @@ describe("SessionBreadcrumb", () => {
         makeUsage({
           session_id: "run:aaa",
           has_cost: true,
-          cost_usd: 9.99,
+          cost: testMoney(9.99),
           breakdown_count: 42,
         }),
       );
@@ -1593,8 +1699,8 @@ describe("SessionBreadcrumb", () => {
 
     it("refetches when a resync changes context tokens without output movement", async () => {
       sessionsService.getApiV1SessionsIdUsage
-        .mockResolvedValueOnce(makeUsage({ has_cost: true, cost_usd: 1 }))
-        .mockResolvedValueOnce(makeUsage({ has_cost: true, cost_usd: 1.75 }));
+        .mockResolvedValueOnce(makeUsage({ has_cost: true, cost: testMoney(1) }))
+        .mockResolvedValueOnce(makeUsage({ has_cost: true, cost: testMoney(1.75) }));
 
       const component = createClassComponent({
         component: SessionBreadcrumb,
@@ -1631,7 +1737,7 @@ describe("SessionBreadcrumb", () => {
           makeUsage({
             session_id: "run:aaa",
             has_cost: true,
-            cost_usd: 1.5,
+            cost: testMoney(1.5),
           }),
         )
         .mockReturnValueOnce(bRequest.promise)
@@ -1667,7 +1773,7 @@ describe("SessionBreadcrumb", () => {
         makeUsage({
           session_id: "run:bbb",
           has_cost: true,
-          cost_usd: 9.99,
+          cost: testMoney(9.99),
         }),
       );
       await flushPromises();
@@ -1678,7 +1784,7 @@ describe("SessionBreadcrumb", () => {
         makeUsage({
           session_id: "run:aaa",
           has_cost: true,
-          cost_usd: 1.5,
+          cost: testMoney(1.5),
         }),
       );
       await vi.waitFor(() => {
@@ -1714,13 +1820,13 @@ describe("SessionBreadcrumb", () => {
       await flushPromises();
       expect(sessionsService.getApiV1SessionsIdUsage).toHaveBeenCalledTimes(2);
 
-      second.resolve(makeUsage({ has_cost: true, cost_usd: 3.5 }));
+      second.resolve(makeUsage({ has_cost: true, cost: testMoney(3.5) }));
       await vi.waitFor(() => {
         const badge = document.querySelector(".cost-badge");
         expect(badge?.textContent?.trim()).toBe("$3.50");
       });
 
-      first.resolve(makeUsage({ has_cost: true, cost_usd: 1 }));
+      first.resolve(makeUsage({ has_cost: true, cost: testMoney(1) }));
       await flushPromises();
       expect(document.querySelector(".cost-badge")?.textContent?.trim()).toBe("$3.50");
 
@@ -1732,18 +1838,18 @@ describe("SessionBreadcrumb", () => {
         .mockResolvedValueOnce(
           makeUsage({
             has_cost: true,
-            cost_usd: 1,
+            cost: testMoney(1),
             has_rollup_cost: true,
-            rollup_cost_usd: 3,
+            rollup_cost: testMoney(3),
             rollup_subagent_count: 1,
           }),
         )
         .mockResolvedValueOnce(
           makeUsage({
             has_cost: true,
-            cost_usd: 1,
+            cost: testMoney(1),
             has_rollup_cost: true,
-            rollup_cost_usd: 5,
+            rollup_cost: testMoney(5),
             rollup_subagent_count: 1,
           }),
         );
@@ -1778,9 +1884,9 @@ describe("SessionBreadcrumb", () => {
       sessionsService.getApiV1SessionsIdUsage.mockResolvedValue(
         makeUsage({
           has_cost: true,
-          cost_usd: 1,
+          cost: testMoney(1),
           has_rollup_cost: true,
-          rollup_cost_usd: 3,
+          rollup_cost: testMoney(3),
           rollup_subagent_count: 1,
         }),
       );

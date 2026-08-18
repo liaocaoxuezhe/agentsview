@@ -14,6 +14,7 @@ import (
 	"time"
 
 	"go.kenn.io/agentsview/internal/db"
+	"go.kenn.io/agentsview/internal/money"
 )
 
 const (
@@ -156,19 +157,19 @@ type CannedUsageSummary struct {
 	OutputTokens        int                    `json:"output_tokens"`
 	CacheCreationTokens int                    `json:"cache_creation_tokens"`
 	CacheReadTokens     int                    `json:"cache_read_tokens"`
-	TotalCost           float64                `json:"total_cost"`
-	CacheSavings        float64                `json:"cache_savings"`
+	TotalCost           money.Money            `json:"total_cost"`
+	CacheSavings        money.Money            `json:"cache_savings"`
 	ModelBreakdowns     []CannedModelBreakdown `json:"model_breakdowns,omitempty"`
 	TopSessionsByCost   []db.TopSessionEntry   `json:"top_sessions_by_cost,omitempty"`
 }
 
 type CannedModelBreakdown struct {
-	ModelName           string  `json:"model_name"`
-	InputTokens         int     `json:"input_tokens"`
-	OutputTokens        int     `json:"output_tokens"`
-	CacheCreationTokens int     `json:"cache_creation_tokens"`
-	CacheReadTokens     int     `json:"cache_read_tokens"`
-	Cost                float64 `json:"cost"`
+	ModelName           string      `json:"model_name"`
+	InputTokens         int         `json:"input_tokens"`
+	OutputTokens        int         `json:"output_tokens"`
+	CacheCreationTokens int         `json:"cache_creation_tokens"`
+	CacheReadTokens     int         `json:"cache_read_tokens"`
+	Cost                money.Money `json:"cost"`
 }
 
 type CannedEvidenceRef struct {
@@ -285,6 +286,7 @@ func CannedCacheKey(
 	dateFrom, dateTo, project, requestedAgent, focus, aggregateHash string,
 	automatedScope string,
 	filters CannedSessionFilters,
+	generation GenerateOptions,
 ) (string, error) {
 	t, ok := CannedTemplate(kind)
 	if !ok {
@@ -296,18 +298,37 @@ func CannedCacheKey(
 		return "", err
 	}
 	filterSum := sha256.Sum256(filterData)
+	generationBackend := requestedAgent
+	generationModel := ""
+	generationEndpointHash := ""
+	if generation.Endpoint != nil &&
+		strings.TrimSpace(generation.Endpoint.Endpoint) != "" &&
+		strings.TrimSpace(generation.Endpoint.Model) != "" {
+		generationBackend = "openai"
+		generationModel = strings.TrimSpace(generation.Endpoint.Model)
+		endpointSum := sha256.Sum256(
+			[]byte(strings.TrimSpace(generation.Endpoint.Endpoint)),
+		)
+		generationEndpointHash = hex.EncodeToString(endpointSum[:])
+		requestedAgent = ""
+	} else if requestedAgent == "gemini" {
+		generationModel = geminiInsightModel
+	}
 	input := map[string]string{
-		"kind":             string(kind),
-		"date_from":        dateFrom,
-		"date_to":          dateTo,
-		"project":          project,
-		"requested_agent":  requestedAgent,
-		"template_version": t.Version,
-		"schema_version":   CannedSchemaVersion,
-		"aggregate_hash":   aggregateHash,
-		"focus_hash":       hex.EncodeToString(focusSum[:]),
-		"automated_scope":  automatedScope,
-		"filter_hash":      hex.EncodeToString(filterSum[:]),
+		"kind":                     string(kind),
+		"date_from":                dateFrom,
+		"date_to":                  dateTo,
+		"project":                  project,
+		"requested_agent":          requestedAgent,
+		"template_version":         t.Version,
+		"schema_version":           CannedSchemaVersion,
+		"aggregate_hash":           aggregateHash,
+		"focus_hash":               hex.EncodeToString(focusSum[:]),
+		"automated_scope":          automatedScope,
+		"filter_hash":              hex.EncodeToString(filterSum[:]),
+		"generation_backend":       generationBackend,
+		"generation_model":         generationModel,
+		"generation_endpoint_hash": generationEndpointHash,
 	}
 	data, err := canonicalJSON(input)
 	if err != nil {
@@ -1124,8 +1145,8 @@ func CannedEvidenceRefs(
 			usage.OutputTokens > 0 ||
 			usage.CacheCreationTokens > 0 ||
 			usage.CacheReadTokens > 0 ||
-			usage.TotalCost != 0 ||
-			usage.CacheSavings != 0 ||
+			usage.TotalCost.Microdollars != 0 ||
+			usage.CacheSavings.Microdollars != 0 ||
 			len(usage.ModelBreakdowns) > 0 ||
 			len(usage.TopSessionsByCost) > 0)
 	refs := []CannedEvidenceRef{
