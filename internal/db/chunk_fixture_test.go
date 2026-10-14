@@ -2,7 +2,7 @@ package db
 
 import (
 	"context"
-	"encoding/json"
+	"encoding/json/jsontext"
 	"os"
 	"path/filepath"
 	"sync"
@@ -24,8 +24,7 @@ func openChunkedAnalyticsFixtureDB(t *testing.T) *DB {
 	t.Helper()
 
 	chunkedAnalyticsOnce.Do(func() {
-		chunkedAnalyticsDir, chunkedAnalyticsPath =
-			buildChunkedAnalyticsFixtureTemplate(t)
+		chunkedAnalyticsDir, chunkedAnalyticsPath = buildChunkedAnalyticsFixtureTemplate(t)
 	})
 
 	dst := filepath.Join(t.TempDir(), "test.db")
@@ -45,16 +44,16 @@ func openChunkedAnalyticsFixtureDB(t *testing.T) *DB {
 func buildChunkedAnalyticsFixtureTemplate(t *testing.T) (string, string) {
 	t.Helper()
 
-	dir, err := os.MkdirTemp("", "agentsview-chunked-analytics-*")
-	require.NoError(t, err, "create chunked analytics fixture dir")
+	dir := filepath.Join(testDBFixtureTempDir, "chunked-analytics")
+	require.NoError(t, os.MkdirAll(dir, 0o700), "create chunked analytics fixture dir")
 	path := filepath.Join(dir, "test.db")
-	require.NoError(t, copyTestDBTemplate(path),
+	require.NoError(t, copyTestDBTemplate(t, path),
 		"copy base db template for chunked analytics fixture")
 
 	d, err := OpenPreparedTestDB(path)
 	require.NoError(t, err, "open chunked analytics template")
 	seedChunkedAnalyticsFixture(t, d)
-	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
+	ctx, cancel := context.WithTimeout(t.Context(), 30*time.Second)
 	defer cancel()
 	require.NoError(t, d.CheckpointWALTruncate(ctx),
 		"checkpoint chunked analytics template")
@@ -95,14 +94,14 @@ func seedChunkedAnalyticsFixture(t *testing.T, d *DB) {
 					ContentLength: 1,
 					Timestamp:     "2024-06-01T09:00:10Z",
 					Model:         "claude-sonnet-4-20250514",
-					TokenUsage: json.RawMessage(
+					TokenUsage: jsontext.Value(
 						`{"input_tokens":100,"output_tokens":10}`,
 					),
 				},
 			},
 		})
 	}
-	result, err := d.WriteSessionBatchAtomic(writes)
+	result, err := d.WriteSessionBatchAtomic(t.Context(), writes)
 	require.NoError(t, err, "WriteSessionBatchAtomic chunked fixture")
 	require.Equal(t, chunkedAnalyticsFixtureSessionCount,
 		result.WrittenSessions, "WrittenSessions")

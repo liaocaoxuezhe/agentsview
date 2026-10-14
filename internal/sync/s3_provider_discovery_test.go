@@ -1,7 +1,6 @@
 package sync
 
 import (
-	"context"
 	"io"
 	"strings"
 	"testing"
@@ -59,7 +58,7 @@ func TestProcessFileS3ProviderDiscoveredRoutesToS3Path(t *testing.T) {
 			MtimeNS: mtime,
 		},
 	}
-	res := e.processFile(context.Background(), parser.DiscoveredFile{
+	res := e.processFile(t.Context(), parser.DiscoveredFile{
 		Agent:           parser.AgentClaude,
 		Path:            path,
 		Project:         "test-proj",
@@ -79,9 +78,33 @@ func TestProcessFileS3ProviderDiscoveredRoutesToS3Path(t *testing.T) {
 	require.Equal(t, 1, written)
 	require.Equal(t, 0, failed)
 
-	sess, err := database.GetSessionFull(context.Background(), "laptop~shared-id")
+	sess, err := database.GetSessionFull(t.Context(), "laptop~shared-id")
 	require.NoError(t, err)
 	require.NotNil(t, sess)
 	assert.Equal(t, "laptop", sess.Machine)
 	assert.Equal(t, path, derefString(sess.FilePath))
+}
+
+func TestDiscoverProviderSourcesThreadsS3TranscriptMetadata(t *testing.T) {
+	const root = "s3://bucket/remote-box/raw/claude"
+	const uri = root + "/proj/session.jsonl"
+	e := NewEngine(t.Context(), openTestDB(t), EngineConfig{
+		AgentDirs: map[parser.AgentType][]string{
+			parser.AgentClaude: {root},
+		},
+		Machine: "central",
+		ProviderFactories: []parser.ProviderFactory{
+			s3ParseDiffProviderFactory{uri: uri},
+		},
+		ProviderMigrationModes: map[parser.AgentType]parser.ProviderMigrationMode{
+			parser.AgentClaude: parser.ProviderMigrationProviderAuthoritative,
+		},
+	})
+	t.Cleanup(e.Close)
+
+	files, failures := e.discoverProviderSources(t.Context(), nil, nil)
+	require.Zero(t, failures)
+	require.Len(t, files, 1)
+	assert.Equal(t, int64(2048), files[0].TranscriptSize)
+	assert.Equal(t, int64(1779012020000)*1_000_000, files[0].TranscriptMtime)
 }

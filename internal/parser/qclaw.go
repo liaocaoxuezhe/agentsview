@@ -1,7 +1,8 @@
 package parser
 
 import (
-	"encoding/json"
+	"context"
+	"encoding/json/v2"
 	"fmt"
 	"os"
 	"path/filepath"
@@ -94,8 +95,7 @@ func (p *qClawProvider) parseSession(
 		switch role {
 		case "user":
 			content := msg.Get("content")
-			text, thinkingText, hasThinking, hasToolUse, tcs, trs :=
-				ExtractTextContent(content)
+			text, thinkingText, hasThinking, hasToolUse, tcs, trs := ExtractTextContent(context.Background(), content)
 			text = strings.TrimSpace(text)
 			if text == "" && len(tcs) == 0 && len(trs) == 0 {
 				continue
@@ -127,8 +127,7 @@ func (p *qClawProvider) parseSession(
 
 		case "assistant":
 			content := msg.Get("content")
-			text, thinkingText, hasThinking, hasToolUse, tcs, trs :=
-				ExtractTextContent(content)
+			text, thinkingText, hasThinking, hasToolUse, tcs, trs := ExtractTextContent(context.Background(), content)
 			text = strings.TrimSpace(text)
 			if text == "" && len(tcs) == 0 && len(trs) == 0 {
 				continue
@@ -296,7 +295,7 @@ func applyQClawAssistantUsage(
 		"cache_read_input_tokens":     cacheRead,
 		"cache_creation_input_tokens": cacheWrite,
 	}
-	j, err := json.Marshal(normalized)
+	j, err := json.Marshal(normalized, json.Deterministic(true))
 	if err != nil {
 		return
 	}

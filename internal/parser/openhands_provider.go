@@ -2,7 +2,7 @@ package parser
 
 import (
 	"context"
-	"fmt"
+	"errors"
 	"os"
 	"path/filepath"
 	"strings"
@@ -29,11 +29,9 @@ func (f openHandsProviderFactory) Capabilities() Capabilities {
 func (f openHandsProviderFactory) NewProvider(cfg ProviderConfig) Provider {
 	cfg = cfg.Clone()
 	return &openHandsProvider{
-		ProviderBase: ProviderBase{
-			Def:    cloneAgentDef(f.def),
-			Caps:   openHandsProviderCapabilities(),
-			Config: cfg,
-		},
+		Def:     cloneAgentDef(f.def),
+		Caps:    openHandsProviderCapabilities(),
+		Config:  cfg,
 		sources: newOpenHandsSourceSet(cfg.Roots),
 	}
 }
@@ -86,10 +84,10 @@ func (p *openHandsProvider) Parse(
 	}
 	path, ok := p.sources.pathFromSource(req.Source)
 	if !ok {
-		return ParseOutcome{}, fmt.Errorf("openhands source path unavailable")
+		return ParseOutcome{}, errors.New("openhands source path unavailable")
 	}
 	machine := firstNonEmptyJSONLString(req.Machine, p.Config.Machine)
-	sess, msgs, err := p.parseSession(path, machine)
+	sess, msgs, err := p.parseSession(ctx, path, machine)
 	if err != nil {
 		return ParseOutcome{}, err
 	}
@@ -297,7 +295,7 @@ func (s openHandsSourceSet) Fingerprint(
 	}
 	path, ok := s.pathFromSource(source)
 	if !ok {
-		return SourceFingerprint{}, fmt.Errorf("openhands source path unavailable")
+		return SourceFingerprint{}, errors.New("openhands source path unavailable")
 	}
 	snapshot, err := OpenHandsSnapshot(path)
 	if err != nil {

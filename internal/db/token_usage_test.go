@@ -3,8 +3,7 @@
 package db
 
 import (
-	"context"
-	"encoding/json"
+	"encoding/json/jsontext"
 	"path/filepath"
 	"testing"
 
@@ -23,7 +22,7 @@ func TestMigrationAddsTokenColumns(t *testing.T) {
 		"has_context_tokens", "has_output_tokens",
 	} {
 		var count int
-		err := w.QueryRow(
+		err := w.QueryRow(t.Context(),
 			"SELECT count(*) FROM pragma_table_info('messages')"+
 				" WHERE name = ?", col,
 		).Scan(&count)
@@ -37,7 +36,7 @@ func TestMigrationAddsTokenColumns(t *testing.T) {
 		"has_total_output_tokens", "has_peak_context_tokens",
 	} {
 		var count int
-		err := w.QueryRow(
+		err := w.QueryRow(t.Context(),
 			"SELECT count(*) FROM pragma_table_info('sessions')"+
 				" WHERE name = ?", col,
 		).Scan(&count)
@@ -50,19 +49,19 @@ func TestMigrationIdempotent(t *testing.T) {
 	dir := t.TempDir()
 	path := filepath.Join(dir, "test.db")
 
-	d1, err := Open(path)
+	d1, err := Open(t.Context(), path)
 	require.NoError(t, err, "first open")
 	d1.Close()
 
 	// Re-open should not fail even though columns already exist.
-	d2, err := Open(path)
+	d2, err := Open(t.Context(), path)
 	require.NoError(t, err, "second open")
 	d2.Close()
 }
 
 func TestInsertAndGetMessagesTokenUsage(t *testing.T) {
 	d := testDB(t)
-	ctx := context.Background()
+	ctx := t.Context()
 
 	insertSession(t, d, "s1", "proj")
 
@@ -74,7 +73,7 @@ func TestInsertAndGetMessagesTokenUsage(t *testing.T) {
 			Content:          "hello",
 			ContentLength:    5,
 			Model:            "claude-sonnet-4-20250514",
-			TokenUsage:       json.RawMessage(`{"input":100,"output":0}`),
+			TokenUsage:       jsontext.Value(`{"input":100,"output":0}`),
 			ContextTokens:    500,
 			OutputTokens:     0,
 			HasContextTokens: true,
@@ -87,7 +86,7 @@ func TestInsertAndGetMessagesTokenUsage(t *testing.T) {
 			Content:          "world",
 			ContentLength:    5,
 			Model:            "claude-sonnet-4-20250514",
-			TokenUsage:       json.RawMessage(`{"input":0,"output":200}`),
+			TokenUsage:       jsontext.Value(`{"input":0,"output":200}`),
 			ContextTokens:    600,
 			OutputTokens:     200,
 			HasContextTokens: true,
@@ -118,7 +117,7 @@ func TestInsertAndGetMessagesTokenUsage(t *testing.T) {
 
 func TestGetAllMessagesTokenUsage(t *testing.T) {
 	d := testDB(t)
-	ctx := context.Background()
+	ctx := t.Context()
 
 	insertSession(t, d, "s1", "proj")
 	insertMessages(t, d, Message{
@@ -128,7 +127,7 @@ func TestGetAllMessagesTokenUsage(t *testing.T) {
 		Content:       "hi",
 		ContentLength: 2,
 		Model:         "gpt-4o",
-		TokenUsage:    json.RawMessage(`{"input":50,"output":150}`),
+		TokenUsage:    jsontext.Value(`{"input":50,"output":150}`),
 		ContextTokens: 300,
 		OutputTokens:  150,
 	})
@@ -153,12 +152,12 @@ func TestGetMessageByOrdinalTokenUsage(t *testing.T) {
 		Content:       "test",
 		ContentLength: 4,
 		Model:         "claude-sonnet-4-20250514",
-		TokenUsage:    json.RawMessage(`{"cache_read":42}`),
+		TokenUsage:    jsontext.Value(`{"cache_read":42}`),
 		ContextTokens: 250,
 		OutputTokens:  99,
 	})
 
-	m, err := d.GetMessageByOrdinal("s1", 0)
+	m, err := d.GetMessageByOrdinal(t.Context(), "s1", 0)
 	require.NoError(t, err, "GetMessageByOrdinal")
 	require.NotNil(t, m, "expected message")
 	assert.Equal(t, "claude-sonnet-4-20250514", m.Model, "Model")
@@ -169,7 +168,7 @@ func TestGetMessageByOrdinalTokenUsage(t *testing.T) {
 
 func TestUpsertSessionTokenUsage(t *testing.T) {
 	d := testDB(t)
-	ctx := context.Background()
+	ctx := t.Context()
 
 	s := Session{
 		ID:                   "s1",
@@ -182,7 +181,7 @@ func TestUpsertSessionTokenUsage(t *testing.T) {
 		HasTotalOutputTokens: true,
 		HasPeakContextTokens: true,
 	}
-	require.NoError(t, d.UpsertSession(s), "upsert")
+	require.NoError(t, d.UpsertSession(ctx, s), "upsert")
 
 	got, err := d.GetSession(ctx, "s1")
 	require.NoError(t, err, "GetSession")
@@ -195,7 +194,7 @@ func TestUpsertSessionTokenUsage(t *testing.T) {
 	// Update with new token values.
 	s.TotalOutputTokens = 2500
 	s.PeakContextTokens = 9000
-	require.NoError(t, d.UpsertSession(s), "upsert update")
+	require.NoError(t, d.UpsertSession(ctx, s), "upsert update")
 
 	got, err = d.GetSession(ctx, "s1")
 	require.NoError(t, err, "GetSession after update")
@@ -207,7 +206,7 @@ func TestUpsertSessionTokenUsage(t *testing.T) {
 
 func TestSessionTokenUsageDefaultsToZero(t *testing.T) {
 	d := testDB(t)
-	ctx := context.Background()
+	ctx := t.Context()
 
 	// Insert session without setting token fields.
 	insertSession(t, d, "s1", "proj")
@@ -223,7 +222,7 @@ func TestSessionTokenUsageDefaultsToZero(t *testing.T) {
 
 func TestMessageTokenUsageDefaultsToZero(t *testing.T) {
 	d := testDB(t)
-	ctx := context.Background()
+	ctx := t.Context()
 
 	insertSession(t, d, "s1", "proj")
 	// Insert message without setting token fields.
@@ -242,7 +241,7 @@ func TestMessageTokenUsageDefaultsToZero(t *testing.T) {
 
 func TestGetSessionFullTokenUsage(t *testing.T) {
 	d := testDB(t)
-	ctx := context.Background()
+	ctx := t.Context()
 
 	s := Session{
 		ID:                "s1",
@@ -253,7 +252,7 @@ func TestGetSessionFullTokenUsage(t *testing.T) {
 		TotalOutputTokens: 600,
 		PeakContextTokens: 4000,
 	}
-	require.NoError(t, d.UpsertSession(s), "upsert")
+	require.NoError(t, d.UpsertSession(ctx, s), "upsert")
 
 	got, err := d.GetSessionFull(ctx, "s1")
 	require.NoError(t, err, "GetSessionFull")
@@ -264,7 +263,7 @@ func TestGetSessionFullTokenUsage(t *testing.T) {
 
 func TestReplaceSessionMessagesTokenUsage(t *testing.T) {
 	d := testDB(t)
-	ctx := context.Background()
+	ctx := t.Context()
 
 	insertSession(t, d, "s1", "proj")
 	insertMessages(t, d, Message{
@@ -284,14 +283,13 @@ func TestReplaceSessionMessagesTokenUsage(t *testing.T) {
 		Content:          "new",
 		ContentLength:    3,
 		Model:            "claude-sonnet-4-20250514",
-		TokenUsage:       json.RawMessage(`{"input":999,"output":888}`),
+		TokenUsage:       jsontext.Value(`{"input":999,"output":888}`),
 		ContextTokens:    700,
 		OutputTokens:     888,
 		HasContextTokens: true,
 		HasOutputTokens:  true,
 	}}
-	require.NoError(t,
-		d.ReplaceSessionMessages("s1", newMsgs),
+	require.NoError(t, d.ReplaceSessionMessages(ctx, "s1", newMsgs),
 		"ReplaceSessionMessages",
 	)
 
@@ -309,7 +307,7 @@ func TestReplaceSessionMessagesTokenUsage(t *testing.T) {
 
 func TestListSessionsTokenUsage(t *testing.T) {
 	d := testDB(t)
-	ctx := context.Background()
+	ctx := t.Context()
 
 	s := Session{
 		ID:                   "s1",
@@ -322,7 +320,7 @@ func TestListSessionsTokenUsage(t *testing.T) {
 		HasTotalOutputTokens: true,
 		HasPeakContextTokens: true,
 	}
-	require.NoError(t, d.UpsertSession(s), "upsert")
+	require.NoError(t, d.UpsertSession(ctx, s), "upsert")
 
 	page, err := d.ListSessions(ctx, SessionFilter{})
 	require.NoError(t, err, "ListSessions")
@@ -336,7 +334,7 @@ func TestListSessionsTokenUsage(t *testing.T) {
 
 func TestIncrementalUpdatePreservesTokenTotals(t *testing.T) {
 	d := testDB(t)
-	ctx := context.Background()
+	ctx := t.Context()
 
 	s := Session{
 		ID:                   "inc-tokens",
@@ -353,7 +351,7 @@ func TestIncrementalUpdatePreservesTokenTotals(t *testing.T) {
 		FileSize:             new(int64(2048)),
 		FileMtime:            new(int64(100)),
 	}
-	require.NoError(t, d.UpsertSession(s), "upsert")
+	require.NoError(t, d.UpsertSession(ctx, s), "upsert")
 
 	t.Run("metadata-only update preserves tokens", func(t *testing.T) {
 		// Simulate a no-new-messages incremental update that

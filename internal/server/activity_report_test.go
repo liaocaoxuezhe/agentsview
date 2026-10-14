@@ -1,8 +1,8 @@
 package server_test
 
 import (
-	"context"
-	"encoding/json"
+	"encoding/json/jsontext"
+	"encoding/json/v2"
 	"net/http"
 	"net/http/httptest"
 	"net/url"
@@ -56,7 +56,7 @@ func TestActivityReportRejectsFilterWhoseSignedIDExceedsLimit(t *testing.T) {
 		"automation": {"all"},
 	}
 
-	req := httptest.NewRequest(
+	req := httptest.NewRequestWithContext(t.Context(),
 		http.MethodGet, "/api/v1/activity/report?"+values.Encode(), nil,
 	)
 	req.Header.Set("Accept", "text/event-stream")
@@ -136,6 +136,8 @@ func TestActivityReportEndpoint_Presets(t *testing.T) {
 				"preset": "day", "date": activityDate, "timezone": "UTC",
 			},
 			check: func(t *testing.T, resp activity.Report) {
+				t.Helper()
+
 				assert.Equal(t, 2, resp.Peak.Agents)
 				assert.Equal(t, 2, resp.Totals.Sessions)
 				assert.Equal(t, "minute", resp.BucketUnit)
@@ -148,6 +150,8 @@ func TestActivityReportEndpoint_Presets(t *testing.T) {
 				"preset": "week", "date": activityDate, "timezone": "UTC",
 			},
 			check: func(t *testing.T, resp activity.Report) {
+				t.Helper()
+
 				assert.Equal(t, "hour", resp.BucketUnit, "a 7-day week auto-buckets hourly")
 				assert.Equal(t, 168, resp.BucketCount)
 			},
@@ -158,6 +162,8 @@ func TestActivityReportEndpoint_Presets(t *testing.T) {
 				"preset": "month", "date": activityDate, "timezone": "UTC",
 			},
 			check: func(t *testing.T, resp activity.Report) {
+				t.Helper()
+
 				assert.Equal(t, "day", resp.BucketUnit, "a 30-day month auto-buckets daily")
 			},
 		},
@@ -170,6 +176,8 @@ func TestActivityReportEndpoint_Presets(t *testing.T) {
 				"timezone": "UTC",
 			},
 			check: func(t *testing.T, resp activity.Report) {
+				t.Helper()
+
 				assert.Equal(t, 2, resp.Totals.Sessions)
 			},
 		},
@@ -247,13 +255,13 @@ func seedActivityReportMetadataFixture(t *testing.T, te *testEnv) {
 			if i == 1 {
 				m.Role = "assistant"
 				m.Model = fallbackModel
-				m.TokenUsage = json.RawMessage(
+				m.TokenUsage = jsontext.Value(
 					`{"input_tokens":200,"output_tokens":100}`)
 			}
 		})
 	cost := money.MustParseDollars("0.25")
 	ordinal := 1
-	require.NoError(t, te.db.ReplaceSessionUsageEvents(
+	require.NoError(t, te.db.ReplaceSessionUsageEvents(t.Context(),
 		"activity-meta-reported-cost", []db.UsageEvent{{
 			SessionID: "activity-meta-reported-cost", MessageOrdinal: &ordinal,
 			Source: "session", Model: "gpt-5.1", InputTokens: 100,
@@ -301,7 +309,6 @@ func seedFallbackModelPricing(t *testing.T, database *db.DB, model string) {
 // MUST appear in the report. A refactor flipping those flags to match
 // the analytics defaults would drop these sessions and fail here.
 func TestActivityReportEndpoint_IncludesOneShotAndAutomated(t *testing.T) {
-
 	te := setup(t)
 
 	// One-shot: a single user message (user_message_count = 1).
@@ -353,7 +360,6 @@ func TestActivityReportEndpoint_IncludesOneShotAndAutomated(t *testing.T) {
 }
 
 func TestActivityReportEndpoint_Validation(t *testing.T) {
-
 	te := setup(t)
 
 	ts := activityDate + "T00:00:00Z"
@@ -433,7 +439,6 @@ func TestActivityReportEndpoint_Validation(t *testing.T) {
 // "automated" drops interactive ones. It also confirms the response Totals
 // carry the automated/interactive session-count split.
 func TestActivityReportEndpoint_AutomationFilter(t *testing.T) {
-
 	te := setup(t)
 
 	// Automated: a single-turn session whose first message matches a known
@@ -514,12 +519,20 @@ func TestActivityReportEndpoint_GitBranchFilter(t *testing.T) {
 		id, branch, started, ended string
 		times                      []string
 	}{
-		{"b1", "main", activityDate + "T10:00:00Z", activityDate + "T10:08:00Z",
-			[]string{activityDate + "T10:00:00Z", activityDate + "T10:02:00Z",
-				activityDate + "T10:05:00Z", activityDate + "T10:07:00Z"}},
-		{"b2", "feature-x", activityDate + "T10:01:00Z", activityDate + "T10:09:00Z",
-			[]string{activityDate + "T10:01:00Z", activityDate + "T10:03:00Z",
-				activityDate + "T10:06:00Z", activityDate + "T10:08:00Z"}},
+		{
+			"b1", "main", activityDate + "T10:00:00Z", activityDate + "T10:08:00Z",
+			[]string{
+				activityDate + "T10:00:00Z", activityDate + "T10:02:00Z",
+				activityDate + "T10:05:00Z", activityDate + "T10:07:00Z",
+			},
+		},
+		{
+			"b2", "feature-x", activityDate + "T10:01:00Z", activityDate + "T10:09:00Z",
+			[]string{
+				activityDate + "T10:01:00Z", activityDate + "T10:03:00Z",
+				activityDate + "T10:06:00Z", activityDate + "T10:08:00Z",
+			},
+		},
 	}
 	for _, e := range seed {
 		started, ended, branch := e.started, e.ended, e.branch
@@ -599,7 +612,7 @@ func TestActivityReportEndpointNegotiatesProgressAndPagesSessions(t *testing.T) 
 	assert.NotEqual(t, first.Sessions[0].SessionID, second.Sessions[0].SessionID)
 
 	nonDefaultResponse := te.get(t, "/api/v1/activity/report/"+report.ReportID+
-		"/sessions?limit=1&sort=project&direction=asc&bucket=120")
+		"/sessions?limit=1&sort=project&direction=asc&bucket_start=120&bucket_end=122")
 	assertStatus(t, nonDefaultResponse, http.StatusOK)
 	var nonDefaultFirst struct {
 		Sessions   []activity.SessionRow `json:"sessions"`
@@ -620,9 +633,10 @@ func TestActivityReportEndpointNegotiatesProgressAndPagesSessions(t *testing.T) 
 	assert.NotEqual(t, nonDefaultFirst.Sessions[0].SessionID, inherited.Sessions[0].SessionID)
 
 	for name, query := range map[string]string{
-		"sort":      "&sort=agent",
-		"direction": "&direction=desc",
-		"bucket":    "&bucket=121",
+		"sort":         "&sort=agent",
+		"direction":    "&direction=desc",
+		"bucket start": "&bucket_start=121&bucket_end=122",
+		"bucket end":   "&bucket_start=120&bucket_end=123",
 	} {
 		t.Run("cursor rejects explicit "+name+" mismatch", func(t *testing.T) {
 			mismatch := te.get(t, "/api/v1/activity/report/"+report.ReportID+
@@ -651,13 +665,13 @@ func TestActivityReportEndpointNegotiatesProgressAndPagesSessions(t *testing.T) 
 	assert.Equal(t, 3, refreshed.Report.Totals.Sessions)
 	assert.NotEqual(t, report.ReportID, refreshed.Report.ReportID)
 
-	req := httptest.NewRequest(http.MethodGet, path, nil)
+	req := httptest.NewRequestWithContext(t.Context(), http.MethodGet, path, nil)
 	req.Header.Set("Accept", "text/event-stream")
 	recorder := httptest.NewRecorder()
 	te.handler.ServeHTTP(recorder, req)
 	assertStatus(t, recorder, http.StatusOK)
-	assert.True(t, strings.Contains(recorder.Body.String(), "event: progress\n"))
-	assert.True(t, strings.Contains(recorder.Body.String(), "event: report\n"))
+	assert.Contains(t, recorder.Body.String(), "event: progress\n")
+	assert.Contains(t, recorder.Body.String(), "event: report\n")
 }
 
 func TestActivityReportSessionPageRefreshesAfterIdentityOnlyChange(t *testing.T) {
@@ -672,7 +686,7 @@ func TestActivityReportSessionPageRefreshesAfterIdentityOnlyChange(t *testing.T)
 	require.NotEmpty(t, initial.ReportID)
 
 	require.NoError(t, te.db.UpsertProjectIdentityObservation(
-		context.Background(), export.ProjectIdentityObservation{
+		t.Context(), export.ProjectIdentityObservation{
 			Project: "alpha", Machine: "test", RootPath: "/fixtures/alpha",
 			GitRemote:     "https://example.com/acme/alpha.git",
 			GitRemoteName: "origin",

@@ -2,7 +2,7 @@ package parser
 
 import (
 	"context"
-	"fmt"
+	"errors"
 	"path/filepath"
 	"strings"
 )
@@ -31,11 +31,9 @@ func (f cortexProviderFactory) Capabilities() Capabilities {
 func (f cortexProviderFactory) NewProvider(cfg ProviderConfig) Provider {
 	cfg = cfg.Clone()
 	return &cortexProvider{
-		ProviderBase: ProviderBase{
-			Def:    cloneAgentDef(f.def),
-			Caps:   cortexProviderCapabilities(),
-			Config: cfg,
-		},
+		Def:     cloneAgentDef(f.def),
+		Caps:    cortexProviderCapabilities(),
+		Config:  cfg,
 		sources: newCortexSourceSet(cfg.Roots),
 	}
 }
@@ -96,7 +94,7 @@ func (p *cortexProvider) Parse(
 		return ParseOutcome{}, err
 	}
 	if !ok {
-		return ParseOutcome{}, fmt.Errorf("cortex source path unavailable")
+		return ParseOutcome{}, errors.New("cortex source path unavailable")
 	}
 	machine := firstNonEmptyJSONLString(req.Machine, p.Config.Machine)
 	sess, msgs, err := p.parseSession(path, machine)

@@ -1,6 +1,6 @@
 // ABOUTME: Builds a structured one-line summary for a tool call header.
 // ABOUTME: Pure; reads input_json + result_content, conservative on counts.
-import type { ToolCall } from "../api/types.js";
+import type { DbToolCall as ToolCall } from "../api/generated/index.js";
 import { isAbsolutePath, pathDisplayValue } from "./tool-params.js";
 
 const MAX = 100;
@@ -43,12 +43,7 @@ function parseParams(toolCall: ToolCall): Params | null {
 }
 
 function fileArg(p: Params): string | null {
-  return (
-    asString(p.file_path) ??
-    asString(p.path) ??
-    asString(p.filePath) ??
-    asString(p.file)
-  );
+  return asString(p.file_path) ?? asString(p.path) ?? asString(p.filePath) ?? asString(p.file);
 }
 
 function isSpecialSummaryTool(name: string, category: string | undefined): boolean {
@@ -76,17 +71,14 @@ export function summarizeToolCallPath(toolCall: ToolCall): string | null {
   if (!hasPathSummary) return null;
 
   const path = fileArg(p);
-  return path && isAbsolutePath(path) && pathDisplayValue(path) !== path
-    ? path
-    : null;
+  return path && isAbsolutePath(path) && pathDisplayValue(path) !== path ? path : null;
 }
 
 function todoSummary(p: Params): string | null {
   const todos = p.todos;
   if (!Array.isArray(todos) || todos.length === 0) return null;
   const items = todos as Array<{ content?: unknown; status?: unknown }>;
-  const target =
-    items.find((t) => t?.status === "in_progress") ?? items[items.length - 1];
+  const target = items.find((t) => t?.status === "in_progress") ?? items[items.length - 1];
   const text = asString(target?.content);
   return text ? `→ ${text}`.slice(0, MAX) : null;
 }
@@ -99,7 +91,8 @@ function specialSummary(name: string, p: Params): string | null {
   }
   if (name === "TaskUpdate") {
     const parts: string[] = [];
-    if (p.taskId != null) parts.push(`#${String(p.taskId)}`);
+    const taskId = typeof p.taskId === "number" ? String(p.taskId) : asString(p.taskId);
+    if (taskId) parts.push(`#${taskId}`);
     const status = asString(p.status);
     if (status) parts.push(status);
     const subject = asString(p.subject);
@@ -118,12 +111,7 @@ function specialSummary(name: string, p: Params): string | null {
 }
 
 function isTaskCall(name: string, cat: string | undefined): boolean {
-  return (
-    name === "Task" ||
-    name === "Agent" ||
-    cat === "Task" ||
-    name.includes("subagent")
-  );
+  return name === "Task" || name === "Agent" || cat === "Task" || name.includes("subagent");
 }
 
 /**
@@ -155,9 +143,7 @@ export function summarizeToolCall(toolCall: ToolCall): string | null {
   if (key === "Read") {
     const file = fileArg(p);
     if (!file) return null;
-    const lines = toolCall.result_content
-      ? countLines(toolCall.result_content)
-      : 0;
+    const lines = toolCall.result_content ? countLines(toolCall.result_content) : 0;
     const suffix = lines > 0 ? ` (${lines} lines)` : "";
     return `${pathDisplayValue(file)}${suffix}`;
   }
@@ -208,4 +194,54 @@ export function summarizeToolCall(toolCall: ToolCall): string | null {
   if (pattern) return pattern.slice(0, MAX);
 
   return null;
+}
+
+const PREVIEW_KEYS = [
+  "command",
+  "cmd",
+  "pattern",
+  "query",
+  "file_path",
+  "filePath",
+  "path",
+  "file",
+  "url",
+  "description",
+  "prompt",
+];
+const PATH_KEYS = new Set(["file_path", "filePath", "path", "file"]);
+
+function previewValue(key: string, value: string): string {
+  return PATH_KEYS.has(key) ? pathDisplayValue(value) : firstLine(value);
+}
+
+/**
+ * One-line label for a tool call's input preview, which may be JSON cut
+ * mid-value. Prefers the command, path, or pattern argument.
+ */
+export function summarizeToolInputPreview(preview: string): string {
+  let params: Params | null = null;
+  try {
+    const parsed: unknown = JSON.parse(preview);
+    params = parsed && typeof parsed === "object" ? (parsed as Params) : null;
+  } catch {
+    params = null;
+  }
+  for (const key of PREVIEW_KEYS) {
+    if (params) {
+      const value = asString(params[key]);
+      if (value) return previewValue(key, value);
+      continue;
+    }
+    const match = new RegExp(String.raw`"${key}"\s*:\s*"((?:[^"\\]|\\.)*)`).exec(preview);
+    if (!match?.[1]) continue;
+    let value = match[1];
+    try {
+      value = JSON.parse(`"${value}"`) as string;
+    } catch {
+      // A value cut mid-escape keeps its raw text.
+    }
+    return previewValue(key, value);
+  }
+  return preview.replace(/\s+/g, " ").trim().slice(0, MAX);
 }

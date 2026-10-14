@@ -3,10 +3,14 @@
 package main
 
 import (
-	"encoding/json"
+	"encoding/json/jsontext"
+	"encoding/json/v2"
 
 	"github.com/spf13/cobra"
 )
+
+// sessionWatchStarted observes successful subscription before consuming events.
+var sessionWatchStarted func()
 
 func newSessionWatchCommand() *cobra.Command {
 	return &cobra.Command{
@@ -34,9 +38,12 @@ func newSessionWatchCommand() *cobra.Command {
 			if err != nil {
 				return err
 			}
-			enc := json.NewEncoder(cmd.OutOrStdout())
+			if sessionWatchStarted != nil {
+				sessionWatchStarted()
+			}
+			enc := jsontext.NewEncoder(cmd.OutOrStdout())
 			for ev := range ch {
-				if err := enc.Encode(ev); err != nil {
+				if err := json.MarshalEncode(enc, ev); err != nil {
 					return err
 				}
 			}

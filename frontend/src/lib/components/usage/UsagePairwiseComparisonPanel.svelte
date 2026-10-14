@@ -163,7 +163,7 @@
           ratio: fmtRatio(perSessionRatio),
         },
         {
-          label: m.usage_input_tokens(),
+          label: m.usage_uncached_input(),
           left: fmtTokens(comparison.left.inputTokens),
           right: fmtTokens(comparison.right.inputTokens),
           delta: fmtSignedTokens(comparison.deltas.inputTokensDelta),
@@ -216,7 +216,7 @@
         ratio: fmtRatio(comparison.deltas.tokensPerSessionRatio),
       },
       {
-        label: m.usage_input_tokens(),
+        label: m.usage_uncached_input(),
         left: fmtTokens(comparison.left.inputTokens),
         right: fmtTokens(comparison.right.inputTokens),
         delta: fmtSignedTokens(comparison.deltas.inputTokensDelta),
@@ -330,7 +330,10 @@
   {#if usage.errors.pairwise}
     <Card level="default" padding="none" class="error-bar">
       <span>{usage.errors.pairwise}</span>
-      <button class="retry-btn" onclick={() => usage.fetchAll()}>
+      <button
+        class="retry-btn"
+        onclick={() => usage.fetchAll({ preserveTimeRange: true })}
+      >
         {m.shared_retry()}
       </button>
     </Card>

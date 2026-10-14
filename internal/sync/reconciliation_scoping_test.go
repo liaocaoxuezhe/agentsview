@@ -48,7 +48,7 @@ func TestReconcileProviderRootsDescendantDoesNotClaimSiblingScope(t *testing.T) 
 	siblingDeleted := writeClaudeProjectSession(t, claudeRoot, "projB", "b1")
 	writeClaudeProjectSession(t, claudeRoot, "projB", "b2")
 
-	engine := NewEngine(database, EngineConfig{
+	engine := NewEngine(t.Context(), database, EngineConfig{
 		AgentDirs: map[parser.AgentType][]string{
 			parser.AgentClaude: {claudeRoot},
 		},
@@ -75,8 +75,7 @@ func TestReconcileProviderRootsDescendantDoesNotClaimSiblingScope(t *testing.T) 
 	}
 	assert.Zero(t, rec.countUnder(projectB),
 		"a projA-scoped pass must not stat sibling sources")
-	assert.LessOrEqual(t,
-		engine.LastReconciliationResult().Metrics.MaxRehydratedSources, 2,
+	assert.LessOrEqual(t, engine.LastReconciliationResult().Metrics.MaxRehydratedSources, 2,
 		"rehydration must stay bounded by the requested scope")
 }
 
@@ -92,7 +91,7 @@ func TestReconcileProviderRootsClaudeDescendantUsesConfiguredTraversal(t *testin
 	projectA := filepath.Join(claudeRoot, "projA")
 	writeClaudeProjectSession(t, claudeRoot, "projA", "a1")
 
-	engine := NewEngine(database, EngineConfig{
+	engine := NewEngine(t.Context(), database, EngineConfig{
 		AgentDirs: map[parser.AgentType][]string{
 			parser.AgentClaude: {claudeRoot},
 		},
@@ -139,7 +138,7 @@ func TestReconcileProviderRootsProofBoundedTombstoneWithinDescendant(t *testing.
 		scopedTestSource(agent, inProof),
 		scopedTestSource(agent, outOfProof),
 	}
-	engine := NewEngine(database, EngineConfig{
+	engine := NewEngine(t.Context(), database, EngineConfig{
 		AgentDirs: map[parser.AgentType][]string{agent: {root}},
 		Machine:   "local",
 		ProviderFactories: []parser.ProviderFactory{
@@ -167,10 +166,7 @@ func TestReconcileProviderRootsProofBoundedTombstoneWithinDescendant(t *testing.
 
 	deleted, err := database.GetSessionFull(t.Context(), "s-in")
 	require.NoError(t, err)
-	require.NotNil(t, deleted)
-	require.NotNil(t, deleted.DeletionCause)
-	assert.Equal(t, "source_missing", *deleted.DeletionCause,
-		"a missing source inside the proof is tombstoned in the same pass")
+	assertSourceMissingState(t, deleted)
 
 	survivor, err := database.GetSession(t.Context(), "s-out")
 	require.NoError(t, err)
@@ -201,7 +197,7 @@ func TestReconcileProviderRootsSharedGatewayTraversesOnce(t *testing.T) {
 		scopedTestSource(agent, firstSource),
 		scopedTestSource(agent, secondSource),
 	}
-	engine := NewEngine(database, EngineConfig{
+	engine := NewEngine(t.Context(), database, EngineConfig{
 		AgentDirs: map[parser.AgentType][]string{agent: {root}},
 		Machine:   "local",
 		ProviderFactories: []parser.ProviderFactory{
@@ -237,7 +233,7 @@ func TestReconcileProviderRootsUnresolvedRootsAreBoundedNoOp(t *testing.T) {
 	database := openTestDB(t)
 	claudeRoot := filepath.Join(t.TempDir(), "claude")
 	writeClaudeProjectSession(t, claudeRoot, "proj", "keep")
-	engine := NewEngine(database, EngineConfig{
+	engine := NewEngine(t.Context(), database, EngineConfig{
 		AgentDirs: map[parser.AgentType][]string{
 			parser.AgentClaude: {claudeRoot},
 		},
@@ -249,10 +245,10 @@ func TestReconcileProviderRootsUnresolvedRootsAreBoundedNoOp(t *testing.T) {
 	var spools atomic.Int32
 	factory := engine.reconciliationSpoolFactory
 	engine.reconciliationSpoolFactory = func(
-		path string,
+		ctx context.Context, path string,
 	) (reconciliationSpoolStore, error) {
 		spools.Add(1)
-		return factory(path)
+		return factory(ctx, path)
 	}
 
 	for _, tc := range []struct {
@@ -298,7 +294,7 @@ func TestReconcileProviderRootsCaseVariantRootAdmitsAsExact(t *testing.T) {
 	variant := strings.ToUpper(claudeRoot)
 	require.NotEqual(t, claudeRoot, variant)
 
-	engine := NewEngine(database, EngineConfig{
+	engine := NewEngine(t.Context(), database, EngineConfig{
 		AgentDirs: map[parser.AgentType][]string{
 			parser.AgentClaude: {claudeRoot},
 		},
@@ -320,10 +316,7 @@ func TestReconcileProviderRootsCaseVariantRootAdmitsAsExact(t *testing.T) {
 		"a case-variant of the configured root must not produce empty discovery")
 	gone, err := database.GetSessionFull(t.Context(), "old-session")
 	require.NoError(t, err)
-	require.NotNil(t, gone)
-	require.NotNil(t, gone.DeletionCause)
-	assert.Equal(t, "source_missing", *gone.DeletionCause,
-		"a case-variant request carries the exact root's full authority")
+	assertSourceMissingState(t, gone)
 }
 
 // scopedStreamingProvider is a multi-root fake whose discovery reflects the
@@ -442,15 +435,13 @@ func newScopedStreamingProvider(
 	agent parser.AgentType,
 ) *scopedStreamingProvider {
 	return &scopedStreamingProvider{
-		ProviderBase: parser.ProviderBase{
-			Def: parser.AgentDef{Type: agent, FileBased: true},
-			Caps: parser.Capabilities{Source: parser.SourceCapabilities{
-				DiscoverSources:    parser.CapabilitySupported,
-				StreamingDiscovery: parser.CapabilitySupported,
-				WatchSources:       parser.CapabilitySupported,
-				FindSource:         parser.CapabilitySupported,
-			}},
-		},
+		Def: parser.AgentDef{Type: agent, FileBased: true},
+		Caps: parser.Capabilities{Source: parser.SourceCapabilities{
+			DiscoverSources:    parser.CapabilitySupported,
+			StreamingDiscovery: parser.CapabilitySupported,
+			WatchSources:       parser.CapabilitySupported,
+			FindSource:         parser.CapabilitySupported,
+		}},
 		sourcesByRoot: make(map[string][]parser.SourceRef),
 		failRoots:     make(map[string]bool),
 		findable:      make(map[string]parser.SourceRef),
@@ -481,7 +472,7 @@ func TestReconcileProviderRootsScopedVirtualMemberChecksRelocationWhenContainerG
 		"moved": movedPath, "gone": gonePath,
 	} {
 		p := path
-		require.NoError(t, database.UpsertSession(db.Session{
+		require.NoError(t, database.UpsertSession(t.Context(), db.Session{
 			ID: id, Agent: string(agent), Project: "proj",
 			Machine: "local", FilePath: &p,
 		}))
@@ -497,7 +488,7 @@ func TestReconcileProviderRootsScopedVirtualMemberChecksRelocationWhenContainerG
 	provider.findable["moved"] = scopedTestSource(
 		agent, filepath.Join(rootTwo, "traces", "chat.db")+"#moved",
 	)
-	engine := NewEngine(database, EngineConfig{
+	engine := NewEngine(t.Context(), database, EngineConfig{
 		AgentDirs: map[parser.AgentType][]string{agent: {rootOne, rootTwo}},
 		Machine:   "local",
 		ProviderFactories: []parser.ProviderFactory{
@@ -521,10 +512,7 @@ func TestReconcileProviderRootsScopedVirtualMemberChecksRelocationWhenContainerG
 		"a member the provider resolves under another root is a move")
 	gone, err := database.GetSessionFull(t.Context(), "gone")
 	require.NoError(t, err)
-	require.NotNil(t, gone)
-	require.NotNil(t, gone.DeletionCause)
-	assert.Equal(t, "source_missing", *gone.DeletionCause,
-		"a member the provider resolves nowhere is reclaimed")
+	assertSourceMissingState(t, gone)
 }
 
 func scopedTestSource(agent parser.AgentType, path string) parser.SourceRef {
@@ -553,7 +541,7 @@ func TestReconcileProviderRootsScopedFailureCommitsHealthySiblingScope(t *testin
 	provider.sourcesByRoot[rootTwo] = []parser.SourceRef{
 		scopedTestSource(agent, pathTwo),
 	}
-	engine := NewEngine(database, EngineConfig{
+	engine := NewEngine(t.Context(), database, EngineConfig{
 		AgentDirs: map[parser.AgentType][]string{agent: {rootOne, rootTwo}},
 		Machine:   "local",
 		ProviderFactories: []parser.ProviderFactory{
@@ -584,10 +572,7 @@ func TestReconcileProviderRootsScopedFailureCommitsHealthySiblingScope(t *testin
 		"the failed scope retries at the caller's own width")
 	gone, getErr := database.GetSessionFull(t.Context(), "s1")
 	require.NoError(t, getErr)
-	require.NotNil(t, gone)
-	require.NotNil(t, gone.DeletionCause)
-	assert.Equal(t, "source_missing", *gone.DeletionCause,
-		"the healthy scope still commits its proof-bounded tombstone")
+	assertSourceMissingState(t, gone)
 	survivor, getErr := database.GetSession(t.Context(), "s2")
 	require.NoError(t, getErr)
 	assert.NotNil(t, survivor, "the failed scope preserves its sessions")
@@ -608,7 +593,7 @@ func TestReconcileProviderRootsContractViolationFailsScopeClosed(t *testing.T) {
 	provider.sourcesByRoot[root] = []parser.SourceRef{
 		scopedTestSource(agent, live),
 	}
-	engine := NewEngine(database, EngineConfig{
+	engine := NewEngine(t.Context(), database, EngineConfig{
 		AgentDirs: map[parser.AgentType][]string{agent: {root}},
 		Machine:   "local",
 		ProviderFactories: []parser.ProviderFactory{
@@ -661,7 +646,7 @@ func TestReconcilePartialRequestCoveringAllRootsKeepsFullAuthority(t *testing.T)
 	writeClaudeProjectSession(t, rootTwo, "proj", "keep-two")
 	removedTwo := writeClaudeProjectSession(t, rootTwo, "proj", "gone-two")
 
-	engine := NewEngine(database, EngineConfig{
+	engine := NewEngine(t.Context(), database, EngineConfig{
 		AgentDirs: map[parser.AgentType][]string{
 			parser.AgentClaude: {rootOne, rootTwo},
 		},
@@ -680,9 +665,7 @@ func TestReconcilePartialRequestCoveringAllRootsKeepsFullAuthority(t *testing.T)
 	for _, id := range []string{"gone-one", "gone-two"} {
 		gone, err := database.GetSessionFull(t.Context(), id)
 		require.NoError(t, err)
-		require.NotNil(t, gone)
-		require.NotNil(t, gone.DeletionCause)
-		assert.Equal(t, "source_missing", *gone.DeletionCause)
+		assertSourceMissingState(t, gone)
 	}
 	for _, id := range []string{"keep-one", "keep-two"} {
 		active, err := database.GetSession(t.Context(), id)
@@ -704,7 +687,7 @@ func TestSyncPathsMissingSourceResolvesReplacementAcrossRoots(t *testing.T) {
 	moved := writeClaudeProjectSession(t, rootOne, "proj", "moved-session")
 	require.NoError(t, os.MkdirAll(filepath.Join(rootTwo, "proj"), 0o755))
 
-	engine := NewEngine(database, EngineConfig{
+	engine := NewEngine(t.Context(), database, EngineConfig{
 		AgentDirs: map[parser.AgentType][]string{
 			parser.AgentClaude: {rootOne, rootTwo},
 		},

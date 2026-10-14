@@ -88,14 +88,43 @@ type UnitRef struct {
 // helpers). The concrete implementation is internal/vector's Index, wired in
 // at startup via SetVectorSearcher.
 type VectorSearcher interface {
-	// SemanticSearch embeds query and returns up to limit unit-level hits,
-	// best first.
-	SemanticSearch(ctx context.Context, query string, limit int) ([]VectorHit, error)
+	// PrepareSemanticSearch embeds query once for this request. The returned
+	// page function fetches up to limit unit-level hits, best first, and can
+	// run again with a larger limit. The int is the engine's KNN candidate
+	// ceiling, or zero when the engine has none.
+	PrepareSemanticSearch(ctx context.Context, query string) (VectorSearchPage, int, error)
 	// ResolveMessageUnits maps each ref to the unit containing it. The
 	// result is parallel to refs; a ref with no containing unit yields a
 	// zero UnitRef (DocKey == "").
 	ResolveMessageUnits(ctx context.Context, refs []MessageRef) ([]UnitRef, error)
 }
+
+// VectorSearchPage returns exhaustion measured before chunk rollup and hydration.
+type VectorSearchPage func(context.Context, int) ([]VectorHit, bool, error)
+
+// SemanticReadiness is a bounded, read-only snapshot of the semantic search
+// index. It deliberately contains no filesystem paths or provider secrets.
+type SemanticReadiness struct {
+	State      string
+	Reason     string
+	Generation string
+	Embedded   int64
+	Missing    int64
+}
+
+// SemanticReadinessProvider is implemented by vector searchers and stores
+// that can describe semantic availability without encoding a probe query.
+type SemanticReadinessProvider interface {
+	SemanticReadiness(context.Context) (SemanticReadiness, error)
+}
+
+// MemoryBackendNamer gives readiness surfaces a stable backend label without
+// requiring service code to import every concrete storage package.
+type MemoryBackendNamer interface {
+	MemoryBackendName() string
+}
+
+func (db *DB) MemoryBackendName() string { return "sqlite" }
 
 // RecallVectorHit is one semantic recall-entry match, ranked best first.
 type RecallVectorHit struct {
@@ -118,6 +147,9 @@ type RecallVectorSearcher interface {
 		ctx context.Context, query string, limit int,
 	) (hits []RecallVectorHit, exhausted bool, snapshot RecallVectorSnapshot, err error)
 	ValidateRecallSnapshot(ctx context.Context, snapshot RecallVectorSnapshot) error
+	// MaxRecallSearchCandidates returns the largest accepted SearchRecall
+	// limit, or zero when the backend has no candidate ceiling.
+	MaxRecallSearchCandidates() int
 }
 
 // SetVectorSearcher wires (or, with nil, clears) the semantic search
@@ -138,6 +170,20 @@ func (db *DB) SetRecallVectorSearcher(v RecallVectorSearcher) {
 // HasSemantic reports whether a VectorSearcher has been wired in.
 func (db *DB) HasSemantic() bool {
 	return db.getVectorSearcher() != nil
+}
+
+// SemanticReadiness reports the wired searcher's metadata-only readiness.
+// Searchers predating this capability remain usable but have unknown detail.
+func (db *DB) SemanticReadiness(ctx context.Context) (SemanticReadiness, error) {
+	searcher := db.getVectorSearcher()
+	if searcher == nil {
+		return SemanticReadiness{State: "unavailable", Reason: "not_configured"}, nil
+	}
+	provider, ok := searcher.(SemanticReadinessProvider)
+	if !ok {
+		return SemanticReadiness{State: "unknown", Reason: "status_unsupported"}, nil
+	}
+	return provider.SemanticReadiness(ctx)
 }
 
 // getVectorSearcher returns the currently wired VectorSearcher, or nil.

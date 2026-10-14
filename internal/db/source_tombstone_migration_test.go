@@ -1,7 +1,6 @@
 package db
 
 import (
-	"context"
 	"database/sql"
 	"path/filepath"
 	"strings"
@@ -14,7 +13,7 @@ import (
 func TestSourceBaselineSchemaUsesLocalCompanionTable(t *testing.T) {
 	d := testDB(t)
 	var sessionColumns int
-	require.NoError(t, d.getReader().QueryRow(`
+	require.NoError(t, d.getReader().QueryRow(t.Context(), `
 		SELECT count(*) FROM pragma_table_info('sessions')
 		WHERE name = 'source_baseline_path'`,
 	).Scan(&sessionColumns))
@@ -22,13 +21,13 @@ func TestSourceBaselineSchemaUsesLocalCompanionTable(t *testing.T) {
 		"machine-local watcher proof must not expand the shared session model")
 
 	var baselineTables int
-	require.NoError(t, d.getReader().QueryRow(`
+	require.NoError(t, d.getReader().QueryRow(t.Context(), `
 		SELECT count(*) FROM sqlite_master
 		WHERE type = 'table' AND name = 'local_session_source_baselines'`,
 	).Scan(&baselineTables))
 	assert.Equal(t, 1, baselineTables)
 	var indexSQL string
-	require.NoError(t, d.getReader().QueryRow(`
+	require.NoError(t, d.getReader().QueryRow(t.Context(), `
 		SELECT sql FROM sqlite_master
 		WHERE type = 'index' AND name = 'idx_local_source_baselines_ownership'`,
 	).Scan(&indexSQL))
@@ -36,7 +35,7 @@ func TestSourceBaselineSchemaUsesLocalCompanionTable(t *testing.T) {
 		"machine, agent, file_path, session_id")
 }
 
-func TestSourceTombstoneSchemaStartsAndMigratesWithoutDataLoss(t *testing.T) {
+func TestSourceMissingSchemaStartsAndMigratesWithoutDataLoss(t *testing.T) {
 	t.Run("new database", func(t *testing.T) {
 		d := testDB(t)
 		assertSourceTombstoneSchema(t, d)
@@ -46,31 +45,33 @@ func TestSourceTombstoneSchemaStartsAndMigratesWithoutDataLoss(t *testing.T) {
 		path := filepath.Join(t.TempDir(), "archive.db")
 		d := testDBAtPath(t, path, "pre-migration archive")
 		insertSession(t, d, "preserved", "project")
+		insertSession(t, d, "legacy-missing", "project")
 		require.NoError(t, d.Close())
 
 		conn, err := sql.Open("sqlite3", path)
 		require.NoError(t, err)
-		_, err = conn.Exec("DROP INDEX IF EXISTS idx_sessions_agent_file_path_active")
+		_, err = conn.ExecContext(t.Context(), "DROP INDEX IF EXISTS idx_sessions_agent_file_path_active")
 		require.NoError(t, err)
-		_, err = conn.Exec("DROP TABLE IF EXISTS local_session_source_baselines")
+		_, err = conn.ExecContext(t.Context(), "DROP INDEX IF EXISTS idx_sessions_recent_source_activity")
 		require.NoError(t, err)
-		var causeColumns int
-		require.NoError(t, conn.QueryRow(`
-			SELECT count(*) FROM pragma_table_info('sessions')
-			WHERE name = 'deletion_cause'`,
-		).Scan(&causeColumns))
-		if causeColumns > 0 {
-			_, err = conn.Exec("ALTER TABLE sessions DROP COLUMN deletion_cause")
-			require.NoError(t, err)
-		}
-		_, err = conn.Exec(`
+		_, err = conn.ExecContext(t.Context(), "DROP TABLE IF EXISTS local_session_source_baselines")
+		require.NoError(t, err)
+		_, err = conn.ExecContext(t.Context(), "ALTER TABLE sessions DROP COLUMN source_missing_at")
+		require.NoError(t, err)
+		_, err = conn.ExecContext(t.Context(), `
+			UPDATE sessions
+			SET deleted_at = '2026-08-01T00:00:00Z',
+			    deletion_cause = 'source_missing'
+			WHERE id = 'legacy-missing'`)
+		require.NoError(t, err)
+		_, err = conn.ExecContext(t.Context(), `
 			CREATE INDEX idx_sessions_agent_file_path_active
 			ON sessions(agent, file_path)
 			WHERE file_path IS NOT NULL AND deleted_at IS NULL`)
 		require.NoError(t, err)
 		require.NoError(t, conn.Close())
 
-		migrated, err := Open(path)
+		migrated, err := Open(t.Context(), path)
 		require.NoError(t, err)
 		defer migrated.Close()
 		assertSourceTombstoneSchema(t, migrated)
@@ -78,30 +79,42 @@ func TestSourceTombstoneSchemaStartsAndMigratesWithoutDataLoss(t *testing.T) {
 		require.NoError(t, err)
 		assert.NotNil(t, preserved, "schema migration must preserve archive rows")
 		var baselines int
-		require.NoError(t, migrated.getReader().QueryRow(
+		require.NoError(t, migrated.getReader().QueryRow(t.Context(),
 			"SELECT count(*) FROM local_session_source_baselines WHERE session_id = ?", "preserved",
 		).Scan(&baselines))
 		assert.Zero(t, baselines,
 			"migration must not make a historical row deletion-eligible")
+		legacy, err := migrated.GetSession(t.Context(), "legacy-missing")
+		require.NoError(t, err)
+		assert.NotNil(t, legacy,
+			"migration must restore visibility to legacy source-missing rows")
+		assertSessionState(t, migrated, "legacy-missing", false, true)
 	})
 }
 
 func assertSourceTombstoneSchema(t *testing.T, d *DB) {
 	t.Helper()
+
 	var causeColumns int
-	require.NoError(t, d.getReader().QueryRow(`
+	require.NoError(t, d.getReader().QueryRow(t.Context(), `
 		SELECT count(*) FROM pragma_table_info('sessions')
 		WHERE name = 'deletion_cause'`,
 	).Scan(&causeColumns))
 	assert.Equal(t, 1, causeColumns)
+	var sourceMissingColumns int
+	require.NoError(t, d.getReader().QueryRow(t.Context(), `
+		SELECT count(*) FROM pragma_table_info('sessions')
+		WHERE name = 'source_missing_at'`,
+	).Scan(&sourceMissingColumns))
+	assert.Equal(t, 1, sourceMissingColumns)
 	var baselineColumns int
-	require.NoError(t, d.getReader().QueryRow(`
+	require.NoError(t, d.getReader().QueryRow(t.Context(), `
 		SELECT count(*) FROM pragma_table_info('sessions')
 		WHERE name = 'source_baseline_path'`,
 	).Scan(&baselineColumns))
 	assert.Zero(t, baselineColumns)
 
-	rows, err := d.getReader().Query(
+	rows, err := d.getReader().Query(t.Context(),
 		"SELECT name FROM pragma_index_info('idx_sessions_agent_file_path_active') ORDER BY seqno",
 	)
 	require.NoError(t, err)
@@ -115,7 +128,7 @@ func assertSourceTombstoneSchema(t *testing.T, d *DB) {
 	require.NoError(t, rows.Err())
 	assert.Equal(t, []string{"agent", "file_path", "id"}, columns)
 	var indexSQL string
-	require.NoError(t, d.getReader().QueryRow(`
+	require.NoError(t, d.getReader().QueryRow(t.Context(), `
 		SELECT sql FROM sqlite_master
 		WHERE type = 'index' AND name = 'idx_sessions_agent_file_path_active'
 	`).Scan(&indexSQL))
@@ -123,24 +136,23 @@ func assertSourceTombstoneSchema(t *testing.T, d *DB) {
 	assert.Contains(t, normalizedIndexSQL,
 		"where file_path is not null and deleted_at is null")
 	var baselineIndexSQL string
-	require.NoError(t, d.getReader().QueryRow(`
+	require.NoError(t, d.getReader().QueryRow(t.Context(), `
 		SELECT sql FROM sqlite_master
 		WHERE type = 'index' AND name = 'idx_local_source_baselines_ownership'
 	`).Scan(&baselineIndexSQL))
-	assert.Contains(t,
-		strings.ToLower(strings.Join(strings.Fields(baselineIndexSQL), " ")),
+	assert.Contains(t, strings.ToLower(strings.Join(strings.Fields(baselineIndexSQL), " ")),
 		"machine, agent, file_path, session_id",
 	)
 }
 
-func TestSourceMissingCauseSurvivesRebuildCopies(t *testing.T) {
+func TestSourceMissingStateSurvivesRebuildOrphanCopy(t *testing.T) {
 	dir := t.TempDir()
 	sourcePath := filepath.Join(dir, "source.db")
 	source := testDBAtPath(t, sourcePath, "source archive")
 	physicalPath := filepath.Join(dir, "missing.jsonl")
 	insertSessionWithSourcePath(t, source, "session", "claude", physicalPath)
 	baselineSessionSource(t, source, defaultMachine, "claude", physicalPath)
-	changed, err := source.SoftDeleteSessionSourceOwnership(
+	changed, err := source.MarkSessionSourceMissing(
 		t.Context(), defaultMachine, "claude", "session", physicalPath,
 	)
 	require.NoError(t, err)
@@ -149,18 +161,21 @@ func TestSourceMissingCauseSurvivesRebuildCopies(t *testing.T) {
 
 	destination := testDBAtPath(t, filepath.Join(dir, "destination.db"), "destination archive")
 	defer destination.Close()
-	copied, err := destination.CopyTrashedDataFrom(sourcePath)
+	copied, err := destination.CopyOrphanedDataFrom(sourcePath)
 	require.NoError(t, err)
 	assert.Equal(t, 1, copied)
-	assertDeletionState(t, destination, "session", true, "source_missing")
+	assertSessionState(t, destination, "session", false, true)
+	active, err := destination.GetSession(t.Context(), "session")
+	require.NoError(t, err)
+	assert.NotNil(t, active)
 }
 
-func TestSessionPushEnumerationIncludesDeletionCause(t *testing.T) {
+func TestSessionPushEnumerationKeepsSourceStateLocal(t *testing.T) {
 	d := testDB(t)
 	path := filepath.Join(t.TempDir(), "session.jsonl")
 	insertSessionWithSourcePath(t, d, "session", "claude", path)
 	baselineSessionSource(t, d, defaultMachine, "claude", path)
-	changed, err := d.SoftDeleteSessionSourceOwnership(
+	changed, err := d.MarkSessionSourceMissing(
 		t.Context(), defaultMachine, "claude", "session", path,
 	)
 	require.NoError(t, err)
@@ -169,16 +184,16 @@ func TestSessionPushEnumerationIncludesDeletionCause(t *testing.T) {
 	full, err := d.GetSessionFull(t.Context(), "session")
 	require.NoError(t, err)
 	require.NotNil(t, full)
-	require.NotNil(t, full.DeletionCause)
-	assert.Equal(t, "source_missing", *full.DeletionCause)
+	require.NotNil(t, full.SourceMissingAt)
+	assert.Nil(t, full.DeletionCause)
 
 	sessions, err := d.ListSessionsModifiedBetween(
 		t.Context(), "", "", nil, nil,
 	)
 	require.NoError(t, err)
 	require.Len(t, sessions, 1)
-	require.NotNil(t, sessions[0].DeletionCause)
-	assert.Equal(t, "source_missing", *sessions[0].DeletionCause)
+	require.NotNil(t, sessions[0].SourceMissingAt)
+	assert.Nil(t, sessions[0].DeletionCause)
 }
 
 func TestRebuildMetadataDoesNotRehideReappearedSource(t *testing.T) {
@@ -188,7 +203,7 @@ func TestRebuildMetadataDoesNotRehideReappearedSource(t *testing.T) {
 	source := testDBAtPath(t, sourcePath, "source archive")
 	insertSessionWithSourcePath(t, source, "session", "claude", physicalPath)
 	baselineSessionSource(t, source, defaultMachine, "claude", physicalPath)
-	changed, err := source.SoftDeleteSessionSourceOwnership(
+	changed, err := source.MarkSessionSourceMissing(
 		t.Context(), defaultMachine, "claude", "session", physicalPath,
 	)
 	require.NoError(t, err)
@@ -199,25 +214,23 @@ func TestRebuildMetadataDoesNotRehideReappearedSource(t *testing.T) {
 	defer destination.Close()
 	insertSessionWithSourcePath(t, destination, "session", "claude", physicalPath)
 	require.NoError(t, destination.CopySessionMetadataFrom(sourcePath))
-	assertDeletionState(t, destination, "session", false, "")
-	active, err := destination.GetSession(context.Background(), "session")
+	assertSessionState(t, destination, "session", false, false)
+	active, err := destination.GetSession(t.Context(), "session")
 	require.NoError(t, err)
 	assert.NotNil(t, active)
 }
 
-func assertDeletionState(
-	t *testing.T, d *DB, id string, wantDeleted bool, wantCause string,
+func assertSessionState(
+	t *testing.T, d *DB, id string, wantDeleted, wantSourceMissing bool,
 ) {
 	t.Helper()
-	var deletedAt, cause sql.NullString
-	require.NoError(t, d.getReader().QueryRow(
-		"SELECT deleted_at, deletion_cause FROM sessions WHERE id = ?", id,
-	).Scan(&deletedAt, &cause))
+
+	var deletedAt, cause, sourceMissingAt sql.NullString
+	require.NoError(t, d.getReader().QueryRow(t.Context(),
+		"SELECT deleted_at, deletion_cause, source_missing_at "+
+			"FROM sessions WHERE id = ?", id,
+	).Scan(&deletedAt, &cause, &sourceMissingAt))
 	assert.Equal(t, wantDeleted, deletedAt.Valid)
-	if wantCause == "" {
-		assert.False(t, cause.Valid)
-		return
-	}
-	require.True(t, cause.Valid)
-	assert.Equal(t, wantCause, cause.String)
+	assert.False(t, cause.Valid)
+	assert.Equal(t, wantSourceMissing, sourceMissingAt.Valid)
 }

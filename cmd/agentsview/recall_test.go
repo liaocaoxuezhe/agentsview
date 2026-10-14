@@ -2,8 +2,8 @@ package main
 
 import (
 	"bytes"
-	"context"
-	"encoding/json"
+	"encoding/json/jsontext"
+	"encoding/json/v2"
 	"fmt"
 	"net/http"
 	"net/http/httptest"
@@ -240,25 +240,29 @@ func TestRecallQueryUsesExplicitServerURL(t *testing.T) {
 	var gotReq service.RecallQuery
 	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		gotPath = r.URL.Path
-		require.Equal(t, http.MethodPost, r.Method)
-		require.NoError(t, json.NewDecoder(r.Body).Decode(&gotReq))
+		if !assert.Equal(t, http.MethodPost, r.Method) {
+			return
+		}
+		if !assert.NoError(t, json.UnmarshalRead(r.Body, &gotReq)) {
+			return
+		}
 		w.Header().Set("Content-Type", "application/json")
-		require.NoError(t, json.NewEncoder(w).Encode(service.RecallQueryResult{
+		if !assert.NoError(t, json.MarshalWrite(w, service.RecallQueryResult{
 			QueryID: "remote-query-id",
 			Mode:    db.RecallQueryModeHybrid,
 			RecallEntries: []db.RecallResult{{
-				RecallEntry: db.RecallEntry{
-					ID:              "m-remote",
-					Type:            "procedure",
-					Scope:           "project",
-					Status:          "accepted",
-					Title:           "Remote recall",
-					Body:            "Remote daemon recall body.",
-					SourceSessionID: "remote-session",
-				},
-				Score: 1,
+				ID:              "m-remote",
+				Type:            "procedure",
+				Scope:           "project",
+				Status:          "accepted",
+				Title:           "Remote recall",
+				Body:            "Remote daemon recall body.",
+				SourceSessionID: "remote-session",
+				Score:           1,
 			}},
-		}))
+		})) {
+			return
+		}
 	}))
 	t.Cleanup(srv.Close)
 
@@ -296,7 +300,7 @@ func TestRecallQueryExplicitServerURLDoesNotSendConfiguredAuthToken(t *testing.T
 	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		gotAuth = r.Header.Get("Authorization")
 		w.Header().Set("Content-Type", "application/json")
-		require.NoError(t, json.NewEncoder(w).Encode(service.RecallQueryResult{}))
+		assert.NoError(t, json.MarshalWrite(w, service.RecallQueryResult{}))
 	}))
 	t.Cleanup(srv.Close)
 
@@ -323,7 +327,7 @@ func TestRecallQueryExplicitServerURLUsesServerTokenFile(t *testing.T) {
 	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		gotAuth = r.Header.Get("Authorization")
 		w.Header().Set("Content-Type", "application/json")
-		require.NoError(t, json.NewEncoder(w).Encode(service.RecallQueryResult{}))
+		assert.NoError(t, json.MarshalWrite(w, service.RecallQueryResult{}))
 	}))
 	t.Cleanup(srv.Close)
 
@@ -345,21 +349,25 @@ func TestRecallListUsesExplicitServerURL(t *testing.T) {
 	var gotPath string
 	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		gotPath = r.URL.Path
-		require.Equal(t, http.MethodGet, r.Method)
-		require.Equal(t, "agentsview", r.URL.Query().Get("project"))
+		if !assert.Equal(t, http.MethodGet, r.Method) {
+			return
+		}
+		if !assert.Equal(t, "agentsview", r.URL.Query().Get("project")) {
+			return
+		}
 		w.Header().Set("Content-Type", "application/json")
-		require.NoError(t, json.NewEncoder(w).Encode(service.RecallList{
+		if !assert.NoError(t, json.MarshalWrite(w, service.RecallList{
 			RecallEntries: []db.RecallResult{{
-				RecallEntry: db.RecallEntry{
-					ID:      "m-list-remote",
-					Type:    "procedure",
-					Scope:   "project",
-					Status:  "accepted",
-					Title:   "Remote list recall",
-					Project: "agentsview",
-				},
+				ID:      "m-list-remote",
+				Type:    "procedure",
+				Scope:   "project",
+				Status:  "accepted",
+				Title:   "Remote list recall",
+				Project: "agentsview",
 			}},
-		}))
+		})) {
+			return
+		}
 	}))
 	t.Cleanup(srv.Close)
 
@@ -384,16 +392,20 @@ func TestRecallGetUsesExplicitServerURL(t *testing.T) {
 	var gotPath string
 	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		gotPath = r.URL.Path
-		require.Equal(t, http.MethodGet, r.Method)
+		if !assert.Equal(t, http.MethodGet, r.Method) {
+			return
+		}
 		w.Header().Set("Content-Type", "application/json")
-		require.NoError(t, json.NewEncoder(w).Encode(db.RecallEntry{
+		if !assert.NoError(t, json.MarshalWrite(w, db.RecallEntry{
 			ID:     "m-get-remote",
 			Type:   "procedure",
 			Scope:  "project",
 			Status: "accepted",
 			Title:  "Remote get recall",
 			Body:   "Remote daemon recall body.",
-		}))
+		})) {
+			return
+		}
 	}))
 	t.Cleanup(srv.Close)
 
@@ -418,20 +430,22 @@ func TestRecallBriefUsesExplicitServerURL(t *testing.T) {
 	var gotReq service.RecallQuery
 	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		gotPath = r.URL.Path
-		require.Equal(t, http.MethodPost, r.Method)
-		require.NoError(t, json.NewDecoder(r.Body).Decode(&gotReq))
+		if !assert.Equal(t, http.MethodPost, r.Method) {
+			return
+		}
+		if !assert.NoError(t, json.UnmarshalRead(r.Body, &gotReq)) {
+			return
+		}
 		w.Header().Set("Content-Type", "application/json")
-		require.NoError(t, json.NewEncoder(w).Encode(service.RecallQueryResult{
+		if !assert.NoError(t, json.MarshalWrite(w, service.RecallQueryResult{
 			QueryID: "remote-brief-id",
 			RecallEntries: []db.RecallResult{{
-				RecallEntry: db.RecallEntry{
-					ID:     "m-brief-remote",
-					Type:   "procedure",
-					Scope:  "project",
-					Status: "accepted",
-					Title:  "Remote brief recall",
-					Body:   "Remote daemon recall body.",
-				},
+				ID:     "m-brief-remote",
+				Type:   "procedure",
+				Scope:  "project",
+				Status: "accepted",
+				Title:  "Remote brief recall",
+				Body:   "Remote daemon recall body.",
 			}},
 			Context: "Relevant prior agentsview entries\n\n- Remote daemon recall body.",
 			ContextMeta: &service.RecallContextMeta{
@@ -440,7 +454,9 @@ func TestRecallBriefUsesExplicitServerURL(t *testing.T) {
 					"m-brief-remote",
 				},
 			},
-		}))
+		})) {
+			return
+		}
 	}))
 	t.Cleanup(srv.Close)
 
@@ -475,19 +491,21 @@ func TestRecallBriefJSONReportsTrustedOnlyOverride(t *testing.T) {
 
 	var gotReq service.RecallQuery
 	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		require.Equal(t, http.MethodPost, r.Method)
-		require.NoError(t, json.NewDecoder(r.Body).Decode(&gotReq))
+		if !assert.Equal(t, http.MethodPost, r.Method) {
+			return
+		}
+		if !assert.NoError(t, json.UnmarshalRead(r.Body, &gotReq)) {
+			return
+		}
 		w.Header().Set("Content-Type", "application/json")
-		require.NoError(t, json.NewEncoder(w).Encode(service.RecallQueryResult{
+		if !assert.NoError(t, json.MarshalWrite(w, service.RecallQueryResult{
 			RecallEntries: []db.RecallResult{{
-				RecallEntry: db.RecallEntry{
-					ID:     "m-brief-untrusted",
-					Type:   "procedure",
-					Scope:  "project",
-					Status: "accepted",
-					Title:  "Remote untrusted recall",
-					Body:   "Remote daemon recall body.",
-				},
+				ID:     "m-brief-untrusted",
+				Type:   "procedure",
+				Scope:  "project",
+				Status: "accepted",
+				Title:  "Remote untrusted recall",
+				Body:   "Remote daemon recall body.",
 			}},
 			Context: "Relevant prior agentsview entries\n\n- Remote daemon recall body.",
 			ContextMeta: &service.RecallContextMeta{
@@ -496,7 +514,9 @@ func TestRecallBriefJSONReportsTrustedOnlyOverride(t *testing.T) {
 					"m-brief-untrusted",
 				},
 			},
-		}))
+		})) {
+			return
+		}
 	}))
 	t.Cleanup(srv.Close)
 
@@ -508,7 +528,7 @@ func TestRecallBriefJSONReportsTrustedOnlyOverride(t *testing.T) {
 
 	require.NoError(t, err)
 	assert.False(t, gotReq.TrustedOnly)
-	var got map[string]json.RawMessage
+	var got map[string]jsontext.Value
 	require.NoError(t, json.Unmarshal([]byte(out), &got),
 		"stdout should be valid JSON: %q", out)
 	require.Contains(t, got, "trusted_only")
@@ -529,7 +549,7 @@ func TestRecallImportRefusesExplicitServerURLWithoutRemoteConfirmation(t *testin
 	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
 		calls++
 		w.Header().Set("Content-Type", "application/json")
-		require.NoError(t, json.NewEncoder(w).Encode(db.RecallImportResult{
+		assert.NoError(t, json.MarshalWrite(w, db.RecallImportResult{
 			Imported: 1,
 		}))
 	}))
@@ -579,9 +599,11 @@ func TestRecallImportExplicitServerURLWithRemoteConfirmation(t *testing.T) {
 		gotPath = r.URL.Path
 		gotDryRun = r.URL.Query().Get("dry_run")
 		gotAuth = r.Header.Get("Authorization")
-		require.Equal(t, http.MethodPost, r.Method)
+		if !assert.Equal(t, http.MethodPost, r.Method) {
+			return
+		}
 		w.Header().Set("Content-Type", "application/json")
-		require.NoError(t, json.NewEncoder(w).Encode(db.RecallImportResult{
+		assert.NoError(t, json.MarshalWrite(w, db.RecallImportResult{
 			Imported: 1,
 		}))
 	}))
@@ -627,7 +649,7 @@ func TestRecallImportExplicitServerURLUsesServerTokenFile(t *testing.T) {
 	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		gotAuth = r.Header.Get("Authorization")
 		w.Header().Set("Content-Type", "application/json")
-		require.NoError(t, json.NewEncoder(w).Encode(db.RecallImportResult{
+		assert.NoError(t, json.MarshalWrite(w, db.RecallImportResult{
 			Imported: 1,
 		}))
 	}))
@@ -1763,7 +1785,7 @@ func TestRecallListFiltersTrustedOnly(t *testing.T) {
 		"--format", "json")
 
 	require.NoError(t, err)
-	var raw map[string]json.RawMessage
+	var raw map[string]jsontext.Value
 	require.NoError(t, json.Unmarshal([]byte(out), &raw),
 		"stdout should be valid JSON: %q", out)
 	require.Contains(t, raw, "trusted_only")
@@ -1849,16 +1871,16 @@ func TestRecallStatsHumanSummarizesAcceptedRecallEntryCorpus(t *testing.T) {
 func TestRecallStatsJSONClampsOversizedLimitConsistently(t *testing.T) {
 	dataDir := t.TempDir()
 	setRecallTestEnv(t, dataDir)
-	d, err := db.Open(filepath.Join(dataDir, "sessions.db"))
+	d, err := db.Open(t.Context(), filepath.Join(dataDir, "sessions.db"))
 	require.NoError(t, err)
-	require.NoError(t, d.UpsertSession(db.Session{
+	require.NoError(t, d.UpsertSession(t.Context(), db.Session{
 		ID:      "limit-session",
 		Project: "agentsview",
 		Machine: "test",
 		Agent:   "codex",
 	}))
 	for i := range db.DefaultRecallEntryLimit + 1 {
-		_, err := d.InsertRecallEntry(db.RecallEntry{
+		_, err := d.InsertRecallEntry(t.Context(), db.RecallEntry{
 			ID:              fmt.Sprintf("limit-entry-%03d", i),
 			Type:            "fact",
 			Scope:           "project",
@@ -2223,11 +2245,12 @@ func setRecallTestEnv(t *testing.T, dataDir string) {
 
 func seedRecallEntryFixture(t *testing.T, dataDir string) {
 	t.Helper()
-	d, err := db.Open(filepath.Join(dataDir, "sessions.db"))
+
+	d, err := db.Open(t.Context(), filepath.Join(dataDir, "sessions.db"))
 	require.NoError(t, err)
 	t.Cleanup(func() { d.Close() })
 
-	err = d.UpsertSession(db.Session{
+	err = d.UpsertSession(t.Context(), db.Session{
 		ID:               "recall-session",
 		Project:          "agentsview",
 		Machine:          "test",
@@ -2236,7 +2259,7 @@ func seedRecallEntryFixture(t *testing.T, dataDir string) {
 		UserMessageCount: 3,
 	})
 	require.NoError(t, err)
-	err = d.InsertMessages([]db.Message{
+	err = d.InsertMessages(t.Context(), []db.Message{
 		{
 			SessionID: "recall-session",
 			Ordinal:   3,
@@ -2269,7 +2292,7 @@ func seedRecallEntryFixture(t *testing.T, dataDir string) {
 		},
 	})
 	require.NoError(t, err)
-	_, err = d.InsertRecallEntry(db.RecallEntry{
+	_, err = d.InsertRecallEntry(t.Context(), db.RecallEntry{
 		ID:              "m-cli",
 		Type:            "procedure",
 		Scope:           "project",
@@ -2297,11 +2320,11 @@ func seedRecallEntryFixture(t *testing.T, dataDir string) {
 
 func seedSupersededRecallEntryFixture(t *testing.T, dataDir string) {
 	t.Helper()
-	d, err := db.Open(filepath.Join(dataDir, "sessions.db"))
+	d, err := db.Open(t.Context(), filepath.Join(dataDir, "sessions.db"))
 	require.NoError(t, err)
 	t.Cleanup(func() { d.Close() })
 
-	_, err = d.SupersedeRecallEntry(context.Background(), "m-cli", db.RecallEntry{
+	_, err = d.SupersedeRecallEntry(t.Context(), "m-cli", db.RecallEntry{
 		ID:              "m-cli-replacement",
 		Type:            "procedure",
 		Scope:           "project",
@@ -2320,11 +2343,11 @@ func seedSupersededRecallEntryFixture(t *testing.T, dataDir string) {
 
 func seedPromptInjectionRecallEntryFixture(t *testing.T, dataDir string) {
 	t.Helper()
-	d, err := db.Open(filepath.Join(dataDir, "sessions.db"))
+	d, err := db.Open(t.Context(), filepath.Join(dataDir, "sessions.db"))
 	require.NoError(t, err)
 	t.Cleanup(func() { d.Close() })
 
-	_, err = d.InsertRecallEntry(db.RecallEntry{
+	_, err = d.InsertRecallEntry(t.Context(), db.RecallEntry{
 		ID:              "m-injection",
 		Type:            "warning",
 		Scope:           "project",
@@ -2341,12 +2364,12 @@ func seedPromptInjectionRecallEntryFixture(t *testing.T, dataDir string) {
 
 func seedExtractedRecallEntryFixture(t *testing.T, dataDir string) {
 	t.Helper()
-	d, err := db.Open(filepath.Join(dataDir, "sessions.db"))
+	d, err := db.Open(t.Context(), filepath.Join(dataDir, "sessions.db"))
 	require.NoError(t, err)
 	t.Cleanup(func() { d.Close() })
 
 	confidence := 0.82
-	_, err = d.InsertRecallEntry(db.RecallEntry{
+	_, err = d.InsertRecallEntry(t.Context(), db.RecallEntry{
 		ID:              "m-extracted",
 		Type:            "procedure",
 		Scope:           "project",
@@ -2373,7 +2396,7 @@ func seedExtractedRecallEntryFixture(t *testing.T, dataDir string) {
 
 func seedRecallReviewStateEntries(t *testing.T, dataDir string) {
 	t.Helper()
-	d, err := db.Open(filepath.Join(dataDir, "sessions.db"))
+	d, err := db.Open(t.Context(), filepath.Join(dataDir, "sessions.db"))
 	require.NoError(t, err)
 	t.Cleanup(func() { d.Close() })
 
@@ -2403,18 +2426,19 @@ func seedRecallReviewStateEntries(t *testing.T, dataDir string) {
 		entry.SourceSessionID = "recall-session"
 		entry.Transferable = true
 		entry.ProvenanceOK = true
-		_, err := d.InsertRecallEntry(entry)
+		_, err := d.InsertRecallEntry(t.Context(), entry)
 		require.NoError(t, err, entry.ID)
 	}
 }
 
 func seedRecallEntryEpisodeFixture(t *testing.T, dataDir string) {
 	t.Helper()
-	d, err := db.Open(filepath.Join(dataDir, "sessions.db"))
+
+	d, err := db.Open(t.Context(), filepath.Join(dataDir, "sessions.db"))
 	require.NoError(t, err)
 	t.Cleanup(func() { d.Close() })
 
-	err = d.UpsertSession(db.Session{
+	err = d.UpsertSession(t.Context(), db.Session{
 		ID:               "session-episode",
 		Project:          "agentsview",
 		Machine:          "test",
@@ -2423,7 +2447,7 @@ func seedRecallEntryEpisodeFixture(t *testing.T, dataDir string) {
 		UserMessageCount: 3,
 	})
 	require.NoError(t, err)
-	_, err = d.InsertRecallEntry(db.RecallEntry{
+	_, err = d.InsertRecallEntry(t.Context(), db.RecallEntry{
 		ID:              "m-episode",
 		Type:            "procedure",
 		Scope:           "project",
@@ -2440,12 +2464,13 @@ func seedRecallEntryEpisodeFixture(t *testing.T, dataDir string) {
 
 func seedRecallEntryCWDFixture(t *testing.T, dataDir, recallID, cwd string) {
 	t.Helper()
-	d, err := db.Open(filepath.Join(dataDir, "sessions.db"))
+
+	d, err := db.Open(t.Context(), filepath.Join(dataDir, "sessions.db"))
 	require.NoError(t, err)
 	t.Cleanup(func() { d.Close() })
 
 	sessionID := recallID + "-session"
-	err = d.UpsertSession(db.Session{
+	err = d.UpsertSession(t.Context(), db.Session{
 		ID:               sessionID,
 		Project:          "agentsview",
 		Machine:          "test",
@@ -2455,7 +2480,7 @@ func seedRecallEntryCWDFixture(t *testing.T, dataDir, recallID, cwd string) {
 		UserMessageCount: 3,
 	})
 	require.NoError(t, err)
-	_, err = d.InsertRecallEntry(db.RecallEntry{
+	_, err = d.InsertRecallEntry(t.Context(), db.RecallEntry{
 		ID:              recallID,
 		Type:            "procedure",
 		Scope:           "project",
@@ -2472,12 +2497,13 @@ func seedRecallEntryCWDFixture(t *testing.T, dataDir, recallID, cwd string) {
 
 func seedRecallEntryBranchFixture(t *testing.T, dataDir, recallID, branch string) {
 	t.Helper()
-	d, err := db.Open(filepath.Join(dataDir, "sessions.db"))
+
+	d, err := db.Open(t.Context(), filepath.Join(dataDir, "sessions.db"))
 	require.NoError(t, err)
 	t.Cleanup(func() { d.Close() })
 
 	sessionID := recallID + "-session"
-	err = d.UpsertSession(db.Session{
+	err = d.UpsertSession(t.Context(), db.Session{
 		ID:               sessionID,
 		Project:          "agentsview",
 		Machine:          "test",
@@ -2487,7 +2513,7 @@ func seedRecallEntryBranchFixture(t *testing.T, dataDir, recallID, branch string
 		UserMessageCount: 3,
 	})
 	require.NoError(t, err)
-	_, err = d.InsertRecallEntry(db.RecallEntry{
+	_, err = d.InsertRecallEntry(t.Context(), db.RecallEntry{
 		ID:              recallID,
 		Type:            "procedure",
 		Scope:           "branch",
@@ -2506,12 +2532,13 @@ func seedRecallEntryWorktreeFixture(
 	t *testing.T, dataDir, recallID, cwd, branch string,
 ) {
 	t.Helper()
-	d, err := db.Open(filepath.Join(dataDir, "sessions.db"))
+
+	d, err := db.Open(t.Context(), filepath.Join(dataDir, "sessions.db"))
 	require.NoError(t, err)
 	t.Cleanup(func() { d.Close() })
 
 	sessionID := recallID + "-session"
-	err = d.UpsertSession(db.Session{
+	err = d.UpsertSession(t.Context(), db.Session{
 		ID:               sessionID,
 		Project:          "agentsview",
 		Machine:          "test",
@@ -2522,7 +2549,7 @@ func seedRecallEntryWorktreeFixture(
 		UserMessageCount: 3,
 	})
 	require.NoError(t, err)
-	_, err = d.InsertRecallEntry(db.RecallEntry{
+	_, err = d.InsertRecallEntry(t.Context(), db.RecallEntry{
 		ID:              recallID,
 		Type:            "procedure",
 		Scope:           "branch",
@@ -2548,7 +2575,7 @@ func initGitRepoOnBranch(t *testing.T, branch string) string {
 
 func runGit(t *testing.T, dir string, args ...string) {
 	t.Helper()
-	cmd := exec.Command("git", args...)
+	cmd := exec.CommandContext(t.Context(), "git", args...)
 	cmd.Dir = dir
 	out, err := cmd.CombinedOutput()
 	require.NoError(t, err, "git %s: %s", strings.Join(args, " "), string(out))
@@ -2556,11 +2583,11 @@ func runGit(t *testing.T, dir string, args ...string) {
 
 func seedRecallEntryRunFixture(t *testing.T, dataDir, id, runID string) {
 	t.Helper()
-	d, err := db.Open(filepath.Join(dataDir, "sessions.db"))
+	d, err := db.Open(t.Context(), filepath.Join(dataDir, "sessions.db"))
 	require.NoError(t, err)
 	t.Cleanup(func() { d.Close() })
 
-	_, err = d.InsertRecallEntry(db.RecallEntry{
+	_, err = d.InsertRecallEntry(t.Context(), db.RecallEntry{
 		ID:              id,
 		Type:            "procedure",
 		Scope:           "project",
@@ -2584,11 +2611,12 @@ func seedRecallEntrySourceSessionFixture(
 	sessionID string,
 ) {
 	t.Helper()
-	d, err := db.Open(filepath.Join(dataDir, "sessions.db"))
+
+	d, err := db.Open(t.Context(), filepath.Join(dataDir, "sessions.db"))
 	require.NoError(t, err)
 	t.Cleanup(func() { d.Close() })
 
-	err = d.UpsertSession(db.Session{
+	err = d.UpsertSession(t.Context(), db.Session{
 		ID:               sessionID,
 		Project:          "agentsview",
 		Machine:          "test",
@@ -2597,7 +2625,7 @@ func seedRecallEntrySourceSessionFixture(
 		UserMessageCount: 2,
 	})
 	require.NoError(t, err)
-	_, err = d.InsertRecallEntry(db.RecallEntry{
+	_, err = d.InsertRecallEntry(t.Context(), db.RecallEntry{
 		ID:              id,
 		Type:            "procedure",
 		Scope:           "project",

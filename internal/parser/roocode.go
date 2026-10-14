@@ -8,8 +8,11 @@
 package parser
 
 import (
+	"context"
 	"crypto/sha256"
-	"encoding/json"
+	"encoding/hex"
+	"encoding/json/jsontext"
+	"encoding/json/v2"
 	"fmt"
 	"os"
 	"path/filepath"
@@ -23,27 +26,27 @@ import (
 
 // rooCodeHistoryItem mirrors the HistoryItem in history_item.json.
 type rooCodeHistoryItem struct {
-	ID                      string       `json:"id"`
-	RootTaskID              string       `json:"rootTaskId,omitempty"`
-	ParentTaskID            string       `json:"parentTaskId,omitempty"`
-	Number                  int          `json:"number"`
-	Timestamp               int64        `json:"ts"`
-	Task                    string       `json:"task"`
-	TokensIn                int          `json:"tokensIn"`
-	TokensOut               int          `json:"tokensOut"`
-	CacheWrites             int          `json:"cacheWrites,omitempty"`
-	CacheReads              int          `json:"cacheReads,omitempty"`
-	TotalCost               *json.Number `json:"totalCost"`
-	Size                    int64        `json:"size,omitempty"`
-	Workspace               string       `json:"workspace,omitempty"`
-	Mode                    string       `json:"mode,omitempty"`
-	APIConfigName           string       `json:"apiConfigName,omitempty"`
-	Status                  string       `json:"status,omitempty"`
-	DelegatedToID           string       `json:"delegatedToId,omitempty"`
-	ChildIDs                []string     `json:"childIds,omitempty"`
-	AwaitingChildID         string       `json:"awaitingChildId,omitempty"`
-	CompletedByChildID      string       `json:"completedByChildId,omitempty"`
-	CompletionResultSummary string       `json:"completionResultSummary,omitempty"`
+	ID                      string          `json:"id"`
+	RootTaskID              string          `json:"rootTaskId,omitempty"`
+	ParentTaskID            string          `json:"parentTaskId,omitempty"`
+	Number                  int             `json:"number"`
+	Timestamp               int64           `json:"ts"`
+	Task                    string          `json:"task"`
+	TokensIn                int             `json:"tokensIn"`
+	TokensOut               int             `json:"tokensOut"`
+	CacheWrites             int             `json:"cacheWrites,omitempty"`
+	CacheReads              int             `json:"cacheReads,omitempty"`
+	TotalCost               *jsontext.Value `json:"totalCost"`
+	Size                    int64           `json:"size,omitempty"`
+	Workspace               string          `json:"workspace,omitempty"`
+	Mode                    string          `json:"mode,omitempty"`
+	APIConfigName           string          `json:"apiConfigName,omitempty"`
+	Status                  string          `json:"status,omitempty"`
+	DelegatedToID           string          `json:"delegatedToId,omitempty"`
+	ChildIDs                []string        `json:"childIds,omitempty"`
+	AwaitingChildID         string          `json:"awaitingChildId,omitempty"`
+	CompletedByChildID      string          `json:"completedByChildId,omitempty"`
+	CompletionResultSummary string          `json:"completionResultSummary,omitempty"`
 }
 
 // rooCodeMessage mirrors the ClineMessage in ui_messages.json.
@@ -299,7 +302,7 @@ func parseRooCodeSession(
 		// is authoritative and must override catalog-based pricing;
 		// treating it as absent would misprice token-bearing sessions.
 		if historyItem.TotalCost != nil {
-			cost, err := money.ParseDollars(historyItem.TotalCost.String())
+			cost, err := money.ParseDollars(string(*historyItem.TotalCost))
 			if err != nil {
 				return nil, nil, fmt.Errorf(
 					"parsing RooCode total cost: %w", err,
@@ -342,7 +345,7 @@ func parseRooCodeMessages(
 		return nil, 0, time.Time{}, err
 	}
 
-	var rawMessages []json.RawMessage
+	var rawMessages []jsontext.Value
 	if err := json.Unmarshal(data, &rawMessages); err != nil {
 		// Try parsing as a single message.
 		var single rooCodeMessage
@@ -351,7 +354,7 @@ func parseRooCodeMessages(
 				"parsing ui_messages.json: %w", err,
 			)
 		}
-		rawMessages = []json.RawMessage{data}
+		rawMessages = []jsontext.Value{data}
 	}
 
 	parsedMessages := make([]ParsedMessage, 0, len(rawMessages))
@@ -542,6 +545,7 @@ func parseRooCodeMessages(
 					Content:       output,
 					Model:         model,
 					IsSystem:      true,
+					SourceSubtype: SourceSubtypeToolResult,
 					Timestamp:     ts,
 					ContentLength: len(output),
 					ToolResults:   toolResults,
@@ -585,6 +589,7 @@ func parseRooCodeMessages(
 					Content:       content,
 					Model:         model,
 					IsSystem:      true,
+					SourceSubtype: SourceSubtypeToolResult,
 					Timestamp:     ts,
 					ContentLength: len(content),
 				})
@@ -629,6 +634,7 @@ func parseRooCodeMessages(
 					Content:       content,
 					Model:         model,
 					IsSystem:      true,
+					SourceSubtype: SourceSubtypeToolResult,
 					Timestamp:     ts,
 					ContentLength: len(content),
 				})
@@ -732,13 +738,20 @@ func parseRooCodeMessages(
 				}
 			}
 
-			// Regular message.
+			// Regular message. A codebase_search_result is the raw
+			// result of an internal search tool, not model text, so
+			// storage policies that drop tool output can recognize it.
+			var subtype string
+			if msg.Say == "codebase_search_result" {
+				subtype = SourceSubtypeToolResult
+			}
 			parsedMessages = append(parsedMessages, ParsedMessage{
 				Ordinal:       ordinal,
 				Role:          role,
 				Content:       content,
 				Model:         model,
 				IsSystem:      role == RoleSystem,
+				SourceSubtype: subtype,
 				Timestamp:     ts,
 				ContentLength: len(content),
 			})
@@ -910,7 +923,7 @@ func classifyRooCodeMessage(
 			return RoleAssistant, nil, nil
 		}
 		inputMap := map[string]string{"command": cmdText}
-		inputJSON, err := json.Marshal(inputMap)
+		inputJSON, err := json.Marshal(inputMap, json.Deterministic(true))
 		if err != nil {
 			return RoleAssistant, nil, nil
 		}
@@ -1289,7 +1302,7 @@ func parseRooCodeMcpCall(text string, ordinal int) *ParsedToolCall {
 		}
 	}
 
-	inputJSON, err := json.Marshal(toolData)
+	inputJSON, err := json.Marshal(toolData, json.Deterministic(true))
 	if err != nil {
 		return nil
 	}
@@ -1331,7 +1344,7 @@ func parseRooCodeToolCall(text string, ordinal int) *ParsedToolCall {
 	}
 
 	// Re-marshal to get canonical JSON for InputJSON.
-	inputJSON, err := json.Marshal(toolData)
+	inputJSON, err := json.Marshal(toolData, json.Deterministic(true))
 	if err != nil {
 		return nil
 	}
@@ -1354,7 +1367,7 @@ func parseRooCodeToolCall(text string, ordinal int) *ParsedToolCall {
 		// Infer skill name from readFile calls to SKILL.md files,
 		// matching how Cursor, Codex, Grok, Kimi, and ZCode detect
 		// skill usage from file reads.
-		tc.SkillName = inferToolSkillName(toolName, tc.InputJSON)
+		tc.SkillName = inferToolSkillName(context.Background(), toolName, tc.InputJSON)
 	}
 	return tc
 }
@@ -1403,7 +1416,7 @@ func rooCodeFingerprintSource(path string) (SourceFingerprint, error) {
 		}
 	}
 
-	fp.Hash = fmt.Sprintf("%x", h.Sum(nil))
+	fp.Hash = hex.EncodeToString(h.Sum(nil))
 	return fp, nil
 }
 

@@ -1,10 +1,8 @@
 <script lang="ts">
   import { EmptyState, Spinner, Typeahead, type TypeaheadOption } from "@kenn-io/kit-ui";
   import { m } from "../../i18n/index.js";
-  import { InsightsService } from "../../api/generated/index";
+  import { InsightsService, type DbInsight } from "../../api/generated/index";
   import {
-    callGenerated,
-    configureGeneratedClient,
     isAbortError,
   } from "../../api/runtime.js";
   import {
@@ -14,9 +12,12 @@
   import { sync } from "../../stores/sync.svelte.js";
   import { insights } from "../../stores/insights.svelte.js";
   import { router } from "../../stores/router.svelte.js";
-  import { renderMarkdown } from "../../utils/markdown.js";
+  import { ui } from "../../stores/ui.svelte.js";
+  import { loadAssetImages, renderMarkdown } from "../../utils/markdown.js";
   import { highlightCodeFences } from "../../utils/highlight-fences.js";
-  import type { Insight, InsightsResponse, AgentName } from "../../api/types.js";
+  import type { AgentName } from "../../api/types.js";
+  import { AGENT_NAMES } from "../../api/types/insights.js";
+  import { agentLabel } from "../../utils/agents.js";
   import { LightbulbIcon, PlusIcon } from "../../icons.js";
   import { LatestRead } from "../../utils/latest-read.js";
 
@@ -26,7 +27,7 @@
     timezone = "",
   }: { dateFrom: string; dateTo: string; timezone?: string } = $props();
 
-  let insight: Insight | null = $state(null);
+  let insight: DbInsight | null = $state(null);
   let loading = $state(false);
   let generating = $state(false);
   let phase = $state("");
@@ -60,26 +61,24 @@
   }
 
   const insightGenerationAvailable = $derived(
-    sync.serverVersion?.insight_generation_available === true ||
-      sync.serverVersion?.read_only !== true,
+    sync.serverVersion?.insight_generation_available ??
+      (sync.serverVersion?.read_only !== true),
   );
   const generationUnavailable = $derived(
     sync.serverVersion === null || !insightGenerationAvailable,
   );
   const unavailableTitle = $derived(
     sync.serverVersion !== null && !insightGenerationAvailable
-      ? m.activity_insight_unavailable_read_only()
+      ? m.insights_page_generate_disabled()
       : sync.serverVersion === null
         ? m.activity_insight_waiting_server()
         : m.activity_insight_generate_insight(),
   );
-  const agentOptions: TypeaheadOption[] = [
-    { name: "claude", label: "Claude", displayLabel: "Claude" },
-    { name: "codex", label: "Codex", displayLabel: "Codex" },
-    { name: "copilot", label: "Copilot", displayLabel: "Copilot" },
-    { name: "gemini", label: "Gemini", displayLabel: "Gemini" },
-    { name: "kiro", label: "Kiro", displayLabel: "Kiro" },
-  ];
+  const agentOptions: TypeaheadOption[] = AGENT_NAMES.map((name) => ({
+    name,
+    label: agentLabel(name),
+    displayLabel: agentLabel(name),
+  }));
 
   function abortGeneration() {
     handle?.abort();
@@ -100,15 +99,11 @@
     generating = false;
     loading = true;
 
-    configureGeneratedClient();
-    callGenerated(
-      () => InsightsService.getApiV1Insights({
+    InsightsService.getApiV1Insights({
         type: "daily_activity",
-        dateFrom: from,
-        dateTo: to,
-      }),
-      signal,
-    )
+        date_from: from,
+        date_to: to,
+      }, { signal })
       .then((res) => {
         if (v !== fetchVersion || !insightListRead.isCurrent(signal)) return;
         // The list endpoint treats date_from/date_to as range BOUNDS, so a
@@ -116,7 +111,7 @@
         // (e.g. a single day) and project-scoped ones. This panel shows the
         // global insight for the exact range, so match both bounds and drop
         // project-scoped rows before taking the newest.
-        const list = (res as unknown as InsightsResponse).insights.filter(
+        const list = res.insights.filter(
           (i) => !i.project && i.date_from === from && i.date_to === to,
         );
         insight = list[0] ?? null;
@@ -155,7 +150,7 @@
         date_from: dateFrom,
         date_to: dateTo,
         timezone,
-        agent: insights.agent,
+        agent: insights.requestAgent,
       },
       (p) => {
         if (v !== genVersion) return;
@@ -242,8 +237,11 @@
     <article
       class="markdown-body"
       use:highlightCodeFences={{ content: insight.content }}
+      use:loadAssetImages={insight.content}
     >
-      {@html renderMarkdown(insight.content)}
+      {@html renderMarkdown(insight.content, {
+        renderUnknownXmlBlocksAsPreformatted: ui.renderUnknownXmlBlocksAsPreformatted,
+      })}
     </article>
   {:else}
     <EmptyState title={m.activity_insight_empty_text()}>
@@ -354,12 +352,12 @@
   }
 
   .generate-btn:active:not(:disabled) {
-    transform: scale(0.98);
+    transform: var(--press-transform);
     box-shadow: none;
   }
 
   .generate-btn:disabled {
-    opacity: 0.45;
+    opacity: var(--opacity-disabled);
     box-shadow: none;
     cursor: default;
   }
@@ -421,7 +419,7 @@
     border-radius: var(--radius-sm);
   }
 
-  .markdown-body :global(pre) {
+  .markdown-body :global(pre:not(.unknown-xml-block)) {
     background: var(--bg-inset);
     padding: 10px 14px;
     border-radius: var(--radius-md);

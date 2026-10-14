@@ -1,4 +1,4 @@
-import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
+import { afterEach, beforeEach, describe, expect, it, vi } from "vite-plus/test";
 import { mount, tick, unmount } from "svelte";
 import SidebarToggleButton from "./SidebarToggleButton.svelte";
 import { setLocale } from "../../i18n/index.js";
@@ -34,9 +34,7 @@ describe("SidebarToggleButton keyboard focus", () => {
 
     expect(sidebarButton).not.toBeNull();
     expect(contentButton).not.toBeNull();
-    expect(sidebarButton?.getAttribute("aria-controls")).toBe(
-      "session-sidebar",
-    );
+    expect(sidebarButton?.getAttribute("aria-controls")).toBe("session-sidebar");
     expect(sidebarButton?.getAttribute("aria-expanded")).toBe("true");
 
     sidebarButton!.focus();

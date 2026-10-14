@@ -19,9 +19,10 @@ const (
 // unsupported results, but scheduling and validation should trust this
 // declaration once a provider has migrated off the legacy adapter.
 type Capabilities struct {
-	Source  SourceCapabilities
-	Content ContentCapabilities
-	Sync    ProviderSyncSemantics
+	Source     SourceCapabilities
+	Content    ContentCapabilities
+	Sync       ProviderSyncSemantics
+	RawCapture RawCaptureCapabilities
 }
 
 // UnchangedResultPolicy controls how the engine compares parsed members from a
@@ -72,6 +73,10 @@ type SourceCapabilities struct {
 	// its stored virtual members. A still-present container remains
 	// authoritative for member deletion.
 	PersistentArchive CapabilitySupport
+	// ExplicitDeletionOnly means source discovery and reconciliation may
+	// refresh sessions but must never mark an archived session missing. The
+	// user deletes these sessions explicitly from AgentsView.
+	ExplicitDeletionOnly CapabilitySupport
 	// MultiFileStatHash declares that a provider's on-disk source layout
 	// spans multiple sibling files (Codebuff's chat-messages.json plus
 	// run-state.json and chat-meta.json, for example) and that the engine
@@ -84,6 +89,26 @@ type SourceCapabilities struct {
 	// in providerStatHashers to avoid short-circuiting every
 	// SourceSet-wrapped agent on a 0==0 digest match.
 	MultiFileStatHash CapabilitySupport
+	// S3Discovery means the provider can enumerate and ingest sessions
+	// from an s3:// root under .../<machine>/raw/<agent>/ and implements
+	// S3Provider. Providers leave this at CapabilityUnsupported unless
+	// they opt in; the sync engine uses the flag instead of a hardcoded
+	// Claude/Codex whitelist.
+	S3Discovery CapabilitySupport
+	// SharedSessionIDs means two of the provider's files can carry the same
+	// session id as separate sessions (Gemini CLI chat segments, Cursor
+	// transcripts copied between projects). The sync engine then keeps the
+	// stored file on the id and stores the other under parser.AltSessionID.
+	SharedSessionIDs CapabilitySupport
+	// StoredMemberFreshnessListing means the provider answers a changed-path
+	// event for a shared container with only the members whose change marker
+	// ChangedPathRequest.StoredMemberFreshnessPage does not cover, and resolves
+	// that container through ResolveStoredMemberFreshnessContainer. The listing
+	// must read one database snapshot: the engine skips its post-listing
+	// re-list for these providers, since a commit during the listing arrives as
+	// its own watcher event. The OpenCode family receives the pager through its
+	// own engine route; other providers receive it only by declaring this.
+	StoredMemberFreshnessListing CapabilitySupport
 }
 
 // ContentCapabilities declares optional normalized content fields a provider

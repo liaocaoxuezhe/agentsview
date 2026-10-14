@@ -5,7 +5,9 @@ import (
 	"crypto/sha256"
 	"database/sql"
 	"encoding/hex"
-	"encoding/json"
+	"encoding/json/jsontext"
+	"encoding/json/v2"
+	"errors"
 	"fmt"
 	"sort"
 	"strings"
@@ -39,7 +41,7 @@ const (
 type EvalTrajectoryIngest struct {
 	RunID           string
 	TrajectoryID    string
-	Trajectory      json.RawMessage
+	Trajectory      jsontext.Value
 	ExtractorMethod string
 	SourceVersion   string
 	Project         string
@@ -69,13 +71,16 @@ type EvalTrajectoryIngestResult struct {
 func (db *DB) IngestEvalTrajectory(
 	ctx context.Context, in EvalTrajectoryIngest,
 ) (EvalTrajectoryIngestResult, error) {
+	if err := db.requireDerivedTextStorage("eval trajectories"); err != nil {
+		return EvalTrajectoryIngestResult{}, err
+	}
 	in = normalizeEvalTrajectoryIngest(in)
 	result := EvalTrajectoryIngestResult{
 		RunID:        in.RunID,
 		TrajectoryID: in.TrajectoryID,
 	}
 	if in.RunID == "" || in.TrajectoryID == "" {
-		return result, fmt.Errorf("run_id and trajectory_id are required")
+		return result, errors.New("run_id and trajectory_id are required")
 	}
 	if err := validateEvalRequiredField("extractor_method", in.ExtractorMethod); err != nil {
 		return result, err
@@ -84,7 +89,7 @@ func (db *DB) IngestEvalTrajectory(
 		return result, err
 	}
 	if len(in.Trajectory) == 0 {
-		return result, fmt.Errorf("trajectory is required")
+		return result, errors.New("trajectory is required")
 	}
 	text, err := flattenTrajectoryText(in.Trajectory)
 	if err != nil {
@@ -159,7 +164,7 @@ func validateEvalRequiredField(field, value string) error {
 // flattens to byte-identical text — which keeps chunk ids, and thus
 // idempotency, stable. Keys are structural and skipped; non-string scalars
 // (numbers, booleans, null) carry no searchable text and are skipped too.
-func flattenTrajectoryText(raw json.RawMessage) (string, error) {
+func flattenTrajectoryText(raw jsontext.Value) (string, error) {
 	var root any
 	if err := json.Unmarshal(raw, &root); err != nil {
 		return "", fmt.Errorf("parsing trajectory: %w", err)

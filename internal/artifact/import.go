@@ -308,8 +308,7 @@ func (c *StoreImportCoordinator) processImportClaim(
 	}
 	checkpoint, sessionsRaw, err := c.loadImportCheckpoint(ctx, work, entry)
 	if err != nil {
-		var future *futureArtifactVersionError
-		if errors.As(err, &future) {
+		if future, ok := errors.AsType[*futureArtifactVersionError](err); ok {
 			updated := work
 			updated.RequiredCheckpointVersion = max(
 				updated.RequiredCheckpointVersion, future.Version,
@@ -375,13 +374,11 @@ func (c *StoreImportCoordinator) processImportClaim(
 			result.More = true
 			return nil
 		}
-		page, nextOffset, done, decodeErr :=
-			decodeImportCheckpointSessionPage(
-				sessionsRaw, work.Origin, state.DecodeOffset, *sessionBudget,
-			)
+		page, nextOffset, done, decodeErr := decodeImportCheckpointSessionPage(
+			sessionsRaw, work.Origin, state.DecodeOffset, *sessionBudget,
+		)
 		if decodeErr != nil {
-			var future *futureArtifactVersionError
-			if errors.As(decodeErr, &future) {
+			if future, ok := errors.AsType[*futureArtifactVersionError](decodeErr); ok {
 				updated := work
 				updated.RequiredCheckpointVersion = max(
 					updated.RequiredCheckpointVersion, future.Version,
@@ -518,8 +515,7 @@ func (c *StoreImportCoordinator) importCheckpointSessions(
 			staged.GID, staged.ManifestHash, productionArtifactLimits(),
 		)
 		if err != nil {
-			var future *futureArtifactVersionError
-			if errors.As(err, &future) {
+			if future, ok := errors.AsType[*futureArtifactVersionError](err); ok {
 				if err := c.rememberFutureRequirement(work, future); err != nil {
 					return err
 				}

@@ -15,8 +15,6 @@
     onRemoveProject?: (project: string) => void;
     onClearProjects?: () => void;
     onRemoveModel?: (model: string) => void;
-    onClearModels?: () => void;
-    onClearAgents?: () => void;
   }
 
   let {
@@ -25,8 +23,6 @@
     onRemoveProject,
     onClearProjects,
     onRemoveModel,
-    onClearModels,
-    onClearAgents,
   }: Props = $props();
 
   const selectedAgents = $derived(
@@ -40,15 +36,19 @@
       : [],
   );
 
+  // Label and pull request filters narrow only the session list, so this
+  // bar (shown on the usage page) neither lists nor counts them.
   const hasFilters = $derived(
     !!sessions.filters.project ||
-      sessions.hasActiveFilters ||
+      sessions.hasSharedFilters ||
       projectFilters.length > 0 ||
     modelFilters.length > 0,
   );
 
   function removeMachineTitle(machine: string): string {
-    return m.shared_active_filters_remove_machine({ machine });
+    return m.shared_active_filters_remove_machine({
+      machine: sessions.machineLabel(machine),
+    });
   }
 
   function removeAgentTitle(agent: string): string {
@@ -82,14 +82,13 @@
   function clearAll() {
     sessions.filters.project = "";
     sessions.clearSessionFilters({
+      preserveLabelsAndPR: true,
       clearDateYoke: hasSessionRouteDateIntent(
         router.route,
         router.params,
       ),
     });
     onClearProjects?.();
-    onClearModels?.();
-    onClearAgents?.();
   }
 </script>
 
@@ -116,7 +115,7 @@
         onclick={() => removeMachine(machine)}
         title={removeMachineTitle(machine)}
       >
-        {machine}
+        {sessions.machineLabel(machine)}
         <span class="chip-x">
           <XIcon size="11" strokeWidth="2.4" aria-hidden="true" />
         </span>

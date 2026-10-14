@@ -4,7 +4,9 @@ package main
 
 import (
 	"context"
-	"encoding/json"
+	"encoding/json/jsontext"
+	"encoding/json/v2"
+	"errors"
 	"fmt"
 	"io"
 	"net/http"
@@ -31,8 +33,10 @@ type extractDistillation struct {
 	Quiet     time.Duration
 	Backoff   time.Duration
 	Backstop  time.Duration
-	Server    string
-	Profile   string
+	// Concurrency is the resolved server's parallel session count.
+	Concurrency int
+	Server      string
+	Profile     string
 }
 
 // resolveExtractDistillation validates cfg and resolves it into a runnable
@@ -42,9 +46,8 @@ func resolveExtractDistillation(
 ) (extractDistillation, error) {
 	var dist extractDistillation
 	if !cfg.Enabled {
-		return dist, fmt.Errorf(
-			"recall extraction is not enabled; set enabled = true under " +
-				"[recall.extract] and configure a model and server")
+		return dist, errors.New("recall extraction is not enabled; set enabled = true under " +
+			"[recall.extract] and configure a model and server")
 	}
 	if err := cfg.Validate(); err != nil {
 		return dist, err
@@ -109,11 +112,12 @@ func resolveExtractDistillation(
 			Model:      cfg.Model,
 			Deployment: cfg.Deployment,
 		},
-		Quiet:    quiet,
-		Backoff:  backoff,
-		Backstop: backstop,
-		Server:   serverName,
-		Profile:  profile.Name,
+		Quiet:       quiet,
+		Backoff:     backoff,
+		Backstop:    backstop,
+		Concurrency: server.Concurrency,
+		Server:      serverName,
+		Profile:     profile.Name,
 	}, nil
 }
 
@@ -133,6 +137,9 @@ func buildExtractManager(
 		Identity:       dist.Identity,
 		QuietPeriod:    dist.Quiet,
 		FailureBackoff: dist.Backoff,
+		Concurrency:    dist.Concurrency,
+
+		AllowCandidateFindings: cfg.AllowCandidateFindings(),
 	})
 }
 
@@ -143,6 +150,8 @@ func setupRecallExtraction(
 	cfg config.Config, database *db.DB, idle *server.IdleTracker,
 ) (*extractScheduler, error) {
 	if !cfg.Recall.Extract.Enabled {
+		database.SetExtractCandidateFindingsAllowed(
+			cfg.Recall.Extract.AllowCandidateFindings())
 		return setupExtractReconcileOnly(database, idle)
 	}
 	dist, err := resolveExtractDistillation(cfg.Recall.Extract)
@@ -212,10 +221,9 @@ func openWritableExtractDB(
 		return nil, nil, err
 	}
 	if tr.Mode == transportHTTP {
-		return nil, nil, fmt.Errorf(
-			"a local daemon is running and owns the archive; a daemon with " +
-				"[recall.extract] enabled runs extraction passes itself — " +
-				"stop it to run extraction manually")
+		return nil, nil, errors.New("a local daemon is running and owns the archive; a daemon with " +
+			"[recall.extract] enabled runs extraction passes itself — " +
+			"stop it to run extraction manually")
 	}
 	if tr.Mode == transportDirect && tr.DirectReadOnly {
 		reason := tr.DirectReason
@@ -321,7 +329,7 @@ func newRecallExtractRunCommand() *cobra.Command {
 				return err
 			}
 			if outputFormat(cmd) == "json" {
-				return json.NewEncoder(cmd.OutOrStdout()).Encode(
+				return json.MarshalEncode(jsontext.NewEncoder(cmd.OutOrStdout()),
 					extractRunResult{
 						Sessions:  result.Sessions,
 						Failed:    result.Failed,
@@ -368,7 +376,7 @@ func newRecallExtractStatusCommand() *cobra.Command {
 				return err
 			}
 			applyClassifierConfig(cfg)
-			database, err := db.OpenReadOnly(cfg.DBPath)
+			database, err := db.OpenReadOnly(cmd.Context(), cfg.DBPath)
 			if err != nil {
 				return err
 			}
@@ -382,7 +390,7 @@ func newRecallExtractStatusCommand() *cobra.Command {
 				return err
 			}
 			if outputFormat(cmd) == "json" {
-				return json.NewEncoder(cmd.OutOrStdout()).Encode(status)
+				return json.MarshalEncode(jsontext.NewEncoder(cmd.OutOrStdout()), status)
 			}
 			printExtractStatusHuman(cmd.OutOrStdout(), status)
 			return nil
@@ -525,9 +533,15 @@ func newRecallExtractDoctorCommand() *cobra.Command {
 			}
 			fmt.Fprintf(out, "Server: %s (%s)\n",
 				dist.Server, config.RedactedEndpoint(dist.Client.BaseURL))
+			fmt.Fprintf(out, "Concurrency: %d\n", dist.Concurrency)
 			fmt.Fprintf(out, "Profile: %s\n", dist.Profile)
 			fmt.Fprintf(out, "Segmenter: %s (max_window_chars=%d)\n",
 				dist.Segmenter.Name(), dist.Segmenter.MaxWindowChars)
+			candidateGate := config.RecallCandidateFindingsBlock
+			if cfg.Recall.Extract.AllowCandidateFindings() {
+				candidateGate = config.RecallCandidateFindingsAllow
+			}
+			fmt.Fprintf(out, "Candidate findings: %s\n", candidateGate)
 			fmt.Fprintf(out, "Fingerprint: %s\n", fingerprint)
 
 			ctx, cancel := context.WithTimeout(cmd.Context(),
@@ -574,7 +588,7 @@ func runRecallExtractPreview(
 	cmd *cobra.Command, sessionID string, chunkMaxChars int,
 ) error {
 	if strings.TrimSpace(sessionID) == "" {
-		return fmt.Errorf("recall extract preview requires --session")
+		return errors.New("recall extract preview requires --session")
 	}
 	svc, cleanup, err := resolveRecallEntryService(cmd)
 	if err != nil {
@@ -600,7 +614,7 @@ func runRecallExtractPreview(
 		Chunks:        chunks,
 	}
 	if outputFormat(cmd) == "json" {
-		return json.NewEncoder(cmd.OutOrStdout()).Encode(result)
+		return json.MarshalEncode(jsontext.NewEncoder(cmd.OutOrStdout()), result)
 	}
 	return printRecallExtractDryRunHuman(cmd.OutOrStdout(), result)
 }

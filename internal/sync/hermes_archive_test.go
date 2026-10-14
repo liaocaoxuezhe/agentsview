@@ -1,7 +1,6 @@
 package sync
 
 import (
-	"context"
 	"database/sql"
 	"fmt"
 	"os"
@@ -78,11 +77,11 @@ func TestHermesProviderFingerprintAggregatesDirectTranscripts(t *testing.T) {
 		Machine: "local",
 	})
 	require.True(t, ok)
-	sources, err := provider.Discover(context.Background())
+	sources, err := provider.Discover(t.Context())
 	require.NoError(t, err)
 	require.Len(t, sources, 1)
 
-	fingerprint, err := provider.Fingerprint(context.Background(), sources[0])
+	fingerprint, err := provider.Fingerprint(t.Context(), sources[0])
 	require.NoError(t, err)
 	assert.Equal(t, wantSize, fingerprint.Size)
 	assert.Equal(t, wantMtime, fingerprint.MTimeNS)
@@ -103,15 +102,15 @@ func TestHermesProviderFingerprintChangesWhenTranscriptRemoved(t *testing.T) {
 		Machine: "local",
 	})
 	require.True(t, ok)
-	sources, err := provider.Discover(context.Background())
+	sources, err := provider.Discover(t.Context())
 	require.NoError(t, err)
 	require.Len(t, sources, 1)
 
-	before, err := provider.Fingerprint(context.Background(), sources[0])
+	before, err := provider.Fingerprint(t.Context(), sources[0])
 	require.NoError(t, err)
 
 	require.NoError(t, os.Remove(transcriptPath))
-	after, err := provider.Fingerprint(context.Background(), sources[0])
+	after, err := provider.Fingerprint(t.Context(), sources[0])
 	require.NoError(t, err)
 
 	stateInfo, err := os.Stat(stateDB)
@@ -120,11 +119,77 @@ func TestHermesProviderFingerprintChangesWhenTranscriptRemoved(t *testing.T) {
 	assert.Equal(t, stateInfo.Size(), after.Size)
 }
 
+func TestHermesArchiveStoresCronGroups(t *testing.T) {
+	agent := parser.AgentHermes
+	prefix := string(agent) + ":"
+	root := t.TempDir()
+	stateDB := writeHermesArchiveStateDB(t, root)
+	conn, err := sql.Open("sqlite3", stateDB)
+	require.NoError(t, err)
+	t.Cleanup(func() { require.NoError(t, conn.Close()) })
+	database := dbtest.OpenTestDB(t)
+	_, err = conn.ExecContext(t.Context(), `DELETE FROM messages; DELETE FROM sessions`)
+	require.NoError(t, err)
+	_, err = conn.ExecContext(t.Context(), `
+		INSERT INTO sessions (id, source, parent_session_id, started_at, ended_at, message_count)
+		VALUES ('cron_job-a_20261008_120000', 'cron', NULL, 1791460800, 1791460860, 1),
+		       ('middle', 'cron', 'cron_job-a_20261008_120000', 1791460860, 1791460920, 1),
+		       ('tip', 'cron', 'middle', 1791460920, 1791460980, 1);
+		INSERT INTO messages (session_id, role, content, timestamp)
+		VALUES ('cron_job-a_20261008_120000', 'user', 'Generate digest', 1791460801),
+		       ('middle', 'user', 'Continue digest', 1791460861),
+		       ('tip', 'user', 'Finish digest', 1791460921);
+	`)
+	require.NoError(t, err)
+	engine := NewEngine(t.Context(), database, EngineConfig{
+		AgentDirs: map[parser.AgentType][]string{agent: {root}},
+		Machine:   "local",
+	})
+	t.Cleanup(engine.Close)
+	require.Equal(t, 3, engine.SyncAll(t.Context(), nil).Synced)
+	checkGroups := func() {
+		t.Helper()
+		for _, id := range []string{prefix + "middle", prefix + "tip"} {
+			stored, err := database.GetSession(t.Context(), id)
+			require.NoError(t, err)
+			require.NotNil(t, stored)
+			assert.Regexp(t, `^job-a:[0-9a-f]{8}$`, stored.GroupKey, id)
+		}
+	}
+	require.NoError(t, engine.ReconcileWatchRoots(t.Context(), nil, true))
+
+	_, err = conn.ExecContext(t.Context(), `
+		UPDATE sessions SET parent_session_id = NULL WHERE parent_session_id = 'cron_job-a_20261008_120000';
+		DELETE FROM messages WHERE session_id = 'cron_job-a_20261008_120000';
+		DELETE FROM sessions WHERE id = 'cron_job-a_20261008_120000';
+	`)
+	require.NoError(t, err)
+	require.NoError(t, engine.ReconcileWatchRoots(t.Context(), nil, true))
+	checkGroups()
+	stored, err := database.GetSession(t.Context(), prefix+"middle")
+	require.NoError(t, err)
+	require.NotNil(t, stored)
+	assert.Empty(t, stored.ParentSessionID)
+
+	require.NoError(t, conn.Close())
+	_, err = database.AssignSessionProject(t.Context(), prefix+"middle", "ops")
+	require.NoError(t, err)
+	for range 2 {
+		stats := engine.ResyncAll(t.Context(), nil)
+		require.False(t, stats.Aborted, "%v", stats.Warnings)
+		checkGroups()
+		stored, err := database.GetSession(t.Context(), prefix+"middle")
+		require.NoError(t, err)
+		require.NotNil(t, stored)
+		assert.Equal(t, "ops", stored.Project)
+	}
+}
+
 func TestHermesProfileCreatedAfterEngineInitializationIsDiscovered(t *testing.T) {
 	profilesRoot := filepath.Join(t.TempDir(), ".hermes", "profiles")
 	require.NoError(t, os.MkdirAll(profilesRoot, 0o755))
 	database := dbtest.OpenTestDB(t)
-	engine := NewEngine(database, EngineConfig{
+	engine := NewEngine(t.Context(), database, EngineConfig{
 		AgentDirs: map[parser.AgentType][]string{
 			parser.AgentHermes: {profilesRoot},
 		},
@@ -132,16 +197,16 @@ func TestHermesProfileCreatedAfterEngineInitializationIsDiscovered(t *testing.T)
 	})
 	t.Cleanup(engine.Close)
 
-	before := engine.SyncAll(context.Background(), nil)
+	before := engine.SyncAll(t.Context(), nil)
 	assert.Zero(t, before.Synced)
 
 	profileRoot := filepath.Join(profilesRoot, "research")
 	require.NoError(t, os.MkdirAll(profileRoot, 0o755))
 	writeHermesArchiveStateDB(t, profileRoot)
 
-	after := engine.SyncAll(context.Background(), nil)
+	after := engine.SyncAll(t.Context(), nil)
 	assert.Equal(t, 1, after.Synced)
-	session, err := database.GetSession(context.Background(), "hermes:child")
+	session, err := database.GetSession(t.Context(), "hermes:child")
 	require.NoError(t, err)
 	require.NotNil(t, session)
 	require.NotNil(t, session.FirstMessage)
@@ -154,7 +219,7 @@ func TestReconcileHermesProfilesRootPreservesActiveMembers(t *testing.T) {
 	require.NoError(t, os.MkdirAll(profileRoot, 0o755))
 	stateDB := writeHermesArchiveStateDB(t, profileRoot)
 	database := dbtest.OpenTestDB(t)
-	engine := NewEngine(database, EngineConfig{
+	engine := NewEngine(t.Context(), database, EngineConfig{
 		AgentDirs: map[parser.AgentType][]string{
 			parser.AgentHermes: {profilesRoot},
 		},
@@ -199,7 +264,7 @@ func TestProcessFileHermesArchiveSkipCacheUsesAggregateMtime(t *testing.T) {
 	_, wantMtime := hermesArchiveAggregateFileInfo(t, stateDB)
 
 	database := dbtest.OpenTestDB(t)
-	engine := NewEngine(database, EngineConfig{
+	engine := NewEngine(t.Context(), database, EngineConfig{
 		AgentDirs: map[parser.AgentType][]string{
 			parser.AgentHermes: {filepath.Join(root, "sessions")},
 		},
@@ -209,12 +274,12 @@ func TestProcessFileHermesArchiveSkipCacheUsesAggregateMtime(t *testing.T) {
 		Roots: []string{filepath.Join(root, "sessions")},
 	})
 	require.True(t, ok)
-	sources, err := provider.Discover(context.Background())
+	sources, err := provider.Discover(t.Context())
 	require.NoError(t, err)
 	require.Len(t, sources, 1)
-	fingerprint, err := provider.Fingerprint(context.Background(), sources[0])
+	fingerprint, err := provider.Fingerprint(t.Context(), sources[0])
 	require.NoError(t, err)
-	initial := engine.processFile(context.Background(), parser.DiscoveredFile{
+	initial := engine.processFile(t.Context(), parser.DiscoveredFile{
 		Path: stateDB, Agent: parser.AgentHermes,
 	})
 	require.NoError(t, initial.err)
@@ -233,7 +298,7 @@ func TestProcessFileHermesArchiveSkipCacheUsesAggregateMtime(t *testing.T) {
 		): wantMtime,
 	})
 
-	res := engine.processFile(context.Background(), parser.DiscoveredFile{
+	res := engine.processFile(t.Context(), parser.DiscoveredFile{
 		Path:  stateDB,
 		Agent: parser.AgentHermes,
 	})
@@ -265,14 +330,14 @@ func TestProcessFileHermesArchivePersistsAggregateFingerprint(t *testing.T) {
 
 	wantSize, wantMtime := hermesArchiveAggregateFileInfo(t, stateDB)
 	database := dbtest.OpenTestDB(t)
-	engine := NewEngine(database, EngineConfig{
+	engine := NewEngine(t.Context(), database, EngineConfig{
 		AgentDirs: map[parser.AgentType][]string{
 			parser.AgentHermes: {filepath.Join(root, "sessions")},
 		},
 		Machine: "local",
 	})
 
-	res := engine.processFile(context.Background(), parser.DiscoveredFile{
+	res := engine.processFile(t.Context(), parser.DiscoveredFile{
 		Path:  stateDB,
 		Agent: parser.AgentHermes,
 	})
@@ -297,7 +362,7 @@ func TestProcessFileHermesArchivePersistsAggregateFingerprint(t *testing.T) {
 	require.Equal(t, 0, failed)
 	require.NotZero(t, written)
 
-	storedSize, storedMtime, ok := database.GetFileInfoByPath(stateDB)
+	storedSize, storedMtime, ok := database.GetFileInfoByPath(t.Context(), stateDB)
 	require.True(t, ok)
 	assert.Equal(t, wantSize, storedSize)
 	assert.Equal(t, wantMtime, storedMtime)
@@ -323,7 +388,7 @@ func TestSyncPathsHermesArchiveTranscriptPersistsAggregateFingerprint(t *testing
 
 	wantSize, wantMtime := hermesArchiveAggregateFileInfo(t, stateDB)
 	database := dbtest.OpenTestDB(t)
-	engine := NewEngine(database, EngineConfig{
+	engine := NewEngine(t.Context(), database, EngineConfig{
 		AgentDirs: map[parser.AgentType][]string{
 			parser.AgentHermes: {filepath.Join(root, "sessions")},
 		},
@@ -332,7 +397,7 @@ func TestSyncPathsHermesArchiveTranscriptPersistsAggregateFingerprint(t *testing
 
 	engine.SyncPaths([]string{transcriptPath})
 
-	storedSize, storedMtime, found := database.GetFileInfoByPath(stateDB)
+	storedSize, storedMtime, found := database.GetFileInfoByPath(t.Context(), stateDB)
 	require.True(t, found)
 	assert.Equal(t, wantSize, storedSize)
 	assert.Equal(t, wantMtime, storedMtime)
@@ -343,7 +408,7 @@ func TestSyncPathsHermesArchiveWALCommitRefreshesMetadata(t *testing.T) {
 	stateDB := writeHermesArchiveStateDB(t, root)
 	writer := openHermesArchiveWALWriter(t, stateDB)
 	database := dbtest.OpenTestDB(t)
-	engine := NewEngine(database, EngineConfig{
+	engine := NewEngine(t.Context(), database, EngineConfig{
 		AgentDirs: map[parser.AgentType][]string{
 			parser.AgentHermes: {root},
 		},
@@ -351,12 +416,12 @@ func TestSyncPathsHermesArchiveWALCommitRefreshesMetadata(t *testing.T) {
 	})
 	t.Cleanup(engine.Close)
 
-	initial := engine.SyncAll(context.Background(), nil)
+	initial := engine.SyncAll(t.Context(), nil)
 	require.Equal(t, 1, initial.Synced)
 	stateBefore, err := os.Stat(stateDB)
 	require.NoError(t, err)
 
-	_, err = writer.Exec(`UPDATE sessions SET title = 'WAL-only title' WHERE id = 'child'`)
+	_, err = writer.ExecContext(t.Context(), `UPDATE sessions SET title = 'WAL-only title' WHERE id = 'child'`)
 	require.NoError(t, err)
 	walPath := stateDB + "-wal"
 	walInfo, err := os.Stat(walPath)
@@ -371,12 +436,12 @@ func TestSyncPathsHermesArchiveWALCommitRefreshesMetadata(t *testing.T) {
 
 	engine.SyncPaths([]string{walPath})
 
-	session, err := database.GetSession(context.Background(), "hermes:child")
+	session, err := database.GetSession(t.Context(), "hermes:child")
 	require.NoError(t, err)
 	require.NotNil(t, session)
 	require.NotNil(t, session.DisplayName)
 	assert.Equal(t, "WAL-only title", *session.DisplayName)
-	storedSize, storedMtime, found := database.GetFileInfoByPath(stateDB)
+	storedSize, storedMtime, found := database.GetFileInfoByPath(t.Context(), stateDB)
 	require.True(t, found)
 	assert.Equal(t, stateAfter.Size()+walInfo.Size(), storedSize)
 	assert.Equal(t, walTime.UnixNano(), storedMtime)
@@ -384,15 +449,16 @@ func TestSyncPathsHermesArchiveWALCommitRefreshesMetadata(t *testing.T) {
 
 func openHermesArchiveWALWriter(t *testing.T, stateDB string) *sql.DB {
 	t.Helper()
+
 	writer, err := sql.Open("sqlite3", stateDB)
 	require.NoError(t, err)
 	writer.SetMaxOpenConns(1)
 	t.Cleanup(func() { require.NoError(t, writer.Close()) })
 
 	var journalMode string
-	require.NoError(t, writer.QueryRow(`PRAGMA journal_mode = WAL`).Scan(&journalMode))
+	require.NoError(t, writer.QueryRowContext(t.Context(), `PRAGMA journal_mode = WAL`).Scan(&journalMode))
 	assert.Equal(t, "wal", journalMode)
-	_, err = writer.Exec(`PRAGMA wal_autocheckpoint = 0`)
+	_, err = writer.ExecContext(t.Context(), `PRAGMA wal_autocheckpoint = 0`)
 	require.NoError(t, err)
 	return writer
 }
@@ -417,7 +483,7 @@ func TestReconcileHermesStateMemberDetectsSameStatTranscriptRewrite(t *testing.T
 	writeTranscript("original prompt")
 
 	database := dbtest.OpenTestDB(t)
-	engine := NewEngine(database, EngineConfig{
+	engine := NewEngine(t.Context(), database, EngineConfig{
 		AgentDirs: map[parser.AgentType][]string{
 			parser.AgentHermes: {sessionsDir},
 		},
@@ -425,7 +491,7 @@ func TestReconcileHermesStateMemberDetectsSameStatTranscriptRewrite(t *testing.T
 	})
 	assertMessages := func(want ...string) {
 		messages, err := database.GetMessages(
-			context.Background(), "hermes:child", 0, len(want), true,
+			t.Context(), "hermes:child", 0, len(want), true,
 		)
 		require.NoError(t, err)
 		require.Len(t, messages, len(want))
@@ -433,26 +499,26 @@ func TestReconcileHermesStateMemberDetectsSameStatTranscriptRewrite(t *testing.T
 			assert.Equal(t, want[i], messages[i].Content)
 		}
 	}
-	require.NoError(t, engine.ReconcileWatchRoots(context.Background(), nil, true))
+	require.NoError(t, engine.ReconcileWatchRoots(t.Context(), nil, true))
 	assertMessages("original prompt", "Done.")
 
 	provider, ok := parser.NewProvider(parser.AgentHermes, parser.ProviderConfig{
 		Roots: []string{sessionsDir},
 	})
 	require.True(t, ok)
-	source, found, err := provider.FindSource(context.Background(), parser.FindSourceRequest{
+	source, found, err := provider.FindSource(t.Context(), parser.FindSourceRequest{
 		RawSessionID: "child",
 	})
 	require.NoError(t, err)
 	require.True(t, found)
-	fingerprint, err := provider.Fingerprint(context.Background(), source)
+	fingerprint, err := provider.Fingerprint(t.Context(), source)
 	require.NoError(t, err)
 	memberPath := parser.VirtualSourcePath(stateDB, "child")
-	storedSize, storedMtime, found := database.GetFileInfoByPath(memberPath)
+	storedSize, storedMtime, found := database.GetFileInfoByPath(t.Context(), memberPath)
 	require.True(t, found)
 	assert.Equal(t, fingerprint.Size, storedSize)
 	assert.Equal(t, fingerprint.MTimeNS, storedMtime)
-	storedHash, found := database.GetFileHashByPath(memberPath)
+	storedHash, found := database.GetFileHashByPath(t.Context(), memberPath)
 	require.True(t, found)
 	assert.Equal(t, fingerprint.Hash, storedHash)
 
@@ -467,7 +533,7 @@ func TestReconcileHermesStateMemberDetectsSameStatTranscriptRewrite(t *testing.T
 	require.Equal(t, transcriptInfo.Size(), rewrittenInfo.Size())
 	require.Equal(t, transcriptInfo.ModTime(), rewrittenInfo.ModTime())
 
-	require.NoError(t, engine.ReconcileWatchRoots(context.Background(), nil, true))
+	require.NoError(t, engine.ReconcileWatchRoots(t.Context(), nil, true))
 	assertMessages("modified prompt", "Done.")
 }
 
@@ -478,7 +544,7 @@ func TestReconcileHermesDefaultSessionsRootTombstonesRemovedStateMember(t *testi
 	require.NoError(t, os.MkdirAll(sessionsDir, 0o755))
 
 	database := dbtest.OpenTestDB(t)
-	engine := NewEngine(database, EngineConfig{
+	engine := NewEngine(t.Context(), database, EngineConfig{
 		AgentDirs: map[parser.AgentType][]string{
 			parser.AgentHermes: {sessionsDir},
 		},
@@ -511,7 +577,7 @@ func TestReconcileHermesDefaultSessionsRootTombstonesRemovedStateMember(t *testi
 	))
 	stored, err = database.GetSession(t.Context(), "hermes:child")
 	require.NoError(t, err)
-	assert.Nil(t, stored,
+	assert.NotNil(t, stored,
 		"authoritative reconciliation must tombstone a removed state.db member")
 }
 
@@ -531,7 +597,7 @@ func TestReconcileHermesScopedArchiveTombstonesRemovedStateMember(
 	writeHermesTranscriptFile(t, otherRoot, "keeper")
 
 	database := dbtest.OpenTestDB(t)
-	engine := NewEngine(database, EngineConfig{
+	engine := NewEngine(t.Context(), database, EngineConfig{
 		AgentDirs: map[parser.AgentType][]string{
 			parser.AgentHermes: {sessionsDir, otherRoot},
 		},
@@ -559,7 +625,7 @@ func TestReconcileHermesScopedArchiveTombstonesRemovedStateMember(
 
 	stored, err = database.GetSession(t.Context(), "hermes:child")
 	require.NoError(t, err)
-	assert.Nil(t, stored,
+	assert.NotNil(t, stored,
 		"an archive-scoped pass proves its own membership and reclaims the member")
 	survivor, err := database.GetSession(t.Context(), "hermes:keeper")
 	require.NoError(t, err)
@@ -572,7 +638,7 @@ func TestReconcileHermesLabeledStateDBRootTombstonesRemovedMember(t *testing.T) 
 	stateDB := writeHermesArchiveStateDB(t, root)
 
 	database := dbtest.OpenTestDB(t)
-	engine := NewEngine(database, EngineConfig{
+	engine := NewEngine(t.Context(), database, EngineConfig{
 		AgentDirs: map[parser.AgentType][]string{
 			parser.AgentHermes: {stateDB},
 		},
@@ -602,7 +668,7 @@ func TestReconcileHermesLabeledStateDBRootTombstonesRemovedMember(t *testing.T) 
 	))
 	stored, err = database.GetSession(t.Context(), "hermes:child")
 	require.NoError(t, err)
-	assert.Nil(t, stored)
+	assert.NotNil(t, stored)
 }
 
 // Streamed discovery must open state.db a bounded number of times per pass:
@@ -611,6 +677,8 @@ func TestReconcileHermesLabeledStateDBRootTombstonesRemovedMember(t *testing.T) 
 // size instead of the changed batch.
 func TestReconcileHermesStateDBOpensBoundedPerPass(t *testing.T) {
 	scansFor := func(t *testing.T, transcripts int) int {
+		t.Helper()
+
 		root := t.TempDir()
 		writeHermesArchiveStateDB(t, root)
 		sessionsDir := filepath.Join(root, "sessions")
@@ -624,7 +692,7 @@ func TestReconcileHermesStateDBOpensBoundedPerPass(t *testing.T) {
 		}
 
 		database := dbtest.OpenTestDB(t)
-		engine := NewEngine(database, EngineConfig{
+		engine := NewEngine(t.Context(), database, EngineConfig{
 			AgentDirs: map[parser.AgentType][]string{
 				parser.AgentHermes: {sessionsDir},
 			},
@@ -651,6 +719,8 @@ func TestReconcileHermesStateMemberFingerprintOpensBoundedPerPass(
 	t *testing.T,
 ) {
 	scansFor := func(t *testing.T, members int) int {
+		t.Helper()
+
 		root := t.TempDir()
 		stateDB := writeHermesArchiveStateDB(t, root)
 		sessionsDir := filepath.Join(root, "sessions")
@@ -673,7 +743,7 @@ func TestReconcileHermesStateMemberFingerprintOpensBoundedPerPass(
 		require.NoError(t, conn.Close())
 
 		database := dbtest.OpenTestDB(t)
-		engine := NewEngine(database, EngineConfig{
+		engine := NewEngine(t.Context(), database, EngineConfig{
 			AgentDirs: map[parser.AgentType][]string{
 				parser.AgentHermes: {sessionsDir},
 			},
@@ -708,6 +778,8 @@ func TestReconcileHermesSiblingMemberChangeBoundsUnchangedMemberWork(
 	t *testing.T,
 ) {
 	passFor := func(t *testing.T, members int) (synced, scans int) {
+		t.Helper()
+
 		root := t.TempDir()
 		stateDB := writeHermesArchiveStateDB(t, root)
 		sessionsDir := filepath.Join(root, "sessions")
@@ -730,7 +802,7 @@ func TestReconcileHermesSiblingMemberChangeBoundsUnchangedMemberWork(
 		require.NoError(t, conn.Close())
 
 		database := dbtest.OpenTestDB(t)
-		engine := NewEngine(database, EngineConfig{
+		engine := NewEngine(t.Context(), database, EngineConfig{
 			AgentDirs: map[parser.AgentType][]string{
 				parser.AgentHermes: {sessionsDir},
 			},
@@ -775,7 +847,7 @@ func TestReconcileHermesSiblingMemberChangeBoundsUnchangedMemberWork(
 		))
 		removed, err := database.GetSession(t.Context(), "hermes:member-000")
 		require.NoError(t, err)
-		assert.Nil(t, removed, "removed member must tombstone")
+		assert.NotNil(t, removed, "removed member must remain browsable")
 		survivor, err := database.GetSession(t.Context(), "hermes:member-001")
 		require.NoError(t, err)
 		assert.NotNil(t, survivor, "surviving members must stay active")
@@ -824,7 +896,7 @@ func TestReconcileHermesSyncAllSeededStateMemberRemovalTombstones(
 	require.NoError(t, conn.Close())
 
 	database := dbtest.OpenTestDB(t)
-	engine := NewEngine(database, EngineConfig{
+	engine := NewEngine(t.Context(), database, EngineConfig{
 		AgentDirs: map[parser.AgentType][]string{
 			parser.AgentHermes: {sessionsDir},
 		},
@@ -850,7 +922,7 @@ func TestReconcileHermesSyncAllSeededStateMemberRemovalTombstones(
 	))
 	removed, err := database.GetSession(t.Context(), "hermes:child")
 	require.NoError(t, err)
-	assert.Nil(t, removed,
+	assert.NotNil(t, removed,
 		"audit reconciliation must tombstone a SyncAll-seeded removed member")
 	survivor, err := database.GetSession(t.Context(), "hermes:survivor")
 	require.NoError(t, err)
@@ -873,7 +945,7 @@ func TestReconcileHermesRelativeSessionsRootTombstonesRemovedStateMember(
 	require.False(t, filepath.IsAbs(relativeSessionsDir))
 
 	database := dbtest.OpenTestDB(t)
-	engine := NewEngine(database, EngineConfig{
+	engine := NewEngine(t.Context(), database, EngineConfig{
 		AgentDirs: map[parser.AgentType][]string{
 			parser.AgentHermes: {relativeSessionsDir},
 		},
@@ -898,7 +970,7 @@ func TestReconcileHermesRelativeSessionsRootTombstonesRemovedStateMember(
 	))
 	stored, err = database.GetSession(t.Context(), "hermes:child")
 	require.NoError(t, err)
-	assert.Nil(t, stored,
+	assert.NotNil(t, stored,
 		"absolute reconciliation scope must cover a configured relative root")
 }
 
@@ -909,7 +981,7 @@ func TestReconcileHermesDefaultSessionsRootPreservesMissingStateDBArchive(t *tes
 	require.NoError(t, os.MkdirAll(sessionsDir, 0o755))
 
 	database := dbtest.OpenTestDB(t)
-	engine := NewEngine(database, EngineConfig{
+	engine := NewEngine(t.Context(), database, EngineConfig{
 		AgentDirs: map[parser.AgentType][]string{
 			parser.AgentHermes: {sessionsDir},
 		},
@@ -939,7 +1011,7 @@ func TestReconcileHermesUnreadableStateDBSyncsTranscriptsWithoutTombstones(
 	require.NoError(t, os.MkdirAll(sessionsDir, 0o755))
 
 	database := dbtest.OpenTestDB(t)
-	engine := NewEngine(database, EngineConfig{
+	engine := NewEngine(t.Context(), database, EngineConfig{
 		AgentDirs: map[parser.AgentType][]string{
 			parser.AgentHermes: {sessionsDir},
 		},
@@ -989,7 +1061,7 @@ func TestReconcileHermesUnreadableStateDBSyncsTranscriptsWithoutTombstones(
 	require.NoError(t, getErr)
 	require.NotNil(t, fallback,
 		"transcript fallback candidates must still be processed before retry")
-	assert.Equal(t, jsonlPath, database.GetSessionFilePath("hermes:orphan"),
+	assert.Equal(t, filepath.Clean(jsonlPath), database.GetSessionFilePath(t.Context(), "hermes:orphan"),
 		"JSONL must remain canonical when a legacy JSON duplicate exists")
 }
 
@@ -1003,7 +1075,7 @@ func TestReconcileHermesScopedRootPreservesStateMemberMovedToAnotherRoot(t *test
 	require.NoError(t, os.MkdirAll(secondSessions, 0o755))
 
 	database := dbtest.OpenTestDB(t)
-	engine := NewEngine(database, EngineConfig{
+	engine := NewEngine(t.Context(), database, EngineConfig{
 		AgentDirs: map[parser.AgentType][]string{
 			parser.AgentHermes: {firstSessions, secondSessions},
 		},
@@ -1032,11 +1104,12 @@ func TestReconcileHermesScopedRootPreservesStateMemberMovedToAnotherRoot(t *test
 
 func writeHermesArchiveStateDB(t *testing.T, root string) string {
 	t.Helper()
+
 	stateDB := filepath.Join(root, "state.db")
 	conn, err := sql.Open("sqlite3", stateDB)
 	require.NoError(t, err)
 
-	_, err = conn.Exec(`
+	_, err = conn.ExecContext(t.Context(), `
 		CREATE TABLE sessions (
 			id TEXT PRIMARY KEY,
 			source TEXT NOT NULL,
@@ -1111,7 +1184,7 @@ func TestReconcileHermesRemovedProfileTombstonesItsTranscripts(t *testing.T) {
 	writeHermesProfileTranscript(t, container, "writing", "kept")
 
 	database := dbtest.OpenTestDB(t)
-	engine := NewEngine(database, EngineConfig{
+	engine := NewEngine(t.Context(), database, EngineConfig{
 		AgentDirs: map[parser.AgentType][]string{
 			parser.AgentHermes: {container},
 		},
@@ -1128,7 +1201,7 @@ func TestReconcileHermesRemovedProfileTombstonesItsTranscripts(t *testing.T) {
 
 	stored, err := database.GetSession(t.Context(), "hermes:gone")
 	require.NoError(t, err)
-	assert.Nil(t, stored,
+	assert.NotNil(t, stored,
 		"a removal event must reclaim the deleted profile's transcripts")
 	survivor, err := database.GetSession(t.Context(), "hermes:kept")
 	require.NoError(t, err)
@@ -1149,7 +1222,7 @@ func TestReconcileHermesFlatRootDescendantTombstonesRemovedTranscript(
 	writeHermesTranscriptFile(t, root, "kept")
 
 	database := dbtest.OpenTestDB(t)
-	engine := NewEngine(database, EngineConfig{
+	engine := NewEngine(t.Context(), database, EngineConfig{
 		AgentDirs: map[parser.AgentType][]string{
 			parser.AgentHermes: {root},
 		},
@@ -1166,7 +1239,7 @@ func TestReconcileHermesFlatRootDescendantTombstonesRemovedTranscript(
 
 	stored, err := database.GetSession(t.Context(), "hermes:gone")
 	require.NoError(t, err)
-	assert.Nil(t, stored,
+	assert.NotNil(t, stored,
 		"a removed flat-root transcript must be reclaimed by its own request")
 	survivor, err := database.GetSession(t.Context(), "hermes:kept")
 	require.NoError(t, err)

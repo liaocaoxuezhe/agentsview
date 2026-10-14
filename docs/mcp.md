@@ -1,4 +1,5 @@
 ---
+last_edited: 2026-10-09
 title: MCP Server
 description: Connect assistant clients to your AgentsView session history with MCP
 ---
@@ -6,8 +7,12 @@ description: Connect assistant clients to your AgentsView session history with M
 The `agentsview mcp` command runs a read-only
 [Model Context Protocol](https://modelcontextprotocol.io) server. MCP-capable
 assistant clients can use it to search prior sessions, inspect a session before
-opening it, fetch message slices, search raw content, and summarize token usage
-without leaving the assistant.
+opening it, fetch message slices, search raw content, see which tools a session
+ran and which files it edited, report activity, tool use, and quality signals,
+summarize and compare token usage, and search the AgentsView guides without
+leaving the assistant.
+
+MCP tool results warn when the archive is stale during a full parser rebuild.
 
 ## When To Use It
 
@@ -16,10 +21,30 @@ Use the MCP server when you want a coding assistant to answer questions such as:
 - "Have I solved this error before?"
 - "Find prior sessions in this repository about the deploy pipeline."
 - "Open the relevant messages around this search hit."
+- "Which sessions changed `internal/server/routes.go`, and what did they run?"
 - "Summarize recent token usage for this project."
+- "How much agent time and cost did this week take, and where did agents
+  struggle?"
 
 The tools are read-only. They expose session history and usage data, but they do
 not mutate the archive or resync files directly.
+
+### Discover running HTTP listeners
+
+Run `agentsview mcp status --json` to list HTTP MCP listeners started by this
+version. The command reads local runtime records without starting a server. Each
+entry includes `transport`, `url`, `pid`, `backend_url` when known, and
+`token_path` when the listener requires a bearer token. Read the token from that
+private file; the status output does not print it.
+
+For wildcard binds, the URL uses loopback (`127.0.0.1` for IPv4 or `::1` for
+IPv6) so local clients can connect. Other bound addresses remain unchanged.
+
+The listener publishes its actual bound port after startup, including when
+started with port zero, and removes its record on orderly shutdown. Status omits
+records whose process has exited. Stdio sessions are not listening endpoints and
+do not appear. An empty JSON list means no HTTP listeners were found in this
+application's configured data directory.
 
 ## Quick Start
 
@@ -39,34 +64,276 @@ For local desktop-style MCP clients, use stdio:
 Restart or reload your MCP client after adding the server. Once connected, the
 client will see these tools:
 
-| Tool                   | Purpose                                                            |
-| ---------------------- | ------------------------------------------------------------------ |
-| `search_sessions`      | Full-text search across recorded sessions                          |
-| `list_sessions`        | List recent or filtered sessions                                   |
-| `get_session_overview` | Fetch metadata and a compact message preview                       |
-| `get_messages`         | Read paginated message bodies from one session                     |
-| `search_content`       | Substring, regex, semantic, or hybrid search over raw session text |
-| `get_usage_summary`    | Aggregate token and cost usage                                     |
+| Tool                   | Purpose                                                                  |
+| ---------------------- | ------------------------------------------------------------------------ |
+| `search_sessions`      | Full-text search across recorded sessions                                |
+| `list_sessions`        | List recent or filtered sessions                                         |
+| `get_session_overview` | Fetch metadata and a compact message preview                             |
+| `get_messages`         | Read paginated message bodies from one session                           |
+| `get_memory_status`    | Report archive, lexical, semantic, and source readiness                  |
+| `search_content`       | Substring, regex, terms, semantic, or hybrid search over session text    |
+| `get_usage_summary`    | Aggregate token and cost usage                                           |
+| `query_recall`         | Search extracted Recall entries when the backend supports Recall queries |
+| `get_tool_calls`       | List the tool calls one session made, with inputs and result sizes       |
+| `get_recent_edits`     | Find which sessions edited a file, newest edit first                     |
+| `get_child_sessions`   | List the sub-agent and fork sessions started from one session            |
+| `compare_usage`        | Compare token usage and cost between two models or two projects          |
+| `get_activity_report`  | Report agent time, sessions, and cost for a day, week, month, or range   |
+| `get_tool_usage`       | Count tool calls by category, agent, and tool name                       |
+| `get_quality_signals`  | Show health grades, outcomes, failures, and example sessions             |
+| `search_docs`          | Search the AgentsView guides bundled with this version                   |
 
-`search_content` accepts a `mode` of `substring` (default), `regex`, `semantic`,
-or `hybrid`, plus a `scope` of `top`, `all` (default), or `subordinate` that is
-only valid with the semantic and hybrid modes. The `semantic` and `hybrid` modes
-need the opt-in [semantic search](/semantic-search/) index on the local SQLite
-archive; without it they return a "not available" error. In every mode, each
-match carries a conversation-unit citation: an `ordinal_range` of `[start, end]`
-ordinals around the match, plus `subordinate`, `relationship`,
+`list_sessions` accepts `labels` (every listed label must match) and `pr`
+(`owner/repo`, `owner/repo#123`, or `github.com::owner/repo#123`). Its rows include each
+session's labels, pull request links, and parent session. See
+[labels](/docs/session-api/#agentsview-session-label) and
+[pull request links](/docs/session-api/#pull-request-links).
+
+### Focused memory profile
+
+Clients that use AgentsView only for conversation memory can select the focused
+profile:
+
+```json
+{
+  "mcpServers": {
+    "agentsview": {
+      "command": "agentsview",
+      "args": ["mcp", "--profile", "memory"]
+    }
+  }
+}
+```
+
+This profile advertises only `get_memory_status`, `search_content`, and
+`get_messages`. The status tool reports the authenticated archive backend,
+read-only mode, server version, lexical availability, semantic generation
+coverage, and whether per-source freshness telemetry is available. Its `ready`,
+`partial`, `unavailable`, or `unknown` states come from the same provider as the
+compact `coverage` object on every successful `search_content` response. Older
+remote servers report `unknown` with an `unsupported` reason. The tools use the
+same schemas and backend selection as the full profile, over either stdio or
+StreamableHTTP. Omitting `--profile` or choosing `--profile full` preserves the
+complete tool list above.
+
+The native
+[AgentsView Memory package](https://github.com/kenn-io/agentsview/tree/main/plugins/agentsview-memory)
+registers this profile for Claude Code and Codex and bundles the recall skill,
+Claude's focused search agent, and a session-start hook. Install it through your
+client's native plugin flow and ensure `agentsview` is on the client's `PATH`.
+The package README explains local and hosted setup.
+
+For a standalone skill installation, use `agentsview skills install`; see
+[the CLI reference](/docs/commands/#agentsview-skills) for client and project
+scope. Choose one installation route per client to avoid loading duplicate
+skills. Both routes teach agents to search relevant history, distinguish
+proposals from accepted decisions, and cite transcript evidence.
+
+The native package's MCP process reads `AGENTSVIEW_MEMORY_SERVER`,
+`AGENTSVIEW_MEMORY_SERVER_TOKEN_FILE`, or `AGENTSVIEW_MEMORY_PG`; explicit
+command flags still win. A token-file setting without a server fails instead of
+falling back to the local archive. PostgreSQL reads use the configured
+`default_pg` target.
+
+Run `agentsview doctor memory` to inspect this server status together with the
+local client integration. Pass the native package root with `--plugin-root` to
+check its skill, MCP profile, and SessionStart hook. The diagnostic uses
+read-only metadata and does not start a daemon, sync transcripts, or rebuild
+vectors.
+
+`search_sessions` accepts optional `date_from` and `date_to` bounds in
+`YYYY-MM-DD` format, just like `list_sessions` and `search_content`. Dates
+include sessions whose activity overlaps the requested days in UTC. Either bound
+can be omitted; omitting both preserves unrestricted date matching. Malformed
+dates and ranges where `date_from` is after `date_to` return an error.
+
+HTTP-backed session and search results include `web_url` when a browser address
+is available. Use that link when citing a session; it preserves the server's
+base path. Direct PostgreSQL reads omit it.
+
+Set `session_id` to a raw UUID or full stored session ID when you need one
+session. The lookup returns one metadata row, includes active sessions, ignores
+the other search arguments, and returns an error when the ID is missing or its
+raw suffix matches more than one session. A raw UUID matches an exact stored ID,
+an agent ID ending in `:<uuid>`, or a host ID ending in `~<uuid>`; the delimiter
+is part of the match, so a fork entry separated by `-` is not selected. The row
+has an empty `snippet`, `match_ordinal` set to `0`, and no `next_cursor`. Call
+`get_messages` with that ordinal to read the first message. For a known full ID,
+`get_session_overview` remains the way to get a compact message preview. Remote
+bare UUID lookup requires AgentsView 0.44.0 or later on the server. Use an exact
+full stored ID with an older server.
+
+`search_sessions` and `search_content` exclude sessions active in the last ten
+minutes by default, including the current conversation. `search_content` applies
+this exclusion before the result limit so older matches fill the page. It
+reports the guard in `exclusions.recent_active`. Older servers retain the guard
+after pagination and report dropped matches in `excluded_active`, so their pages
+can still be short or empty with a `next_cursor`. Set `include_active: true`
+when you need that recent work. For recall from a known conversation, pass its
+full ID as `current_session_id`; `search_content` then excludes only that
+session before applying the result limit and does not hide other recent work.
+
+`search_content` also excludes one-shot and automated sessions by default. Set
+`include_one_shot: true` or `include_automated: true` to include those classes.
+An empty result can therefore omit a matching one-shot or automated session.
+
+When a vector search index is configured, prefer `search_content` with
+`mode: "hybrid"` or `mode: "semantic"` for questions about prior work,
+especially when the exact wording is unknown. Hybrid combines semantic
+similarity with keyword matching. Use `context` to include surrounding messages.
+If the index is unavailable, use `search_sessions` for keyword search, or
+`search_content` with substring/regex for exact errors, identifiers, and code
+fragments. The default search mode remains substring.
+
+`search_content` accepts a `mode` of `substring` (default), `regex`, `terms`,
+`semantic`, or `hybrid`. `terms` splits `pattern` on whitespace and requires
+every literal term to occur within one exchange: a user message and its ensuing
+assistant run on the same main or sidechain branch. Terms can appear on opposite
+sides of that exchange. Assistant messages before a session's first user message
+belong to no exchange and never match. `%`, `_`, and backslashes stay literal;
+tool and system content is outside this mode. The `terms` mode currently
+requires a SQLite or PostgreSQL backend.
+
+`scope` can be `top`, `all` (default), or `subordinate` for terms, semantic, and
+hybrid searches. The semantic and hybrid modes need the opt-in
+[semantic search](/docs/semantic-search/) index on the local SQLite archive;
+without it they return a "not available" error. Exact `session_id`,
+`git_branch`, `project`, `agent`, `date_from`, and `date_to` filters apply
+before the final limit. Limits default to 10 and go up to 50; a value outside
+that range falls back to the default.
+
+A `terms` snippet shows about 60 characters of context around the first
+occurrence of each term. Terms that sit far apart in a long exchange produce
+separate windows joined by `...`, so snippet size follows the number of terms,
+not the length of the exchange.
+
+Every match carries a conversation-unit citation: an `ordinal_range` of
+`[start, end]` ordinals around the match, plus `subordinate`, `relationship`,
 `parent_session_id`, and `is_sidechain` fields that flag hits from sidechain
-runs and subagent or fork sessions.
+runs and subagent or fork sessions. The response also reports the
+`effective_mode`, the `effective_scope` for modes that support scope, and the
+`exclusions` that applied by default. `next_cursor` is present when another page
+exists. To continue `search_content`, pass `next_cursor` as the numeric `cursor`
+and echo the returned RFC3339 `activity_cutoff` unchanged. The cutoff keeps the
+recent-activity exclusion fixed across pages of an unchanged archive, including
+on older servers. A positive cursor without the cutoff returns a restart error
+when that exclusion applies. Restart without a cursor to obtain both fields.
+`include_active: true` or an explicit `current_session_id` allows numeric-only
+continuation. Archive edits retain the existing offset-pagination behavior.
+
+SQLite and PostgreSQL search matches also carry `transcript_revision`, captured
+by the same storage query as the evidence. A `revision_bound` response flag says
+whether every returned match has that guarantee. Pass a match's revision as
+`expected_revision` when calling `get_messages`. If the transcript changed in
+between, the read returns `source_changed`; repeat the search and use the new
+citation.
+
+`get_messages` returns the revision observed for its page. A message longer than
+`max_chars_per_message` has a `body_cursor`; keep calling `get_messages` with
+that cursor before following `next_from`. The opaque cursor stays bound to the
+archive instance, session, revision, message ordinal, and next content offset,
+so it cannot silently continue against replaced transcript content. A cursor
+stops working when the archive server restarts. If a continuation fails with
+`source_changed` or `invalid body_cursor`, start a fresh `get_messages` listing.
+Role and system filtering still happens after each scanned page, so an empty or
+short page can have a `next_from` and should be continued.
+
+### Session details, reports, and guides
+
+`get_tool_calls` lists one session's tool calls in order, up to 50 per page
+(maximum 200). Set `category` to `Edit`, `Write`, `Bash`, or another tool
+category to narrow the list. Each input has secret-shaped values masked and is
+cut to `max_input_chars` (default 500, maximum 10000). Pass a call's `ordinal`
+to `get_messages` to read the surrounding conversation.
+
+`get_recent_edits` matches `path` as a case-insensitive substring of edited file
+paths. Files come back newest edit first, 10 per page (maximum 50), each with up
+to 20 of its newest Edit and Write calls and the session that made each one.
+Omit `path` to list every recently edited file.
+
+`get_child_sessions` returns the sub-agent and fork sessions whose parent is
+`session_id`, with each child's `relationship`.
+
+`compare_usage` takes a `dimension` of `model` or `project` and a `left` and
+`right` value, each one name or several separated by commas. Both sides share
+the optional date range, agent, and machine filters. The result has each side's
+cost, tokens, and session count plus the differences. Like `get_usage_summary`,
+it counts one-shot sessions.
+
+`get_activity_report` returns the same totals as `agentsview activity report`:
+agent minutes, sessions, tokens, and cost, the most agents running at once, and
+breakdowns by project, model, and agent. `preset` is `day` (default), `week`,
+`month`, or `custom` with RFC3339 `from` and `to`. `date` picks the day, week,
+or month and defaults to today in `timezone` (default UTC). The session list
+comes 20 rows at a time (maximum 100), longest first or most expensive first
+with `sessions_sort: "cost"`; pass `sessions_next_cursor` back as
+`sessions_cursor` for the next page. The timeline buckets are left out.
+
+`get_tool_usage` and `get_quality_signals` use the analytics filters: `from` and
+`to` dates default to the 30 days ending today in UTC, and one-shot and
+automated sessions are excluded unless `include_one_shot` or
+`include_automated` is set. `get_tool_usage` counts tool calls by category,
+agent, and tool name with a weekly trend. `get_quality_signals` reports health
+grades, outcomes, tool failures and retries, edit churn, context pressure, and
+prompt quality, by agent and project. Set `signal`, such as
+`tool_failure_signals` or `edit_churn`, to also get up to `examples` sessions
+(default 5, maximum 20) that show it.
+
+`search_docs` searches the guides published at
+[agentsview.io/docs](https://agentsview.io/docs/) as shipped with this binary,
+so it works offline and matches the version you run. Every query word must
+appear in a section. Set `topic` to one guide name, such as `mcp` or `recall`,
+to search only that guide.
+
+### Protocol versions
+
+Over stdio, the server speaks MCP 2026-07-28 and still accepts clients that use
+an older protocol version. StreamableHTTP keeps per-client sessions, which MCP
+2026-07-28 does not support, so HTTP clients negotiate 2025-11-25 or older.
+Current clients fall back to it automatically.
 
 ## Daemon-Backed Reads
 
-Local MCP mode talks to the AgentsView daemon. Each tool call resolves the local
-daemon and starts it when needed, so a long-lived MCP server keeps working even
-after the daemon exits due to idleness.
+Local MCP mode talks to the AgentsView daemon. The first tool call finds the
+daemon and starts it when needed. Later calls reuse that connection while the
+daemon's runtime record is unchanged and the same daemon process is still
+running. If the daemon exits or another daemon replaces it, the next call finds
+the daemon again.
+
+A failed tool call returns its error to the client and is not retried. The next
+call finds the daemon again, unless the daemon rejected the failed call with a
+4xx error or the client canceled it. Both cases show that the daemon is still
+serving.
+
+The MCP server finds the daemon again on every call when the daemon is
+read-only, could not write its runtime record, or runs as a process whose
+identity cannot be checked. This lets a writable daemon take over as soon as one
+is available.
 
 The MCP server does not open the local SQLite archive directly. This keeps MCP
 reads on the same daemon policy as the desktop app and avoids a long-running MCP
 process holding its own archive handle.
+
+Native conversation-memory packages can call `agentsview memory session-start`
+on startup, resume, and clear events. The command ensures the writable local
+daemon is available, queues a debounced background reconciliation, and returns
+within two seconds without waiting for the archive pass. Parallel starts
+coalesce in the daemon, while the file watcher continues to ingest changed
+transcripts normally.
+
+Packages configured as hosted contributors call the same command with
+`--mode hosted-contributor` and an optional named PostgreSQL target. This wakes
+the existing push watcher; it does not start another writer or copy that owner's
+credentials. Hosted read-only packages use `--mode hosted-reader` with either
+`--server` or `--pg`. That mode only checks the selected read endpoint and never
+starts a local archive or reports that the remote corpus was refreshed.
+Contributor wake delivery is currently available on macOS and Linux.
+
+Set `AGENTSVIEW_DISABLE_AUTO_SYNC=1` to skip this automatic lifecycle request.
+Explicit `agentsview sync` commands and existing-history searches remain
+available. A disabled or failed lifecycle request does not change archive data;
+the package hook is responsible for reporting the failure without blocking the
+agent session.
 
 If you need to disable daemon auto-start for general CLI work with
 `AGENTSVIEW_NO_DAEMON=1`, do not use local MCP mode for that archive. Start the
@@ -148,7 +415,7 @@ agentsview pg serve --port 8085
 }
 ```
 
-See [PostgreSQL Sync](/pg-sync/) for configuring `pg push` and `pg serve`.
+See [PostgreSQL Sync](/docs/pg-sync/) for configuring `pg push` and `pg serve`.
 
 ## StreamableHTTP Mode
 
@@ -189,5 +456,5 @@ project names, and usage totals. Treat it like access to your session archive.
 - Remember that MCP tools are read-only, but the data they expose may still be
   sensitive.
 
-For every flag, see [`agentsview mcp`](/commands/#agentsview-mcp) in the CLI
-reference.
+For every flag, see [`agentsview mcp`](/docs/commands/#agentsview-mcp) in the
+CLI reference.

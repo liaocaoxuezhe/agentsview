@@ -8,19 +8,23 @@ import (
 	"go.kenn.io/agentsview/internal/db"
 	"go.kenn.io/agentsview/internal/service"
 	"go.kenn.io/agentsview/internal/update"
+
+	"github.com/danielgtaylor/huma/v2"
 )
 
 func (s *Server) registerMetadataRoutes() {
-	group := newRouteGroup(s.api, "/api/v1", "Metadata")
+	group := huma.NewGroup(s.api, "/api/v1")
+	configureRouteGroup(group, "Metadata")
 
-	get(s, group, "/projects", "List projects", s.humaListProjects)
-	get(s, group, "/machines", "List machines", s.humaListMachines)
-	get(s, group, "/branches", "List branches", s.humaListBranches)
-	get(s, group, "/agents", "List agents", s.humaListAgents)
-	get(s, group, "/stats", "Get stats", s.humaGetStats)
-	get(s, group, "/session-stats", "Get session stats", s.humaGetSessionStats)
-	get(s, group, "/version", "Get server version", s.humaGetVersion)
-	get(s, group, "/update/check", "Check for updates", s.humaCheckUpdate)
+	s.get(group, "/projects", "List projects", s.humaListProjects)
+	s.get(group, "/machines", "List machines", s.humaListMachines)
+	s.get(group, "/branches", "List branches", s.humaListBranches)
+	s.get(group, "/agents", "List agents", s.humaListAgents)
+	s.get(group, "/stats", "Get stats", s.humaGetStats)
+	s.getLong(group, "/session-stats", "Get session stats", s.humaGetSessionStats)
+	s.get(group, "/version", "Get server version", s.humaGetVersion)
+	s.get(group, "/memory/status", "Get memory readiness", s.humaGetMemoryStatus)
+	s.get(group, "/update/check", "Check for updates", s.humaCheckUpdate)
 }
 
 type statsInput struct {
@@ -44,7 +48,21 @@ type projectsResponse struct {
 }
 
 type machinesResponse struct {
-	Machines []string `json:"machines"`
+	Machines       []string          `json:"machines"`
+	MachineLabels  map[string]string `json:"machine_labels"`
+	MachineAliases map[string]string `json:"machine_aliases"`
+}
+
+func (s *Server) machineAliases(ctx context.Context) (map[string]string, error) {
+	aliases, err := s.db.GetMachineAliases(ctx)
+	if err != nil {
+		return nil, err
+	}
+	// The old local sentinel belongs only to this archive, never a shared mirror.
+	if _, local := s.db.(*db.DB); local && s.cfg.InstallationID != "" {
+		aliases["local"] = s.cfg.InstallationID
+	}
+	return aliases, nil
 }
 
 type branchesResponse struct {
@@ -95,8 +113,7 @@ func (s *Server) humaGetSessionStats(
 		if handled := handleHumaReadOnly(err); handled != nil {
 			return nil, handled
 		}
-		var inputErr *db.StatsInputError
-		if errors.As(err, &inputErr) {
+		if inputErr, ok := errors.AsType[*db.StatsInputError](err); ok {
 			return nil, apiError(http.StatusBadRequest, inputErr.Msg)
 		}
 		return nil, internalError("session stats error", err)
@@ -123,7 +140,15 @@ func (s *Server) humaListMachines(
 	if err != nil {
 		return nil, serverError(err)
 	}
-	return &jsonOutput[machinesResponse]{Body: machinesResponse{Machines: machines}}, nil
+	labels, err := s.db.GetMachineLabels(ctx)
+	if err != nil {
+		return nil, serverError(err)
+	}
+	aliases, err := s.machineAliases(ctx)
+	if err != nil {
+		return nil, serverError(err)
+	}
+	return &jsonOutput[machinesResponse]{Body: machinesResponse{Machines: machines, MachineLabels: labels, MachineAliases: aliases}}, nil
 }
 
 func (s *Server) humaListBranches(
@@ -149,14 +174,39 @@ func (s *Server) humaListAgents(
 }
 
 func (s *Server) humaGetVersion(
-	_ context.Context,
+	ctx context.Context,
 	_ *emptyInput,
 ) (*jsonOutput[VersionInfo], error) {
-	return &jsonOutput[VersionInfo]{Body: s.version}, nil
+	version := s.version
+	if database, ok := s.db.(*db.DB); ok {
+		var err error
+		version.ArchiveOnly, err = database.IsArchiveOnly(ctx)
+		if err != nil {
+			return nil, serverError(err)
+		}
+	}
+	version.InsightGenerationAvailable = supportsInsightGeneration(s.db)
+	_, version.SessionStatsAvailable = s.db.(*db.DB)
+	return &jsonOutput[VersionInfo]{Body: version}, nil
+}
+
+func (s *Server) humaGetMemoryStatus(
+	ctx context.Context,
+	_ *emptyInput,
+) (*jsonOutput[service.MemoryStatus], error) {
+	status, err := service.GetMemoryStatus(ctx, s.sessions)
+	if err != nil {
+		return nil, internalError("memory status error", err)
+	}
+	status.ServerVersion = s.version.Version
+	if _, local := s.db.(*db.DB); local && status.Archive.Identity == "" {
+		status.Archive.Identity = s.cfg.InstallationID
+	}
+	return &jsonOutput[service.MemoryStatus]{Body: status}, nil
 }
 
 func (s *Server) humaCheckUpdate(
-	_ context.Context,
+	ctx context.Context,
 	_ *emptyInput,
 ) (*jsonOutput[updateCheckResponse], error) {
 	if s.cfg.DisableUpdateCheck {
@@ -168,9 +218,9 @@ func (s *Server) humaCheckUpdate(
 	if checkFn == nil {
 		checkFn = update.CheckForUpdate
 	}
-	info, err := checkFn(s.version.Version, false, s.dataDir)
+	info, err := checkFn(ctx, s.version.Version, false, s.dataDir)
 	if err != nil || info == nil {
-		return &jsonOutput[updateCheckResponse]{
+		return &jsonOutput[updateCheckResponse]{ //nolint:nilerr // Optional update metadata falls back to the installed version.
 			Body: updateCheckResponse{CurrentVersion: s.version.Version},
 		}, nil
 	}

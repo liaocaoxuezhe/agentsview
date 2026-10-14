@@ -2,7 +2,7 @@ package parser
 
 import (
 	"crypto/sha256"
-	"encoding/json"
+	"encoding/json/v2"
 	"fmt"
 	"os"
 	"path/filepath"
@@ -140,7 +140,7 @@ func parseKiroIDENewFormat(
 
 	var sess kiroIDENewSession
 	if err := json.Unmarshal(data, &sess); err != nil {
-		return nil, nil, nil
+		return nil, nil, nil //nolint:nilerr // Malformed provider records are skipped without discarding other sessions.
 	}
 
 	if len(sess.History) == 0 {
@@ -324,7 +324,7 @@ func parseKiroIDEChatFormat(
 
 	var chat kiroIDEChat
 	if err := json.Unmarshal(data, &chat); err != nil {
-		return nil, nil, nil // malformed, skip
+		return nil, nil, nil //nolint:nilerr // Malformed provider records are skipped without discarding other sessions.
 	}
 
 	if len(chat.Chat) == 0 {
@@ -575,7 +575,7 @@ func kiroIDEResolveAssistant(
 				if a.Input.ModifiedContent != "" {
 					m["content"] = a.Input.ModifiedContent
 				}
-				inputJSON, _ := json.Marshal(m)
+				inputJSON, _ := json.Marshal(m, json.Deterministic(true))
 				toolCalls = append(toolCalls, ParsedToolCall{
 					ToolUseID: a.ActionID,
 					ToolName:  "Write",
@@ -605,7 +605,7 @@ func kiroIDEComputeDiff(input kiroIDEActionInput) string {
 	if input.OriginalContent == "" && input.ModifiedContent == "" {
 		j, _ := json.Marshal(map[string]string{
 			"file": input.File,
-		})
+		}, json.Deterministic(true))
 		return string(j)
 	}
 
@@ -620,14 +620,14 @@ func kiroIDEComputeDiff(input kiroIDEActionInput) string {
 	if err != nil || text == "" {
 		j, _ := json.Marshal(map[string]string{
 			"file": input.File,
-		})
+		}, json.Deterministic(true))
 		return string(j)
 	}
 
 	j, _ := json.Marshal(map[string]string{
 		"file": input.File,
 		"diff": text,
-	})
+	}, json.Deterministic(true))
 	return string(j)
 }
 

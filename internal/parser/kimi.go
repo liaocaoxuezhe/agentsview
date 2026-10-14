@@ -1,7 +1,9 @@
 package parser
 
 import (
-	"encoding/json"
+	"context"
+	"encoding/json/jsontext"
+	"encoding/json/v2"
 	"fmt"
 	"os"
 	"path/filepath"
@@ -97,7 +99,7 @@ func isKimiHash(s string) bool {
 	if len(s) != 12 {
 		return false
 	}
-	for i := 0; i < len(s); i++ {
+	for i := range len(s) {
 		c := s[i]
 		isHex := (c >= '0' && c <= '9') ||
 			(c >= 'a' && c <= 'f') ||
@@ -172,7 +174,7 @@ func parseKimiSessionWithFallbackModel(
 		pendingThinkingText     []string
 		pendingToolCall         []ParsedToolCall
 		pendingModel            string
-		pendingTokenUsage       json.RawMessage
+		pendingTokenUsage       jsontext.Value
 		pendingContextTokens    int
 		pendingOutputTokens     int
 		pendingHasContextTokens bool
@@ -388,15 +390,14 @@ func parseKimiSessionWithFallbackModel(
 						ToolName:  fnName,
 						Category:  NormalizeToolCategory(fnName),
 						InputJSON: fnArgs,
-						SkillName: inferToolSkillName(
+						SkillName: inferToolSkillName(context.Background(),
 							fnName, fnArgs,
 						),
 					}
-					pendingToolCall = append(pendingToolCall, tc)
-
 					argsResult := kimiJSONResult(event.Get("args"))
-					pendingText = append(pendingText,
-						formatKimiToolUse(fnName, argsResult))
+					tc.Rendering = formatKimiToolUse(fnName, argsResult)
+					pendingToolCall = append(pendingToolCall, tc)
+					pendingText = append(pendingText, tc.Rendering)
 
 				case "tool.result":
 					if index := flushAssistantTurn(); index >= 0 {
@@ -440,8 +441,7 @@ func parseKimiSessionWithFallbackModel(
 					pendingStopReason = event.Get("finishReason").Str
 					if usage := event.Get("usage"); usage.Exists() {
 						tokenUsage, outputTokens, contextTokens,
-							hasOutput, hasContext :=
-							kimiNativeTokenUsage(usage)
+							hasOutput, hasContext := kimiNativeTokenUsage(usage)
 						pendingTokenUsage = tokenUsage
 						pendingOutputTokens = outputTokens
 						pendingContextTokens = contextTokens
@@ -497,8 +497,7 @@ func parseKimiSessionWithFallbackModel(
 					}
 					if target != nil {
 						tokenUsage, outputTokens, contextTokens,
-							hasOutput, hasContext :=
-							kimiNativeTokenUsage(usage)
+							hasOutput, hasContext := kimiNativeTokenUsage(usage)
 						target.Model = currentModel
 						target.TokenUsage = tokenUsage
 						target.OutputTokens = outputTokens
@@ -607,16 +606,15 @@ func parseKimiSessionWithFallbackModel(
 				ToolName:  fnName,
 				Category:  NormalizeToolCategory(fnName),
 				InputJSON: fnArgs,
-				SkillName: inferToolSkillName(
+				SkillName: inferToolSkillName(context.Background(),
 					fnName, fnArgs,
 				),
 			}
+			// Format tool use display text and keep it on the call so
+			// storage policies that drop tool inputs can replace it.
+			tc.Rendering = formatKimiToolUse(fnName, gjson.Parse(fnArgs))
 			pendingToolCall = append(pendingToolCall, tc)
-
-			// Format tool use display text.
-			argsResult := gjson.Parse(fnArgs)
-			pendingText = append(pendingText,
-				formatKimiToolUse(fnName, argsResult))
+			pendingText = append(pendingText, tc.Rendering)
 
 		case "ToolResult":
 			flushAssistantTurn()
@@ -804,7 +802,7 @@ func kimiJSONResult(value gjson.Result) gjson.Result {
 
 func kimiNativeTokenUsage(
 	usage gjson.Result,
-) (json.RawMessage, int, int, bool, bool) {
+) (jsontext.Value, int, int, bool, bool) {
 	var (
 		inputOther          int
 		output              int
@@ -844,7 +842,7 @@ func kimiNativeTokenUsage(
 		"cache_read_input_tokens":     inputCacheRead,
 		"cache_creation_input_tokens": inputCacheCreate,
 	}
-	raw, err := json.Marshal(normalized)
+	raw, err := json.Marshal(normalized, json.Deterministic(true))
 	if err != nil {
 		return nil, 0, 0, false, false
 	}
@@ -896,7 +894,7 @@ func formatKimiToolUse(name string, input gjson.Result) string {
 		if desc != "" {
 			return fmt.Sprintf("[Bash: %s]\n$ %s", desc, cmd)
 		}
-		return fmt.Sprintf("[Bash]\n$ %s", cmd)
+		return "[Bash]\n$ " + cmd
 	case "Grep":
 		return fmt.Sprintf("[Grep: %s]", input.Get("pattern").Str)
 	case "Glob":

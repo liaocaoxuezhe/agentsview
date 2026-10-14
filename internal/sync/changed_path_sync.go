@@ -5,7 +5,6 @@ import (
 	"errors"
 	"fmt"
 	"log"
-	"slices"
 	"time"
 
 	"go.kenn.io/agentsview/internal/parser"
@@ -52,6 +51,10 @@ func (e *Engine) SyncChangedPathPlanWithOptionsContext(
 	options ChangedPathSyncOptions,
 	onProgress ProgressFunc,
 ) (ChangedPathSyncResult, error) {
+	if e.sourceSyncErr != nil {
+		return ChangedPathSyncResult{}, e.sourceSyncErr
+	}
+	ctx = e.parsePolicyContext(ctx)
 	result := ChangedPathSyncResult{
 		CachedSourceKeys:        make(map[string]struct{}),
 		CachedFallbackProviders: make(map[parser.AgentType]int),
@@ -115,7 +118,7 @@ func (e *Engine) SyncChangedPathPlanWithOptionsContext(
 	e.syncMu.Lock()
 	var stats SyncStats
 	defer func() {
-		if stats.Synced > 0 {
+		if stats.hasSessionChanges() {
 			e.emit("sessions")
 		}
 	}()
@@ -130,10 +133,16 @@ func (e *Engine) SyncChangedPathPlanWithOptionsContext(
 		physicalPaths = append(physicalPaths, file.Path)
 	}
 	preContainerStates := e.captureSQLiteContainerStates(physicalPaths)
+	if err := e.prepareSQLiteContainerVerification(ctx, preContainerStates); err != nil {
+		result.Stats = SyncStats{Aborted: true}
+		return result, err
+	}
 	e.beginSQLiteContainerPass(files, preContainerStates)
 	processingCtx := context.WithValue(ctx, deferGlobalLinkContextKey{}, true)
+	processingCtx = parser.WithProjectRootMemo(processingCtx)
+	processingCtx = parser.WithCodexParentInventoryBatch(processingCtx)
 	results := e.startWorkers(processingCtx, files)
-	affectedSessionIDs := make(map[string]struct{})
+	affectedSessionIDs := make(changedSessionLinks)
 	stats = e.collectAndBatchWithOptions(
 		processingCtx, results, len(files), len(files), func(progress Progress) {
 			progress.FallbackProviders = len(plan.FallbackProviders)
@@ -142,18 +151,9 @@ func (e *Engine) SyncChangedPathPlanWithOptionsContext(
 				onProgress(progress)
 			}
 		}, syncWriteDefault, collectAndBatchOptions{
-			preserveMissingSources: true,
 			observeResult: func(job syncJob) {
 				result.FilesProcessed++
-				if job.incremental != nil {
-					affectedSessionIDs[job.incremental.sessionID] = struct{}{}
-				}
-				for _, parsed := range job.results {
-					affectedSessionIDs[applyIDPrefixToID(e.idPrefix, parsed.Session.ID)] = struct{}{}
-				}
-				for _, id := range job.excludedSessionIDs {
-					affectedSessionIDs[applyIDPrefixToID(e.idPrefix, id)] = struct{}{}
-				}
+				affectedSessionIDs.observe(job, e.idPrefix)
 				if !job.cachedSkip {
 					return
 				}
@@ -170,26 +170,21 @@ func (e *Engine) SyncChangedPathPlanWithOptionsContext(
 			},
 		},
 	)
-	if len(affectedSessionIDs) > 0 && !stats.Aborted {
-		ids := make([]string, 0, len(affectedSessionIDs))
-		for id := range affectedSessionIDs {
-			ids = append(ids, id)
-		}
-		slices.Sort(ids)
-		if err := e.db.LinkSubagentSessionsForSessions(ids); err != nil {
-			stats.RecordFailed()
-			processErr = errors.Join(processErr,
-				fmt.Errorf("link affected subagent sessions: %w", err))
-			if queueErr := e.db.QueueSubagentParentRepairs(ids); queueErr != nil {
-				processErr = errors.Join(processErr,
-					fmt.Errorf("queue affected subagent parent repairs: %w", queueErr))
-			}
-		}
+	processErr = errors.Join(processErr, e.finishCodexParentInventoryBatch(processingCtx, &stats))
+	if err := affectedSessionIDs.link(ctx, e, &stats); err != nil {
+		stats.RecordFailed()
+		processErr = errors.Join(processErr, err)
 	}
-	e.finishSQLiteContainerPass(true, false)
 	e.anomalies.applyTo(&stats)
+	// Pass-level failures cannot be attributed to one container, so they
+	// poison the whole capture; a clean plan subset keeps its verification
+	// age and, being partial, never promotes.
+	if ctx.Err() != nil || processErr != nil || !stats.ProcessingComplete() {
+		e.poisonSQLiteContainerPass()
+	}
+	e.finishSQLiteContainerPass(ctx, true, false)
 	if !e.ephemeral {
-		e.persistSkipCache()
+		e.persistSkipCache(ctx)
 	}
 	e.mu.Lock()
 	e.lastSync = time.Now()
@@ -197,13 +192,13 @@ func (e *Engine) SyncChangedPathPlanWithOptionsContext(
 	e.mu.Unlock()
 	result.Stats = stats
 
-	if stats.Synced > 0 {
+	if stats.Synced > 0 || stats.CwdUpdated > 0 {
 		log.Printf("sync: %d file(s) updated", stats.Synced)
 	}
 	if err := ctx.Err(); err != nil {
 		return result, err
 	}
-	if stats.Aborted || stats.Failed > 0 || stats.providerFailures > 0 {
+	if !stats.ProcessingComplete() {
 		return result, errors.Join(processErr, fmt.Errorf(
 			"changed-path plan sync incomplete: %d source or archive failures",
 			stats.Failed,

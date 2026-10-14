@@ -13,10 +13,17 @@ import (
 // SchemaVersion is the version of the DuckDB mirror schema created by
 // createSchema. The mirror schema is create-only: there are no in-place
 // migrations between versions. A version mismatch means the mirror file
-// must be rebuilt with 'agentsview duckdb push --full'. v10 adds the usage
-// accounting rebuild boundary on top of schema v9's session launch and prompt
-// provenance columns.
-const SchemaVersion = 10
+// must be rebuilt with 'agentsview duckdb push --full'. v12 adds the 1h
+// cache-write rate columns on top of v11's raw GenAI pricing document. v13
+// adds row-level provider identity to messages and usage events. v14 adds
+// reasoning effort to messages. v15 adds explicit session-project
+// assignment state. v16 rebuilds after SQLite data version 111 rewrote
+// stored Devin source identities; pre-111 mirrors would otherwise keep
+// serving bare ids that deduplicate across sessions.
+// v17 adds session groups to the rebuilt mirror. v18 adds per-call tool
+// observations for effectiveness rates. v19 adds session pull request links
+// and labels.
+const SchemaVersion = 19
 
 const schemaVersionMetadataKey = "agentsview_schema_version"
 
@@ -109,6 +116,7 @@ var mirrorTables = []tableSpec{
 		create: `CREATE TABLE IF NOT EXISTS sessions (
 			id TEXT PRIMARY KEY,
 			project TEXT NOT NULL,
+			project_assigned BOOLEAN NOT NULL DEFAULT FALSE,
 			machine TEXT NOT NULL DEFAULT 'local',
 			agent TEXT NOT NULL DEFAULT 'claude',
 			agent_label TEXT NOT NULL DEFAULT '',
@@ -165,6 +173,7 @@ var mirrorTables = []tableSpec{
 			git_branch TEXT NOT NULL DEFAULT '',
 			source_session_id TEXT NOT NULL DEFAULT '',
 			source_version TEXT NOT NULL DEFAULT '',
+			group_key TEXT NOT NULL DEFAULT '',
 			transcript_fidelity TEXT NOT NULL DEFAULT '',
 			parser_malformed_lines INTEGER NOT NULL DEFAULT 0,
 			is_truncated BOOLEAN NOT NULL DEFAULT FALSE,
@@ -174,12 +183,15 @@ var mirrorTables = []tableSpec{
 			termination_status TEXT,
 			secret_leak_count INTEGER NOT NULL DEFAULT 0,
 			secrets_rules_version TEXT NOT NULL DEFAULT '',
+			pr_links VARCHAR NOT NULL DEFAULT '',
+			labels VARCHAR[],
 			agentsview_push_fingerprint TEXT,
 			source_archive_id TEXT NOT NULL DEFAULT ''
 		)`,
 		columns: []columnSpec{
 			{"id", "id TEXT"},
 			{"project", "project TEXT NOT NULL DEFAULT ''"},
+			{"project_assigned", "project_assigned BOOLEAN NOT NULL DEFAULT FALSE"},
 			{"machine", "machine TEXT NOT NULL DEFAULT 'local'"},
 			{"agent", "agent TEXT NOT NULL DEFAULT 'claude'"},
 			{"agent_label", "agent_label TEXT NOT NULL DEFAULT ''"},
@@ -236,6 +248,7 @@ var mirrorTables = []tableSpec{
 			{"git_branch", "git_branch TEXT NOT NULL DEFAULT ''"},
 			{"source_session_id", "source_session_id TEXT NOT NULL DEFAULT ''"},
 			{"source_version", "source_version TEXT NOT NULL DEFAULT ''"},
+			{"group_key", "group_key TEXT NOT NULL DEFAULT ''"},
 			{"transcript_fidelity", "transcript_fidelity TEXT NOT NULL DEFAULT ''"},
 			{"parser_malformed_lines", "parser_malformed_lines INTEGER NOT NULL DEFAULT 0"},
 			{"is_truncated", "is_truncated BOOLEAN NOT NULL DEFAULT FALSE"},
@@ -245,6 +258,8 @@ var mirrorTables = []tableSpec{
 			{"termination_status", "termination_status TEXT"},
 			{"secret_leak_count", "secret_leak_count INTEGER NOT NULL DEFAULT 0"},
 			{"secrets_rules_version", "secrets_rules_version TEXT NOT NULL DEFAULT ''"},
+			{"pr_links", "pr_links VARCHAR NOT NULL DEFAULT ''"},
+			{"labels", "labels VARCHAR[]"},
 			{"agentsview_push_fingerprint", "agentsview_push_fingerprint TEXT"},
 			{"source_archive_id", "source_archive_id TEXT NOT NULL DEFAULT ''"},
 		},
@@ -273,9 +288,11 @@ var mirrorTables = []tableSpec{
 			content_length INTEGER NOT NULL DEFAULT 0,
 			is_system BOOLEAN NOT NULL DEFAULT FALSE,
 			model TEXT NOT NULL DEFAULT '',
+			reasoning_effort TEXT NOT NULL DEFAULT '',
 			token_usage TEXT NOT NULL DEFAULT '',
 			context_tokens INTEGER NOT NULL DEFAULT 0,
 			output_tokens INTEGER NOT NULL DEFAULT 0,
+			provider_id TEXT NOT NULL DEFAULT '',
 			has_context_tokens BOOLEAN NOT NULL DEFAULT FALSE,
 			has_output_tokens BOOLEAN NOT NULL DEFAULT FALSE,
 			claude_message_id TEXT NOT NULL DEFAULT '',
@@ -302,9 +319,11 @@ var mirrorTables = []tableSpec{
 			{"content_length", "content_length INTEGER NOT NULL DEFAULT 0"},
 			{"is_system", "is_system BOOLEAN NOT NULL DEFAULT FALSE"},
 			{"model", "model TEXT NOT NULL DEFAULT ''"},
+			{"reasoning_effort", "reasoning_effort TEXT NOT NULL DEFAULT ''"},
 			{"token_usage", "token_usage TEXT NOT NULL DEFAULT ''"},
 			{"context_tokens", "context_tokens INTEGER NOT NULL DEFAULT 0"},
 			{"output_tokens", "output_tokens INTEGER NOT NULL DEFAULT 0"},
+			{"provider_id", "provider_id TEXT NOT NULL DEFAULT ''"},
 			{"has_context_tokens", "has_context_tokens BOOLEAN NOT NULL DEFAULT FALSE"},
 			{"has_output_tokens", "has_output_tokens BOOLEAN NOT NULL DEFAULT FALSE"},
 			{"claude_message_id", "claude_message_id TEXT NOT NULL DEFAULT ''"},
@@ -331,6 +350,7 @@ var mirrorTables = []tableSpec{
 			message_ordinal INTEGER,
 			source TEXT NOT NULL,
 			model TEXT NOT NULL,
+			provider_id TEXT NOT NULL DEFAULT '',
 			input_tokens INTEGER NOT NULL DEFAULT 0,
 			output_tokens INTEGER NOT NULL DEFAULT 0,
 			cache_creation_input_tokens INTEGER NOT NULL DEFAULT 0,
@@ -348,6 +368,7 @@ var mirrorTables = []tableSpec{
 			{"message_ordinal", "message_ordinal INTEGER"},
 			{"source", "source TEXT NOT NULL DEFAULT ''"},
 			{"model", "model TEXT NOT NULL DEFAULT ''"},
+			{"provider_id", "provider_id TEXT NOT NULL DEFAULT ''"},
 			{"input_tokens", "input_tokens INTEGER NOT NULL DEFAULT 0"},
 			{"output_tokens", "output_tokens INTEGER NOT NULL DEFAULT 0"},
 			{"cache_creation_input_tokens", "cache_creation_input_tokens INTEGER NOT NULL DEFAULT 0"},
@@ -412,6 +433,7 @@ var mirrorTables = []tableSpec{
 			input_microdollars_per_mtok BIGINT NOT NULL DEFAULT 0,
 			output_microdollars_per_mtok BIGINT NOT NULL DEFAULT 0,
 			cache_creation_microdollars_per_mtok BIGINT NOT NULL DEFAULT 0,
+			cache_creation_1h_microdollars_per_mtok BIGINT NOT NULL DEFAULT 0,
 			cache_read_microdollars_per_mtok BIGINT NOT NULL DEFAULT 0,
 			updated_at TEXT NOT NULL DEFAULT ''
 		)`,
@@ -420,6 +442,7 @@ var mirrorTables = []tableSpec{
 			{"input_microdollars_per_mtok", "input_microdollars_per_mtok BIGINT NOT NULL DEFAULT 0"},
 			{"output_microdollars_per_mtok", "output_microdollars_per_mtok BIGINT NOT NULL DEFAULT 0"},
 			{"cache_creation_microdollars_per_mtok", "cache_creation_microdollars_per_mtok BIGINT NOT NULL DEFAULT 0"},
+			{"cache_creation_1h_microdollars_per_mtok", "cache_creation_1h_microdollars_per_mtok BIGINT NOT NULL DEFAULT 0"},
 			{"cache_read_microdollars_per_mtok", "cache_read_microdollars_per_mtok BIGINT NOT NULL DEFAULT 0"},
 			{"updated_at", "updated_at TEXT NOT NULL DEFAULT ''"},
 		},
@@ -432,6 +455,7 @@ var mirrorTables = []tableSpec{
 			input_microdollars_per_mtok BIGINT NOT NULL DEFAULT 0,
 			output_microdollars_per_mtok BIGINT NOT NULL DEFAULT 0,
 			cache_creation_microdollars_per_mtok BIGINT NOT NULL DEFAULT 0,
+			cache_creation_1h_microdollars_per_mtok BIGINT NOT NULL DEFAULT 0,
 			cache_read_microdollars_per_mtok BIGINT NOT NULL DEFAULT 0,
 			updated_at TEXT NOT NULL DEFAULT '',
 			PRIMARY KEY (model_pattern, above_input_tokens),
@@ -443,7 +467,27 @@ var mirrorTables = []tableSpec{
 			{"input_microdollars_per_mtok", "input_microdollars_per_mtok BIGINT NOT NULL DEFAULT 0"},
 			{"output_microdollars_per_mtok", "output_microdollars_per_mtok BIGINT NOT NULL DEFAULT 0"},
 			{"cache_creation_microdollars_per_mtok", "cache_creation_microdollars_per_mtok BIGINT NOT NULL DEFAULT 0"},
+			{"cache_creation_1h_microdollars_per_mtok", "cache_creation_1h_microdollars_per_mtok BIGINT NOT NULL DEFAULT 0"},
 			{"cache_read_microdollars_per_mtok", "cache_read_microdollars_per_mtok BIGINT NOT NULL DEFAULT 0"},
+			{"updated_at", "updated_at TEXT NOT NULL DEFAULT ''"},
+		},
+	},
+	{
+		name: "genai_pricing",
+		create: `CREATE TABLE IF NOT EXISTS genai_pricing (
+			singleton SMALLINT PRIMARY KEY,
+			version TEXT NOT NULL,
+			source_ref TEXT NOT NULL DEFAULT '',
+			source TEXT NOT NULL,
+			data_json BLOB NOT NULL,
+			updated_at TEXT NOT NULL DEFAULT ''
+		)`,
+		columns: []columnSpec{
+			{"singleton", "singleton SMALLINT"},
+			{"version", "version TEXT NOT NULL"},
+			{"source_ref", "source_ref TEXT NOT NULL DEFAULT ''"},
+			{"source", "source TEXT NOT NULL"},
+			{"data_json", "data_json BLOB NOT NULL"},
 			{"updated_at", "updated_at TEXT NOT NULL DEFAULT ''"},
 		},
 	},
@@ -576,6 +620,9 @@ var mirrorTables = []tableSpec{
 	{
 		name: "tool_calls",
 		create: `CREATE TABLE IF NOT EXISTS tool_calls (
+			observed_outcome TEXT,
+			observed_repeat TEXT,
+			sequence_ending TEXT,
 			id BIGINT,
 			message_id BIGINT,
 			session_id TEXT NOT NULL,
@@ -591,6 +638,10 @@ var mirrorTables = []tableSpec{
 			file_path TEXT
 		)`,
 		columns: []columnSpec{
+			{"observed_outcome", "observed_outcome TEXT"},
+			{"observed_repeat", "observed_repeat TEXT"},
+			{"sequence_ending", "sequence_ending TEXT"},
+
 			{"id", "id BIGINT"},
 			{"message_id", "message_id BIGINT"},
 			{"session_id", "session_id TEXT NOT NULL DEFAULT ''"},

@@ -4,23 +4,31 @@
 package parser
 
 import (
+	"context"
 	"database/sql"
-	"encoding/json"
+	"encoding/json/jsontext"
+	"encoding/json/v2"
 	"fmt"
 	"io"
 	"log"
 	"math"
 	"os"
 	"path/filepath"
+	"regexp"
 	"sort"
 	"strings"
 	"time"
 
 	_ "github.com/mattn/go-sqlite3"
 	"github.com/tidwall/gjson"
-
 	"go.kenn.io/agentsview/internal/money"
 )
+
+const hermesIDPrefix = string(AgentHermes) + ":"
+
+var hermesCronSessionID = regexp.MustCompile(`^cron_([A-Za-z0-9][A-Za-z0-9._-]*)_\d{8}_\d{6}$`)
+
+const hermesCronParentQuery = `SELECT COALESCE(parent_session_id, '') FROM sessions WHERE id = ?`
 
 type hermesStateSession struct {
 	id               string
@@ -40,6 +48,7 @@ type hermesStateSession struct {
 	costStatus       string
 	costSource       string
 	title            string
+	cronJob          string
 	apiCallCount     int
 }
 
@@ -104,13 +113,13 @@ func parseHermesToolCall(tc gjson.Result) (ParsedToolCall, bool) {
 // transcript-file parser. It owns the archive on-disk shape (state.db plus the
 // sessions transcript directory) for the Hermes provider; the package-level
 // entrypoint was folded onto the provider.
-func (p *hermesProvider) parseArchive(root, project, machine string) ([]ParseResult, error) {
+func (p *hermesProvider) parseArchive(ctx context.Context, root, project, machine string) ([]ParseResult, error) {
 	stateDB, sessionsDir, ok := hermesStatePaths(root)
 	if !ok {
 		return p.parseTranscriptArchive(root, project, machine)
 	}
 
-	results, err := p.parseStateDB(
+	results, err := p.parseStateDB(ctx,
 		stateDB, sessionsDir, project, machine,
 	)
 	if err == nil {
@@ -345,24 +354,27 @@ func parseHermesJSONLSession(path, project, machine string) (*ParsedSession, []P
 	fullID := "hermes:" + sessionID
 
 	// Derive project from the session platform or default.
+	projectSynthesized := false
 	if project == "" {
 		if sessionPlatform != "" {
 			project = "hermes-" + sessionPlatform
 		} else {
 			project = "hermes"
 		}
+		projectSynthesized = true
 	}
 
 	sess := &ParsedSession{
-		ID:               fullID,
-		Project:          project,
-		Machine:          machine,
-		Agent:            AgentHermes,
-		FirstMessage:     firstMsg,
-		StartedAt:        startedAt,
-		EndedAt:          endedAt,
-		MessageCount:     len(messages),
-		UserMessageCount: realUserCount,
+		ID:                         fullID,
+		Project:                    project,
+		projectSynthesizedByHermes: projectSynthesized,
+		Machine:                    machine,
+		Agent:                      AgentHermes,
+		FirstMessage:               firstMsg,
+		StartedAt:                  startedAt,
+		EndedAt:                    endedAt,
+		MessageCount:               len(messages),
+		UserMessageCount:           realUserCount,
 		File: FileInfo{
 			Path:  path,
 			Size:  info.Size(),
@@ -370,6 +382,7 @@ func parseHermesJSONLSession(path, project, machine string) (*ParsedSession, []P
 		},
 	}
 
+	setHermesCronGroup(sess, sessionPlatform, hermesCronRunJob(sessionID))
 	return sess, messages, nil
 }
 
@@ -532,24 +545,27 @@ func parseHermesJSONSession(path, project, machine string) (*ParsedSession, []Pa
 
 	fullID := "hermes:" + sessionID
 
+	projectSynthesized := false
 	if project == "" {
 		if sessionPlatform != "" {
 			project = "hermes-" + sessionPlatform
 		} else {
 			project = "hermes"
 		}
+		projectSynthesized = true
 	}
 
 	sess := &ParsedSession{
-		ID:               fullID,
-		Project:          project,
-		Machine:          machine,
-		Agent:            AgentHermes,
-		FirstMessage:     firstMsg,
-		StartedAt:        startedAt,
-		EndedAt:          endedAt,
-		MessageCount:     len(messages),
-		UserMessageCount: realUserCount,
+		ID:                         fullID,
+		Project:                    project,
+		projectSynthesizedByHermes: projectSynthesized,
+		Machine:                    machine,
+		Agent:                      AgentHermes,
+		FirstMessage:               firstMsg,
+		StartedAt:                  startedAt,
+		EndedAt:                    endedAt,
+		MessageCount:               len(messages),
+		UserMessageCount:           realUserCount,
 		File: FileInfo{
 			Path:  path,
 			Size:  info.Size(),
@@ -557,6 +573,7 @@ func parseHermesJSONSession(path, project, machine string) (*ParsedSession, []Pa
 		},
 	}
 
+	setHermesCronGroup(sess, sessionPlatform, hermesCronRunJob(sessionID))
 	return sess, messages, nil
 }
 
@@ -583,20 +600,29 @@ func hermesStatePaths(root string) (stateDB, sessionsDir string, ok bool) {
 	return "", "", false
 }
 
-func (p *hermesProvider) parseStateDB(
+func (p *hermesProvider) parseStateDB(ctx context.Context,
 	stateDB, sessionsDir, project, machine string,
 ) ([]ParseResult, error) {
-	conn, err := sql.Open("sqlite3", "file:"+sqliteURIPath(stateDB)+"?mode=ro")
+	conn, err := openSQLiteReadOnly(stateDB, sqliteReadOptions{})
 	if err != nil {
 		return nil, fmt.Errorf("open hermes state db: %w", err)
 	}
 	defer conn.Close()
 
-	sessions, err := readHermesStateSessions(conn)
+	sessions, err := readHermesStateSessions(ctx, conn)
 	if err != nil {
 		return nil, err
 	}
-	messages, err := readHermesStateMessages(conn)
+	parents := make(map[string]string, len(sessions))
+	for _, ss := range sessions {
+		parents[ss.id] = ss.parentSessionID
+	}
+	for i := range sessions {
+		if err := resolveHermesStateCronJob(&sessions[i], func(id string) (string, error) { return parents[id], nil }); err != nil {
+			return nil, err
+		}
+	}
+	messages, err := readHermesStateMessages(ctx, conn)
 	if err != nil {
 		return nil, err
 	}
@@ -635,10 +661,10 @@ func (p *hermesProvider) parseStateDB(
 	return results, nil
 }
 
-func readHermesStateSessions(
+func readHermesStateSessions(ctx context.Context,
 	conn *sql.DB,
 ) ([]hermesStateSession, error) {
-	rows, err := conn.Query(`
+	rows, err := conn.QueryContext(ctx, `
 		SELECT id, source, COALESCE(model, ''),
 			COALESCE(parent_session_id, ''), started_at,
 			COALESCE(ended_at, 0), COALESCE(message_count, 0),
@@ -678,10 +704,10 @@ func readHermesStateSessions(
 	return out, rows.Err()
 }
 
-func readHermesStateMessages(
+func readHermesStateMessages(ctx context.Context,
 	conn *sql.DB,
 ) (map[string][]hermesStateMessage, error) {
-	rows, err := conn.Query(`
+	rows, err := conn.QueryContext(ctx, `
 		SELECT session_id, role, COALESCE(content, ''),
 			COALESCE(tool_call_id, ''), COALESCE(tool_calls, ''),
 			timestamp, COALESCE(finish_reason, ''),
@@ -716,10 +742,10 @@ func readHermesStateMessages(
 	return out, rows.Err()
 }
 
-func readHermesStateSession(
+func readHermesStateSession(ctx context.Context,
 	conn *sql.DB, rawSessionID string,
 ) (hermesStateSession, bool, error) {
-	row := conn.QueryRow(`
+	row := conn.QueryRowContext(ctx, `
 		SELECT id, source, COALESCE(model, ''),
 			COALESCE(parent_session_id, ''), started_at,
 			COALESCE(ended_at, 0), COALESCE(message_count, 0),
@@ -757,10 +783,10 @@ func readHermesStateSession(
 	return ss, true, nil
 }
 
-func readHermesStateMessagesForSession(
+func readHermesStateMessagesForSession(ctx context.Context,
 	conn *sql.DB, rawSessionID string,
 ) ([]hermesStateMessage, error) {
-	rows, err := conn.Query(`
+	rows, err := conn.QueryContext(ctx, `
 		SELECT role, COALESCE(content, ''), COALESCE(tool_call_id, ''),
 			COALESCE(tool_calls, ''), timestamp,
 			COALESCE(finish_reason, ''), COALESCE(reasoning, ''),
@@ -800,10 +826,10 @@ func readHermesStateMessagesForSession(
 	return out, rows.Err()
 }
 
-func writeHermesStateSessionJSONL(
+func writeHermesStateSessionJSONL(ctx context.Context,
 	w io.Writer, stateDB, rawSessionID string,
 ) error {
-	ss, messages, selectedPath, err := readHermesStateSessionSource(
+	ss, messages, selectedPath, err := readHermesStateSessionSource(ctx,
 		stateDB, rawSessionID,
 	)
 	if err != nil {
@@ -815,26 +841,26 @@ func writeHermesStateSessionJSONL(
 	return encodeHermesStateSessionJSONL(w, ss, messages)
 }
 
-func readHermesStateSessionSource(
+func readHermesStateSessionSource(ctx context.Context,
 	stateDB, rawSessionID string,
 ) (hermesStateSession, []hermesStateMessage, string, error) {
-	conn, err := sql.Open("sqlite3", "file:"+sqliteURIPath(stateDB)+"?mode=ro")
+	conn, err := openSQLiteReadOnly(stateDB, sqliteReadOptions{})
 	if err != nil {
 		return hermesStateSession{}, nil, "", hermesStateLookupError{
 			err: fmt.Errorf("open hermes state db: %w", err),
 		}
 	}
 	defer conn.Close()
-	return readHermesStateSessionSourceConn(conn, stateDB, rawSessionID)
+	return readHermesStateSessionSourceConn(ctx, conn, stateDB, rawSessionID)
 }
 
 // readHermesStateSessionSourceConn is readHermesStateSessionSource on an
 // already-open connection, so per-pass callers can reuse one state.db open
 // across every member instead of opening the database per session.
-func readHermesStateSessionSourceConn(
+func readHermesStateSessionSourceConn(ctx context.Context,
 	conn *sql.DB, stateDB, rawSessionID string,
 ) (hermesStateSession, []hermesStateMessage, string, error) {
-	ss, found, err := readHermesStateSession(conn, rawSessionID)
+	ss, found, err := readHermesStateSession(ctx, conn, rawSessionID)
 	if err != nil {
 		return hermesStateSession{}, nil, "", hermesStateLookupError{err: err}
 	}
@@ -844,7 +870,7 @@ func readHermesStateSessionSourceConn(
 			rawSessionID, stateDB, os.ErrNotExist,
 		)
 	}
-	messages, err := readHermesStateMessagesForSession(conn, rawSessionID)
+	messages, err := readHermesStateMessagesForSession(ctx, conn, rawSessionID)
 	if err != nil {
 		return hermesStateSession{}, nil, "", hermesStateLookupError{err: err}
 	}
@@ -875,8 +901,7 @@ func copyHermesTranscriptFile(w io.Writer, path string) error {
 func encodeHermesStateSessionJSONL(
 	w io.Writer, ss hermesStateSession, messages []hermesStateMessage,
 ) error {
-	enc := json.NewEncoder(w)
-	enc.SetEscapeHTML(false)
+	enc := jsontext.NewEncoder(w)
 
 	meta := map[string]any{"role": "session_meta"}
 	if ss.model != "" {
@@ -885,7 +910,7 @@ func encodeHermesStateSessionJSONL(
 	if ts := timeString(ss.startedAt, time.Time{}); ts != "" {
 		meta["timestamp"] = ts
 	}
-	if err := enc.Encode(meta); err != nil {
+	if err := json.MarshalEncode(enc, meta, json.Deterministic(true)); err != nil {
 		return fmt.Errorf("encode hermes session meta: %w", err)
 	}
 	for _, hm := range messages {
@@ -896,8 +921,8 @@ func encodeHermesStateSessionJSONL(
 		if hm.toolCallID != "" {
 			record["tool_call_id"] = hm.toolCallID
 		}
-		if hm.toolCalls != "" && json.Valid([]byte(hm.toolCalls)) {
-			record["tool_calls"] = json.RawMessage(hm.toolCalls)
+		if hm.toolCalls != "" && jsontext.Value([]byte(hm.toolCalls)).IsValid() {
+			record["tool_calls"] = jsontext.Value(hm.toolCalls)
 		}
 		if ts := timeString(hm.timestamp, time.Time{}); ts != "" {
 			record["timestamp"] = ts
@@ -915,18 +940,18 @@ func encodeHermesStateSessionJSONL(
 			record["reasoning_details"] = hm.reasoningDetails
 		}
 		if hm.codexReasoningItems != "" &&
-			json.Valid([]byte(hm.codexReasoningItems)) {
-			record["codex_reasoning_items"] = json.RawMessage(
+			jsontext.Value([]byte(hm.codexReasoningItems)).IsValid() {
+			record["codex_reasoning_items"] = jsontext.Value(
 				hm.codexReasoningItems,
 			)
 		}
 		if hm.codexMessageItems != "" &&
-			json.Valid([]byte(hm.codexMessageItems)) {
-			record["codex_message_items"] = json.RawMessage(
+			jsontext.Value([]byte(hm.codexMessageItems)).IsValid() {
+			record["codex_message_items"] = jsontext.Value(
 				hm.codexMessageItems,
 			)
 		}
-		if err := enc.Encode(record); err != nil {
+		if err := json.MarshalEncode(enc, record, json.Deterministic(true)); err != nil {
 			return fmt.Errorf("encode hermes session %s: %w", ss.id, err)
 		}
 	}
@@ -959,6 +984,13 @@ func buildHermesStateResult(
 	}
 
 	applyHermesStateMetadata(sess, ss, selectedPath, project)
+	// Match transcript parsing: advance stale or unset end times from messages.
+	// Both state.db readers sort by timestamp ASC, id ASC, so the last is newest.
+	if len(stateMessages) > 0 {
+		if latest := stateMessages[len(stateMessages)-1].timestamp; latest.After(sess.EndedAt) && latest.After(sess.StartedAt) {
+			sess.EndedAt = latest
+		}
+	}
 	return ParseResult{
 		Session:     *sess,
 		Messages:    msgs,
@@ -1000,19 +1032,22 @@ func applyHermesStateMetadata(
 		sess.Project = project
 	} else if ss.source != "" {
 		sess.Project = "hermes-" + ss.source
+		sess.projectSynthesizedByHermes = true
 	} else if sess.Project == "" {
 		sess.Project = "hermes"
+		sess.projectSynthesizedByHermes = true
 	}
 	if !ss.startedAt.IsZero() {
 		sess.StartedAt = ss.startedAt
 	}
-	if !ss.endedAt.IsZero() {
+	if ss.endedAt.After(sess.EndedAt) {
 		sess.EndedAt = ss.endedAt
 	}
 	if ss.parentSessionID != "" {
 		sess.ParentSessionID = "hermes:" + ss.parentSessionID
 		sess.RelationshipType = RelContinuation
 	}
+	setHermesCronGroup(sess, ss.source, ss.cronJob)
 	sess.SourceSessionID = ss.id
 	sess.SourceVersion = "hermes-state-db"
 	sess.SessionName = ss.title
@@ -1395,7 +1430,7 @@ func parseHermesTimestamp(s string) time.Time {
 	// Try parsing with microseconds (Hermes default).
 	// Use ParseInLocation so naive timestamps are interpreted as local
 	// time rather than UTC — Hermes records local wall-clock time.
-	t, err := time.ParseInLocation("2006-01-02T15:04:05.999999", s, time.Local)
+	t, err := time.ParseInLocation("2006-01-02T15:04:05.999999", s, time.Local) //nolint:forbidigo // Hermes source timestamps omit the offset and represent local wall-clock time.
 	if err == nil {
 		return t
 	}
@@ -1405,7 +1440,7 @@ func parseHermesTimestamp(s string) time.Time {
 		return t
 	}
 	// Try without fractional seconds.
-	t, err = time.ParseInLocation("2006-01-02T15:04:05", s, time.Local)
+	t, err = time.ParseInLocation("2006-01-02T15:04:05", s, time.Local) //nolint:forbidigo // Hermes source timestamps omit the offset and represent local wall-clock time.
 	if err == nil {
 		return t
 	}
@@ -1458,4 +1493,80 @@ func stripHermesSkillPrefix(s string) string {
 		return "[Skill: " + skillName + "]"
 	}
 	return s
+}
+
+// hermesCronJobID follows parents until a cron run identifies its job.
+func hermesCronJobID(id string, parent func(string) string) string {
+	seen := make(map[string]bool)
+	for id != "" && !seen[id] {
+		seen[id] = true
+		if job := hermesCronRunJob(id); job != "" {
+			return job
+		}
+		id = parent(id)
+	}
+	return ""
+}
+
+func setHermesCronGroup(sess *ParsedSession, platform, job string) {
+	if platform == "" {
+		return
+	}
+	if platform != "cron" {
+		sess.GroupKey = ""
+		sess.KeepStoredGroupKey = false
+		return
+	}
+	sess.GroupKey = job
+	sess.KeepStoredGroupKey = job == ""
+}
+
+// hermesCronRunJob returns the job ID from a native cron run ID, or empty for other sessions.
+func hermesCronRunJob(id string) string {
+	if match := hermesCronSessionID.FindStringSubmatch(id); match != nil {
+		return match[1]
+	}
+	return ""
+}
+
+func resolveHermesStateCronJob(ss *hermesStateSession, parent func(string) (string, error)) error {
+	if ss.source != "cron" {
+		return nil
+	}
+	var lookupErr error
+	ss.cronJob = hermesCronJobID(ss.id, func(id string) string {
+		if id == ss.id {
+			return ss.parentSessionID
+		}
+		var next string
+		next, lookupErr = parent(id)
+		if lookupErr != nil {
+			return ""
+		}
+		return next
+	})
+	return lookupErr
+}
+
+func hermesCronParent(ctx context.Context, conn *sql.DB, id string) (string, error) {
+	var parent string
+	err := conn.QueryRowContext(ctx, hermesCronParentQuery, id).Scan(&parent)
+	if err == sql.ErrNoRows {
+		err = nil
+	}
+	return parent, err
+}
+
+// HermesCronJobName strips the run timestamp from a recorded job title.
+func HermesCronJobName(job, title string) string {
+	job, _, _ = strings.Cut(job, ":")
+	before, after, ok := strings.CutLast(title, " · ")
+	if !ok || strings.TrimSpace(after) == "" {
+		return ""
+	}
+	name := strings.TrimSpace(before)
+	if name == job || name == "cron "+job {
+		return ""
+	}
+	return name
 }

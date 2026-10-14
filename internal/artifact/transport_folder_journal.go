@@ -3,7 +3,7 @@ package artifact
 import (
 	"bytes"
 	"context"
-	"encoding/json"
+	"encoding/json/v2"
 	"errors"
 	"fmt"
 	"io"
@@ -150,7 +150,7 @@ func readFolderJournalHead(root *os.Root) (folderJournalHead, error) {
 	}
 	var head folderJournalHead
 	if err := decodeCanonicalFolderJSON(body, &head); err != nil {
-		return folderJournalHead{}, fmt.Errorf("%w: invalid artifact journal head: %v", ErrArtifactInvalid, err)
+		return folderJournalHead{}, fmt.Errorf("%w: invalid artifact journal head: %w", ErrArtifactInvalid, err)
 	}
 	if head.Sequence < 0 {
 		return folderJournalHead{}, fmt.Errorf("%w: invalid artifact journal sequence", ErrArtifactInvalid)
@@ -176,7 +176,7 @@ func readFolderJournalEvent(
 	}
 	var event folderJournalEvent
 	if err := decodeCanonicalFolderJSON(body, &event); err != nil {
-		return folderJournalEvent{}, fmt.Errorf("%w: invalid artifact journal event: %v", ErrArtifactInvalid, err)
+		return folderJournalEvent{}, fmt.Errorf("%w: invalid artifact journal event: %w", ErrArtifactInvalid, err)
 	}
 	if event.Sequence != sequence {
 		return folderJournalEvent{}, fmt.Errorf("%w: artifact journal sequence mismatch", ErrArtifactInvalid)
@@ -196,19 +196,15 @@ func readFolderJournalEvent(
 }
 
 func decodeCanonicalFolderJSON(body []byte, destination any) error {
-	decoder := json.NewDecoder(bytes.NewReader(body))
-	decoder.DisallowUnknownFields()
-	if err := decoder.Decode(destination); err != nil {
+	if err := json.Unmarshal(
+		body, destination, json.RejectUnknownMembers(true),
+	); err != nil {
 		return err
 	}
-	if err := decoder.Decode(&struct{}{}); !errors.Is(err, io.EOF) {
-		return errors.New("trailing content")
-	}
-	canonical, err := json.Marshal(destination)
+	canonical, err := canonicalJSON(destination)
 	if err != nil {
 		return err
 	}
-	canonical = append(canonical, '\n')
 	if !bytes.Equal(body, canonical) {
 		return errors.New("noncanonical JSON")
 	}
@@ -363,7 +359,7 @@ func validateFolderJournalRejection(
 	var rejection folderJournalRejection
 	if err := decodeCanonicalFolderJSON(body, &rejection); err != nil {
 		return fmt.Errorf(
-			"%w: invalid artifact journal rejection: %v",
+			"%w: invalid artifact journal rejection: %w",
 			ErrArtifactInvalid,
 			err,
 		)

@@ -2,7 +2,8 @@ package sync
 
 import (
 	"bufio"
-	"encoding/json"
+	"encoding/json/jsontext"
+	"encoding/json/v2"
 	"errors"
 	"io"
 	"os"
@@ -11,6 +12,7 @@ import (
 	"strings"
 
 	"github.com/minio/minio-go/v7"
+	"go.kenn.io/kit/atomicfile"
 )
 
 func hydrateS3ClaudeToolResults(
@@ -28,7 +30,7 @@ func hydrateS3ClaudeToolResults(
 		_ = os.Remove(rewritePath)
 		return false, sawPersisted, nil
 	}
-	if err := os.Rename(rewritePath, sessionPath); err != nil {
+	if err := atomicfile.Replace(rewritePath, sessionPath); err != nil {
 		_ = os.Remove(rewritePath)
 		return false, sawPersisted, err
 	}
@@ -109,19 +111,17 @@ func rewriteS3ClaudeToolResultLine(
 		return line, false, false, nil
 	}
 
-	dec := json.NewDecoder(strings.NewReader(line))
-	dec.UseNumber()
-	var top map[string]any
-	if err := dec.Decode(&top); err != nil {
-		return line, false, false, nil
+	var top map[string]jsontext.Value
+	if err := json.Unmarshal([]byte(line), &top); err != nil || top == nil {
+		return line, false, false, nil //nolint:nilerr // Non-JSON tool output is retained without optional sidecar enrichment.
 	}
-	msg, ok := top["message"].(map[string]any)
-	if !ok {
-		return line, false, false, nil
+	var msg map[string]jsontext.Value
+	if err := json.Unmarshal(top["message"], &msg); err != nil || msg == nil {
+		return line, false, false, nil //nolint:nilerr // Non-JSON tool output is retained without optional sidecar enrichment.
 	}
-	blocks, ok := msg["content"].([]any)
-	if !ok {
-		return line, false, false, nil
+	var blocks []jsontext.Value
+	if err := json.Unmarshal(msg["content"], &blocks); err != nil {
+		return line, false, false, nil //nolint:nilerr // Non-JSON tool output is retained without optional sidecar enrichment.
 	}
 
 	resolvePath := func(original string) (string, bool, error) {
@@ -132,8 +132,11 @@ func rewriteS3ClaudeToolResultLine(
 
 	changed := false
 	sawPersisted := false
-	if tur, ok := top["toolUseResult"].(map[string]any); ok {
-		if p, ok := tur["persistedOutputPath"].(string); ok {
+	var toolUseResult map[string]jsontext.Value
+	if err := json.Unmarshal(top["toolUseResult"], &toolUseResult); err == nil &&
+		toolUseResult != nil {
+		var p string
+		if json.Unmarshal(toolUseResult["persistedOutputPath"], &p) == nil {
 			if _, ok := s3ClaudeToolResultRef(p, sessionURI); ok {
 				sawPersisted = true
 			}
@@ -142,18 +145,32 @@ func rewriteS3ClaudeToolResultLine(
 				return "", false, sawPersisted, err
 			}
 			if ok {
-				tur["persistedOutputPath"] = local
+				toolUseResult["persistedOutputPath"], err = json.Marshal(local)
+				if err != nil {
+					return "", false, sawPersisted, err
+				}
+				top["toolUseResult"], err = json.Marshal(
+					toolUseResult, json.Deterministic(true),
+				)
+				if err != nil {
+					return "", false, sawPersisted, err
+				}
 				changed = true
 			}
 		}
 	}
-	for _, rawBlock := range blocks {
-		block, ok := rawBlock.(map[string]any)
-		if !ok || block["type"] != "tool_result" {
+	for i, rawBlock := range blocks {
+		var block map[string]jsontext.Value
+		if err := json.Unmarshal(rawBlock, &block); err != nil || block == nil {
 			continue
 		}
-		content, ok := block["content"].(string)
-		if !ok {
+		var blockType string
+		if err := json.Unmarshal(block["type"], &blockType); err != nil ||
+			blockType != "tool_result" {
+			continue
+		}
+		var content string
+		if err := json.Unmarshal(block["content"], &content); err != nil {
 			continue
 		}
 		original := persistedOutputPathFromContent(content)
@@ -170,13 +187,30 @@ func rewriteS3ClaudeToolResultLine(
 		if !ok {
 			continue
 		}
-		block["content"] = strings.ReplaceAll(content, original, local)
+		block["content"], err = json.Marshal(strings.ReplaceAll(content, original, local))
+		if err != nil {
+			return "", false, sawPersisted, err
+		}
+		blocks[i], err = json.Marshal(block, json.Deterministic(true))
+		if err != nil {
+			return "", false, sawPersisted, err
+		}
 		changed = true
 	}
 	if !changed {
 		return line, false, sawPersisted, nil
 	}
-	encoded, err := json.Marshal(top)
+	contentData, err := json.Marshal(blocks)
+	if err != nil {
+		return "", false, sawPersisted, err
+	}
+	msg["content"] = contentData
+	messageData, err := json.Marshal(msg, json.Deterministic(true))
+	if err != nil {
+		return "", false, sawPersisted, err
+	}
+	top["message"] = messageData
+	encoded, err := json.Marshal(top, json.Deterministic(true))
 	if err != nil {
 		return "", false, sawPersisted, err
 	}
@@ -240,8 +274,8 @@ func localS3ClaudeToolResultPath(
 }
 
 func isMissingS3Object(err error) bool {
-	var resp minio.ErrorResponse
-	return errors.As(err, &resp) && resp.Code == minio.NoSuchKey
+	resp, hasResp := errors.AsType[minio.ErrorResponse](err)
+	return hasResp && resp.Code == minio.NoSuchKey
 }
 
 func s3ClaudeToolResultRel(original string) (string, bool) {

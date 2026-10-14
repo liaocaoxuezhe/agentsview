@@ -253,7 +253,9 @@ type darwinWatchBackend struct {
 // events forwarded by the kqueue fallback. Native FSEvents deliveries bypass
 // Watcher.loop through the direct sink, so this method never puts filesystem
 // work on the FSEvents callback queue.
-func (b *darwinWatchBackend) includeCreatedSubtreePath(root, path string) bool {
+func (b *darwinWatchBackend) includeCreatedSubtreePath(
+	root, path string, _ bool,
+) bool {
 	return !shouldExcludeForRoot(b.excludes, path, root)
 }
 
@@ -1700,6 +1702,26 @@ func (b *darwinWatchBackend) handleKqueueEvent(
 	if ok {
 		event.Root = owner.logicalPath
 	}
+	// A lost-events full sync carries no path, so it never matches a root.
+	// It stands in for kqueue events that were dropped and must reach the
+	// consumer regardless of root ownership. The dropped events can include
+	// a shallow root's own removal, which normally signals loss here, so
+	// every active kqueue-backed root is marked lost and revalidated by
+	// lifecycle recovery. The marking runs before fallback collection:
+	// buffered events replay without passing through here again, so
+	// deferring it would lose the signal.
+	if event.Op&backendOpFullSync != 0 {
+		for _, root := range snapshot.activeRoots() {
+			if !root.recursive && root.state != nil {
+				root.state.signal.Or(darwinRootSignalLoss)
+			}
+		}
+		b.signalLifecycle()
+		if b.collectFallbackEvent(event) {
+			return backendEvent{}, false
+		}
+		return event, true
+	}
 	if b.collectFallbackEvent(event) {
 		return backendEvent{}, false
 	}
@@ -1967,6 +1989,13 @@ func (b *darwinWatchBackend) removeRootLocked(root string, recursive bool) {
 		},
 	)}
 	b.roots.Store(next)
+}
+
+func (s *darwinRootSnapshot) activeRoots() []darwinWatchRoot {
+	if s == nil {
+		return nil
+	}
+	return s.roots
 }
 
 func (s *darwinRootSnapshot) mostSpecificRoot(path string) (darwinWatchRoot, bool) {

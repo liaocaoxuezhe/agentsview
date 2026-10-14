@@ -10,10 +10,11 @@ import (
 )
 
 func (s *Server) registerSecretsRoutes() {
-	group := newRouteGroup(s.api, "/api/v1/secrets", "Secrets")
+	group := huma.NewGroup(s.api, "/api/v1/secrets")
+	configureRouteGroup(group, "Secrets")
 
-	get(s, group, "", "List secret findings", s.humaListSecrets)
-	stream(s, group, http.MethodPost, "/scan", "Scan secrets", s.humaScanSecrets)
+	s.get(group, "", "List secret findings", s.humaListSecrets)
+	s.stream(group, http.MethodPost, "/scan", "Scan secrets", s.humaScanSecrets)
 }
 
 type secretListInput struct {
@@ -86,7 +87,7 @@ func (s *Server) humaScanSecrets(
 		stream, ok := newHumaSSEStream(hctx)
 		if !ok {
 			writeHumaJSON(hctx, http.StatusInternalServerError,
-				apiErrorResponse{Message: "streaming not supported"})
+				apiResponseError{Message: "streaming not supported"})
 			return
 		}
 		summary, err := s.sessions.ScanSecrets(ctx, service.SecretScanInput{

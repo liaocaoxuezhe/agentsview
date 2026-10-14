@@ -3,7 +3,7 @@ package extract
 import (
 	"crypto/sha256"
 	"encoding/hex"
-	"encoding/json"
+	"encoding/json/v2"
 	"fmt"
 	"maps"
 	"os"
@@ -45,6 +45,17 @@ Rules:
 - title: one specific sentence, at most 120 characters.
 - body: 1-4 dense sentences with the exact identifiers and values.
 - entities: the exact searchable strings (file paths, function names, commands, error strings, URLs) the entry is about.`
+
+	// unexecutedActionPreamble opens the resolved action prompt for units
+	// whose messages ran no tool. It sits outside the prompt digests, so
+	// editing it requires an extractionProtocolVersion bump.
+	unexecutedActionPreamble = `No tool ran in this segment, so nothing in it was executed and no procedure entry applies; record only observations, findings, warnings, and settled choices, and never state that proposed or planned work was done.`
+)
+
+// unexecutedEntryTypes drops 'procedure' for action units whose messages ran
+// no tool: nothing in them can be recorded as steps that were carried out.
+var unexecutedEntryTypes = slices.DeleteFunc(
+	slices.Clone(entryTypes), func(t string) bool { return t == "procedure" },
 )
 
 // basePrompts returns the embedded defaults for every prompt role. The
@@ -259,9 +270,9 @@ func Fingerprint(
 		PromptDigests: promptDigests,
 		Request:       request,
 	}
-	// encoding/json writes map keys in sorted order, which makes the
-	// encoding canonical for the JSON-shaped values profiles carry.
-	canonical, err := json.Marshal(identity)
+	// The identity contains maps, so deterministic ordering is part of the
+	// fingerprint contract.
+	canonical, err := json.Marshal(identity, json.Deterministic(true))
 	if err != nil {
 		return "", fmt.Errorf("encoding extraction identity: %w", err)
 	}

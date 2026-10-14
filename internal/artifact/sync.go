@@ -49,6 +49,9 @@ func Sync(
 	if database == nil {
 		return SyncResult{}, errors.New("artifact sync database is required")
 	}
+	if err := database.RequireSourceSync(ctx); err != nil {
+		return SyncResult{}, err
+	}
 	if err := validateArtifactSyncOptions(opts); err != nil {
 		return SyncResult{}, err
 	}
@@ -80,6 +83,9 @@ func SyncWithRepository(
 	if database == nil {
 		return SyncResult{}, errors.New("artifact sync database is required")
 	}
+	if err := database.RequireSourceSync(ctx); err != nil {
+		return SyncResult{}, err
+	}
 	if err := validateArtifactSyncOptions(opts); err != nil {
 		return SyncResult{}, err
 	}
@@ -106,7 +112,7 @@ func SyncWithRepository(
 	}
 	defer func() { retErr = errors.Join(retErr, transport.Close()) }()
 
-	origin, err := resolveSyncOrigin(database, opts.Origin)
+	origin, err := resolveSyncOrigin(ctx, database, opts.Origin)
 	if err != nil {
 		return SyncResult{}, err
 	}
@@ -167,19 +173,17 @@ type databaseFolderTransportState struct {
 	database *db.DB
 }
 
-func (s databaseFolderTransportState) LoadFolderTransportState(
-	_ context.Context,
+func (s databaseFolderTransportState) LoadFolderTransportState(ctx context.Context,
 	namespaceID string,
 ) (string, error) {
-	return s.database.GetSyncState("artifact_transport_" + namespaceID)
+	return s.database.GetSyncState(ctx, "artifact_transport_"+namespaceID)
 }
 
-func (s databaseFolderTransportState) SaveFolderTransportState(
-	_ context.Context,
+func (s databaseFolderTransportState) SaveFolderTransportState(ctx context.Context,
 	namespaceID string,
 	value string,
 ) error {
-	return s.database.SetSyncState("artifact_transport_"+namespaceID, value)
+	return s.database.SetSyncState(ctx, "artifact_transport_"+namespaceID, value)
 }
 
 func validateArtifactSyncOptions(opts SyncOptions) error {
@@ -197,14 +201,14 @@ func validateArtifactSyncOptions(opts SyncOptions) error {
 	return nil
 }
 
-func resolveSyncOrigin(database *db.DB, configured string) (string, error) {
+func resolveSyncOrigin(ctx context.Context, database *db.DB, configured string) (string, error) {
 	if configured == "" {
-		return EnsureOrigin(database)
+		return EnsureOrigin(ctx, database)
 	}
 	if err := validateOriginID(configured); err != nil {
 		return "", err
 	}
-	if err := AdoptOrigin(database, configured); err != nil {
+	if err := AdoptOrigin(ctx, database, configured); err != nil {
 		return "", err
 	}
 	return configured, nil

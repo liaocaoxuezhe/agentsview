@@ -3,10 +3,10 @@ title: Semantic Search Internals
 description: Architecture and invariants behind the vector index — storage, generations, build pipeline, concurrency, and search path
 ---
 
-This page documents the internal design of [Semantic Search](/semantic-search/)
-for maintainers extending or debugging the vector index. It assumes the
-user-facing behavior described there and does not repeat configuration or CLI
-usage.
+This page documents the internal design of
+[Semantic Search](/docs/semantic-search/) for maintainers extending or debugging
+the vector index. It assumes the user-facing behavior described there and does
+not repeat configuration or CLI usage.
 
 ## Storage layout
 
@@ -179,20 +179,20 @@ retired**. A generation's fingerprint is derived from `model` + `dimension` +
 the params map
 `{max_input_chars, doc_unit_scheme: "run_v1", chunk_overlap_chars}`
 (`vectorGeneration` in `cmd/agentsview/embeddings.go`), plus `query_prefix`,
-`document_prefix`, `input_suffix`, and `request_dimensions` when configured —
-an unset value is omitted from the map rather than included as `""`/`false`, so
+`document_prefix`, `input_suffix`, and `request_dimensions` when configured — an
+unset value is omitted from the map rather than included as `""`/`false`, so
 configs written before those keys existed keep their fingerprints.
 `chunk_overlap_chars` is computed by `vector.ChunkOverlap` —
 `max_input_chars * 15 / 100` — the same function `Open` uses for kit's
-`SplitOptions`, so the split behavior and its fingerprint can never drift
-apart. Changing any input — the model, the dimension, whether reduced output
-dimensions are requested, the chunking cap, either role prefix, the input
-suffix, the overlap formula, or the document-unit scheme — produces a
-different fingerprint and cuts a new generation. Which
-`[vector.embeddings.servers.<name>]` entry encoded a document is deliberately
-*not* a fingerprint input: every server serves the same globally-configured
-model, so their vectors are interchangeable and a build may switch servers
-(`embeddings build --using <name>`) without invalidating the generation.
+`SplitOptions`, so the split behavior and its fingerprint can never drift apart.
+Changing any input — the model, the dimension, whether reduced output dimensions
+are requested, the chunking cap, either role prefix, the input suffix, the
+overlap formula, or the document-unit scheme — produces a different fingerprint
+and cuts a new generation. Which `[vector.embeddings.servers.<name>]` entry
+encoded a document is deliberately *not* a fingerprint input: every server
+serves the same globally-configured model, so their vectors are interchangeable
+and a build may switch servers (`embeddings build --using <name>`) without
+invalidating the generation.
 
 - `embeddings build` (incremental): mirror refresh, then fill whatever the
   active generation is missing.
@@ -205,6 +205,27 @@ model, so their vectors are interchangeable and a build may switch servers
 - The staleness gate checked at query time is exactly this: the active
   generation's stored fingerprint no longer matches the fingerprint computed
   from the current `[vector.embeddings]` config.
+
+Builds and the staleness gate compare fingerprints through kit's
+`embedmodel.Descriptor`. Its `Legacy` entry is the agentsview fingerprint above,
+so generations stored before agentsview adopted kit's embedding stack stay
+current and are not re-embedded. kit's own vector-space identity omits the input
+recipe (unit scheme, chunk size, overlap, corpus), so agentsview keeps keying
+new generations by its own fingerprint.
+
+Lifecycle bookkeeping uses kit's `sqlitevec` store: `Coverage` reports each
+generation's embedded and missing documents, and auto-activation calls
+`Activate`, which publishes a generation only when no document is pending and
+retires the previous active and building generations in the same transaction.
+Two operations stay local because kit treats a retired generation as permanent:
+
+- A build whose config returns to a retired generation's fingerprint revives it
+  and tops it up, reusing its stored vectors.
+- `embeddings activate <id>` can reactivate a retired generation, and `--force`
+  activates a generation that still has pending documents.
+
+Both rely on agentsview never calling kit's `Reclaim`, so a retired generation
+keeps its vectors until `vectors.db` is reset.
 
 ## Chunking and anchoring
 
@@ -255,28 +276,41 @@ instead of being deleted outright, so a same-scan reinsert under the same
 `doc_key` survives via upsert and keeps its `embed_gen` rather than
 re-embedding.
 
+An incremental refresh also reads the archive's session deletion journal from
+the revision stored in `vectors.db`. It removes the documents of permanently
+deleted sessions and rescans reinserted sessions whole, whatever their end time.
+When the stored revision is missing, belongs to another archive, or is ahead of
+the journal, the refresh runs a full reconciliation instead.
+
 ### Fill and skip-and-stamp
 
 Fill embeds every pending document (content changed, or never embedded, for the
 active generation). Within each scan page, up to `concurrency` (the building
 server's config, default 4) documents are split and encoded in parallel; saves
 into `vectors.db` stay serialized on one goroutine, preserving the single-writer
-model. Requests ask for `encoding_format: "base64"` (raw little-endian float32
-bytes, ~4x smaller than JSON float arrays); the encoder accepts either response
-shape, and a server that rejects the field downgrades the encoder to plain float
-requests for its lifetime. A document whose encode call fails with a permanent
-error — a 400, 413, or 422 whose error body describes the input itself, e.g. a
-token/context-length overflow or a content-policy rejection — is not retried in
-that fill or the next one: it's stamped for the generation with no vectors at
-its current `content_hash`, which marks it non-pending. It's logged (doc key
-plus the underlying error) and counted in the build summary's skipped count, but
-there is no separate poison list or periodic retry — the only way it embeds
-again is if the document's content itself changes later (a new `content_hash`,
-so a new pending row). Every other failure — 5xx, network errors, timeouts, 429,
-and any 4xx that looks like an auth, route, model, or media-type problem rather
-than a rejection of this document — aborts the fill and is retried on the next
-scheduled build, so a config mistake can't silently stamp the whole corpus as
-embedded-with-no-vectors.
+model. Requests go through kit's `embedclient`, which applies the role prefix
+and suffix, validates every vector, and retries 408, 429, 5xx, and network
+failures up to `max_retries` attempts. Document builds keep retrying a 429 until
+it clears or the build is canceled; 429s do not use up the `max_retries` budget
+for other failures in the same request.
+
+kit classifies every failed response from its status and the provider's error
+code or message. Only an input that is too long or refused by policy counts as a
+rejection of that document. A 400 kit cannot attribute to the input, such as a
+wrong model or an unsupported `dimensions` field, aborts the fill: documents
+stay pending and the active generation is unchanged. Every other failure — 401,
+403, 404, 5xx, network errors, timeouts, and 429 — also aborts the fill and is
+retried on the next scheduled build.
+
+When a rejection comes back for a request that batched several documents, the
+fill re-sends each document on its own to find the one at fault. A confirmed
+rejection is stamped for the generation with no vectors at its current
+`content_hash`, which marks it non-pending, and later builds of that generation
+do not send it again. It's logged (doc key plus the underlying error) and
+counted in the build summary's skipped count; there is no separate poison list
+or periodic retry. The document is attempted again only when its content changes
+(a new `content_hash`), a full rebuild clears the generation's stamps, or a
+config change creates a generation with a new fingerprint.
 
 ### Scope (`include_automated`)
 
@@ -376,7 +410,7 @@ Generation activation always happens under the single writer. Search opens
   over-fetches `max(limit × 4, 200)` candidates, then filters and truncates to
   the requested limit. At small corpora or narrow filters this can return
   fewer than `--limit` results even though more exist — a known v1 tradeoff
-  (see [Limitations](/semantic-search/#limitations)).
+  (see [Limitations](/docs/semantic-search/#limitations)).
 
 ## Conversation-unit citations
 
@@ -513,7 +547,7 @@ construction — is exported from `internal/db` and reused rather than duplicate
 so semantic/hybrid parity between backends holds by construction. The
 user-facing behavior (fingerprint gate, graceful 501 degradation, shared
 generations) is described in
-[Semantic Search — PostgreSQL](/semantic-search/#postgresql); this section
+[Semantic Search — PostgreSQL](/docs/semantic-search/#postgresql); this section
 covers the invariants.
 
 ### Schema shape
@@ -637,7 +671,7 @@ covers the invariants.
   `ResolveMessageUnits` point lookups against `vector_documents`, and feeds
   the shared RRF merge — everything after candidate selection matches the
   SQLite contract, with the BM25-vs-recency leg-ranking difference documented
-  in the [user-facing docs](/semantic-search/#hybrid-keyword-leg).
+  in the [user-facing docs](/docs/semantic-search/#hybrid-keyword-leg).
 
 ## Error taxonomy
 
@@ -657,26 +691,41 @@ stale-fingerprint case.
 The distinction matters for callers: 501 means the feature will not work until
 something is configured or built; 503 means it should work and is worth
 retrying. CLI and MCP surface the same cause-specific remediation text described
-in the [user-facing error taxonomy](/semantic-search/#error-taxonomy).
+in the [user-facing error taxonomy](/docs/semantic-search/#error-taxonomy).
 
 ## Skill generation
 
-`internal/skills` renders the `agentsview-finding-history` skill (see
-[Skills for coding agents](/semantic-search/#skills-for-coding-agents)) from a
-single embedded template, `internal/skills/templates/finding-history.md.tmpl`
-via `go:embed` — the same pattern `internal/web` uses for the frontend — with no
-per-harness copies checked in. `Render` fills in a harness-specific delegation
-phrase (whether the harness can dispatch a search subagent or must run the
-bounded probes itself) and inserts a `generated-by` header — carrying the CLI
-version and a sha256 hash of the pure template render — as a YAML comment on
-line two, just inside the frontmatter fence, so the file still begins with `---`
-and frontmatter-based skill discovery keeps working. Staleness and tamper
-detection are hash-authoritative, not version-authoritative: `Classify` compares
-a file's recorded hash against its own body hash to detect modification, and
-against a fresh render's hash to detect staleness, and never consults the
-version string, because dev builds all report version `"dev"` and would
-otherwise be indistinguishable from one another. There is deliberately no Claude
-Code plugin/marketplace packaging: that would tie distribution to one harness's
-install mechanism, whereas the goal is a single `SKILL.md` artifact that any
-`.agents/skills`-reading harness can consume the same way, installed directly by
-the `agentsview` binary rather than a separate package manager.
+`internal/skills` renders a harness-specific artifact package (see
+[Skills for coding agents](/docs/semantic-search/#skills-for-coding-agents))
+from embedded templates via `go:embed`. Both harnesses receive
+`agentsview-finding-history` plus a `LICENSE` sidecar; Claude also receives the
+`agentsview-search-conversations` agent. The generic Agents/Codex package still
+ships the skill and LICENSE and follows the same MCP workflow directly when no
+permitted search agent exists.
+
+`RenderPackage` assigns every artifact an install-relative path. Skill and agent
+templates go through the frontmatter generated-header renderer. The MIT sidecar
+is a static file whose generated-by header sits on line one. The copyright
+notice lives in that sidecar. The skill receives the harness-specific delegation
+phrase and optional `--server` / `--server-token-file` suffixes. Its
+`# install-remote:` JSON comment records remote intent so `skills list` and a
+flagless reinstall classify the package against the same target. The search
+agent is endpoint-neutral. Its `tools` frontmatter allowlists
+`mcp__agentsview__search_content` and `mcp__agentsview__get_messages`, so Claude
+Code does not grant built-in tools or tools from any other MCP server. The
+server entry must be named `agentsview`.
+
+Classification remains hash-authoritative and per file. `Classify` compares an
+artifact's recorded hash against its body to detect modification and against a
+fresh render to detect staleness. Frontmatter files hash the fence plus the body
+after the header; sidecars hash everything after line one. Install therefore
+refuses a modified agent without preventing a safe skill or license update, and
+list emits one row per artifact. The CLI version in the header remains
+informational because development builds all report `"dev"`.
+
+The templates adapt the pinned Episodic Memory skill, agent, and prompt under
+MIT; the
+[adaptation record](https://github.com/kenn-io/agentsview/blob/main/docs/internal/episodic-memory-adaptation.md)
+documents the source and deviations. The `agentsview` binary installs standalone
+artifacts. The native `plugins/agentsview-memory` package bundles the same
+recall artifacts with the focused MCP profile and a SessionStart lifecycle hook.

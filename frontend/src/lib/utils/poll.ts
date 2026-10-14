@@ -23,8 +23,7 @@ export async function waitForStableValue<T>(
   isEqual: (a: T, b: T) => boolean = sameValueZero,
 ): Promise<T> {
   const interval = pollIntervalMs ?? 100;
-  const deadline =
-    Date.now() + (maxWaitMs ?? stableDurationMs * 3);
+  const deadline = Date.now() + (maxWaitMs ?? stableDurationMs * 3);
   let lastValue = await fn();
   let stableStart = Date.now();
 
@@ -42,6 +41,6 @@ export async function waitForStableValue<T>(
   throw new Error(
     `Value did not stabilize within ` +
       `${maxWaitMs ?? stableDurationMs * 3}ms.` +
-      ` Last value: ${lastValue}`,
+      ` Last value: ${typeof lastValue === "number" ? String(lastValue) : (JSON.stringify(lastValue) ?? "undefined")}`,
   );
 }

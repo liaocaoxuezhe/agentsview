@@ -3,7 +3,9 @@
 package main
 
 import (
-	"encoding/json"
+	"encoding/json/jsontext"
+	"encoding/json/v2"
+	"errors"
 	"fmt"
 	"io"
 	"strings"
@@ -39,7 +41,7 @@ func newSessionMessagesCommand() *cobra.Command {
 				return err
 			}
 			if outputFormat(cmd) == "json" {
-				return json.NewEncoder(cmd.OutOrStdout()).Encode(list)
+				return json.MarshalEncode(jsontext.NewEncoder(cmd.OutOrStdout()), list)
 			}
 			return printMessagesHuman(cmd.OutOrStdout(), list)
 		},
@@ -86,9 +88,7 @@ func messagesFilterFromFlags(cmd *cobra.Command) (service.MessageFilter, error) 
 	}
 	aroundSet := flags.Changed("around")
 	if !aroundSet && (flags.Changed("before") || flags.Changed("after")) {
-		return service.MessageFilter{}, fmt.Errorf(
-			"--before/--after require --around",
-		)
+		return service.MessageFilter{}, errors.New("--before/--after require --around")
 	}
 
 	limit, err := flags.GetInt("limit")

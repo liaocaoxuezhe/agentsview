@@ -1,11 +1,30 @@
 package db
 
 import (
+	"context"
 	"database/sql"
 	"fmt"
 )
 
 const automationAuditPrefixBytes = AutomationEvidencePrefixBytes
+
+// ParentlessWorkerSQL is the stored-row equivalent of parser.PromoteParentlessWorker.
+const ParentlessWorkerSQL = `session_kind = 'non-interactive'
+ AND COALESCE(parent_session_id, '') = '' AND COALESCE(relationship_type, '') = ''`
+
+const parentlessRelationshipSQL = `IIF(sessions.session_kind = 'non-interactive', 'subagent', '')`
+
+// parserRelationshipSQL restores parser provenance, falling back to kind for legacy rows.
+const parserRelationshipSQL = `COALESCE(sessions.parser_relationship_type, ` + parentlessRelationshipSQL + `)`
+
+func repairParentlessWorkers(ctx context.Context, w *writerHandle) error {
+	if _, err := w.Exec(ctx, `UPDATE sessions
+		SET relationship_type = 'subagent', local_modified_at = strftime('%Y-%m-%dT%H:%M:%fZ','now')
+		WHERE `+ParentlessWorkerSQL); err != nil {
+		return fmt.Errorf("repairing parentless workers: %w", err)
+	}
+	return nil
+}
 
 type boundedAutomationText struct {
 	prefix         sql.RawBytes
@@ -20,13 +39,14 @@ func (text boundedAutomationText) evidence() AutomationTextEvidence {
 	}
 }
 
-func auditAutomatedFull(
+func auditAutomatedFull(ctx context.Context,
 	w *writerHandle,
 	patterns automationPatternSnapshot,
 ) (setIDs, clearIDs []string, err error) {
-	rows, err := w.Query(
+	rows, err := w.Query(ctx,
 		`SELECT
 			s.id,
+			s.session_kind,
 			s.first_message,
 			s.user_message_count,
 			s.is_automated,
@@ -35,6 +55,7 @@ func auditAutomatedFull(
 				FROM messages m
 				WHERE m.session_id = s.id
 				  AND m.role = 'user'
+				  AND COALESCE(m.source_subtype, '') <> 'tool_result'
 				  AND m.is_system = 0
 				  AND TRIM(m.content) <> ''
 				ORDER BY m.ordinal
@@ -47,6 +68,7 @@ func auditAutomatedFull(
 			"querying automated backfill candidates: %w", err,
 		)
 	}
+	defer rows.Close()
 
 	setIDs, clearIDs, err = scanFullAutomationCandidates(rows, patterns)
 	if closeErr := rows.Close(); err == nil && closeErr != nil {
@@ -55,13 +77,14 @@ func auditAutomatedFull(
 	return setIDs, clearIDs, err
 }
 
-func auditAutomatedMatchingHash(
+func auditAutomatedMatchingHash(ctx context.Context,
 	w *writerHandle,
 	patterns automationPatternSnapshot,
 ) (setIDs, clearIDs []string, err error) {
-	rows, err := w.Query(
+	rows, err := w.Query(ctx,
 		`SELECT
 			s.id,
+			s.session_kind,
 			s.user_message_count,
 			s.is_automated,
 			substr(CAST(first_user.content AS BLOB), 1, ?)
@@ -84,6 +107,7 @@ func auditAutomatedMatchingHash(
 				FROM messages m
 				WHERE m.session_id = s.id
 				  AND m.role = 'user'
+				  AND COALESCE(m.source_subtype, '') <> 'tool_result'
 				  AND m.is_system = 0
 				  AND TRIM(m.content) <> ''
 				ORDER BY m.ordinal
@@ -97,11 +121,13 @@ func auditAutomatedMatchingHash(
 			"querying bounded automated audit candidates: %w", err,
 		)
 	}
+	defer rows.Close()
 
 	var unresolved []string
 	for rows.Next() {
 		var (
 			id               string
+			sessionKind      string
 			userMessageCount int
 			rowAutomated     bool
 			firstUser        boundedAutomationText
@@ -109,6 +135,7 @@ func auditAutomatedMatchingHash(
 		)
 		if err := rows.Scan(
 			&id,
+			&sessionKind,
 			&userMessageCount,
 			&rowAutomated,
 			&firstUser.prefix,
@@ -121,6 +148,12 @@ func auditAutomatedMatchingHash(
 				"scanning bounded automated audit candidate: %w", err,
 			)
 		}
+		if IsAutomatedSessionMetadata(sessionKind) {
+			setIDs, clearIDs = AppendAutomationFlagChange(
+				setIDs, clearIDs, id, rowAutomated, true,
+			)
+			continue
+		}
 
 		want, conclusive := patterns.verdictFromEvidence(
 			userMessageCount, firstUser.evidence(), firstMessage.evidence(),
@@ -129,7 +162,7 @@ func auditAutomatedMatchingHash(
 			unresolved = append(unresolved, id)
 			continue
 		}
-		setIDs, clearIDs = appendAutomationFlagChange(
+		setIDs, clearIDs = AppendAutomationFlagChange(
 			setIDs, clearIDs, id, rowAutomated, want,
 		)
 	}
@@ -142,10 +175,11 @@ func auditAutomatedMatchingHash(
 	}
 
 	err = queryChunked(unresolved, func(ids []string) error {
-		placeholders, args := inPlaceholders(ids)
-		fullRows, err := w.Query(
+		placeholders, args := InPlaceholders(ids)
+		fullRows, err := w.Query(ctx,
 			`SELECT
 				s.id,
+				s.session_kind,
 				s.first_message,
 				s.user_message_count,
 				s.is_automated,
@@ -154,6 +188,7 @@ func auditAutomatedMatchingHash(
 					FROM messages m
 					WHERE m.session_id = s.id
 					  AND m.role = 'user'
+					  AND COALESCE(m.source_subtype, '') <> 'tool_result'
 					  AND m.is_system = 0
 					  AND TRIM(m.content) <> ''
 					ORDER BY m.ordinal
@@ -168,6 +203,7 @@ func auditAutomatedMatchingHash(
 				"querying unresolved automated audit candidates: %w", err,
 			)
 		}
+		defer fullRows.Close()
 		batchSet, batchClear, scanErr := scanFullAutomationCandidates(
 			fullRows, patterns,
 		)
@@ -194,22 +230,25 @@ func scanFullAutomationCandidates(
 	for rows.Next() {
 		var (
 			id           string
+			sessionKind  string
 			firstMessage sql.NullString
 			firstUser    sql.NullString
 			userCount    int
 			rowAutomated bool
 		)
 		if err := rows.Scan(
-			&id, &firstMessage, &userCount, &rowAutomated, &firstUser,
+			&id, &sessionKind,
+			&firstMessage, &userCount, &rowAutomated, &firstUser,
 		); err != nil {
 			return nil, nil, fmt.Errorf(
 				"scanning automated audit candidate: %w", err,
 			)
 		}
-		want := patterns.matchesTextCandidates(
-			userCount, firstUser, firstMessage,
-		)
-		setIDs, clearIDs = appendAutomationFlagChange(
+		want := IsAutomatedSessionMetadata(sessionKind) ||
+			patterns.matchesTextCandidates(
+				userCount, firstUser, firstMessage,
+			)
+		setIDs, clearIDs = AppendAutomationFlagChange(
 			setIDs, clearIDs, id, rowAutomated, want,
 		)
 	}
@@ -219,7 +258,9 @@ func scanFullAutomationCandidates(
 	return setIDs, clearIDs, nil
 }
 
-func appendAutomationFlagChange(
+// AppendAutomationFlagChange adds id to setIDs or clearIDs when the stored
+// automated flag differs from want.
+func AppendAutomationFlagChange(
 	setIDs, clearIDs []string,
 	id string,
 	rowAutomated, want bool,

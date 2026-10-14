@@ -1,8 +1,7 @@
 package db
 
 import (
-	"context"
-	"encoding/json"
+	"encoding/json/jsontext"
 	"strings"
 	"sync"
 	"testing"
@@ -35,7 +34,7 @@ func TestFlattenTrajectoryText(t *testing.T) {
 	}
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
-			got, err := flattenTrajectoryText(json.RawMessage(tt.in))
+			got, err := flattenTrajectoryText(jsontext.Value(tt.in))
 			require.NoError(t, err)
 			assert.Equal(t, tt.want, got)
 		})
@@ -43,12 +42,12 @@ func TestFlattenTrajectoryText(t *testing.T) {
 }
 
 func TestFlattenTrajectoryTextInvalidJSON(t *testing.T) {
-	_, err := flattenTrajectoryText(json.RawMessage(`{not json`))
+	_, err := flattenTrajectoryText(jsontext.Value(`{not json`))
 	require.Error(t, err)
 }
 
 func TestFlattenTrajectoryTextDeterministic(t *testing.T) {
-	in := json.RawMessage(`{"c":"3","a":"1","b":"2"}`)
+	in := jsontext.Value(`{"c":"3","a":"1","b":"2"}`)
 	first, err := flattenTrajectoryText(in)
 	require.NoError(t, err)
 	assert.Equal(t, "1\n2\n3", first)
@@ -103,14 +102,14 @@ func TestEvalIngestIDDeterministicAndCollisionSafe(t *testing.T) {
 
 func TestIngestEvalTrajectory(t *testing.T) {
 	d := testDB(t)
-	ctx := context.Background()
+	ctx := t.Context()
 
 	// Flattened text spans three 2000-rune chunks (4050 runes total).
 	long := strings.Repeat("x", defaultEvalChunkChars*2+50)
 	in := EvalTrajectoryIngest{
 		RunID:           "run1",
 		TrajectoryID:    "traj1",
-		Trajectory:      json.RawMessage(`{"text":"` + long + `"}`),
+		Trajectory:      jsontext.Value(`{"text":"` + long + `"}`),
 		ExtractorMethod: "eval-harness-raw-trajectory",
 		SourceVersion:   "test-harness-v1",
 	}
@@ -138,7 +137,7 @@ func TestIngestEvalTrajectory(t *testing.T) {
 	assert.True(t, m0.Transferable)
 	assert.True(t, m0.ProvenanceOK)
 	assert.Nil(t, m0.Confidence, "raw chunks carry no confidence")
-	assert.Equal(t, defaultEvalChunkChars, len([]rune(m0.Body)))
+	assert.Len(t, []rune(m0.Body), defaultEvalChunkChars)
 	assert.Equal(t, defaultEvalTrajectoryProject, m0.Project)
 	assert.Equal(t, defaultEvalTrajectoryAgent, m0.Agent)
 
@@ -157,7 +156,7 @@ func TestIngestEvalTrajectoryConcurrentReingestIsIdempotent(t *testing.T) {
 	in := EvalTrajectoryIngest{
 		RunID:           "run-concurrent",
 		TrajectoryID:    "traj-concurrent",
-		Trajectory:      json.RawMessage(`{"text":"` + strings.Repeat("x", defaultEvalChunkChars*2+50) + `"}`),
+		Trajectory:      jsontext.Value(`{"text":"` + strings.Repeat("x", defaultEvalChunkChars*2+50) + `"}`),
 		ExtractorMethod: "eval-harness-raw-trajectory",
 		SourceVersion:   "test-harness-v1",
 	}
@@ -174,7 +173,7 @@ func TestIngestEvalTrajectoryConcurrentReingestIsIdempotent(t *testing.T) {
 		go func() {
 			ready.Done()
 			<-start
-			result, err := d.IngestEvalTrajectory(context.Background(), in)
+			result, err := d.IngestEvalTrajectory(t.Context(), in)
 			outcomes <- outcome{result: result, err: err}
 		}()
 	}
@@ -188,7 +187,7 @@ func TestIngestEvalTrajectoryConcurrentReingestIsIdempotent(t *testing.T) {
 		totalIndexed += outcome.result.EntriesIndexed
 	}
 	assert.Equal(t, 3, totalIndexed)
-	entries, err := d.ListRecallEntries(context.Background(), RecallQuery{
+	entries, err := d.ListRecallEntries(t.Context(), RecallQuery{
 		SourceRunID: in.RunID,
 		Status:      corerecall.StatusAccepted,
 		Limit:       10,
@@ -199,11 +198,11 @@ func TestIngestEvalTrajectoryConcurrentReingestIsIdempotent(t *testing.T) {
 
 func TestIngestEvalTrajectoryVersionsIdentityByExtractorMetadataAndContent(t *testing.T) {
 	d := testDB(t)
-	ctx := context.Background()
+	ctx := t.Context()
 	base := EvalTrajectoryIngest{
 		RunID:           "run1",
 		TrajectoryID:    "traj1",
-		Trajectory:      json.RawMessage(`{"text":"first trajectory"}`),
+		Trajectory:      jsontext.Value(`{"text":"first trajectory"}`),
 		ExtractorMethod: "extractor-v1",
 		SourceVersion:   "harness-v1",
 	}
@@ -225,7 +224,7 @@ func TestIngestEvalTrajectoryVersionsIdentityByExtractorMetadataAndContent(t *te
 	assert.Equal(t, 1, third.EntriesIndexed)
 
 	changedContent := base
-	changedContent.Trajectory = json.RawMessage(`{"text":"revised trajectory"}`)
+	changedContent.Trajectory = jsontext.Value(`{"text":"revised trajectory"}`)
 	fourth, err := d.IngestEvalTrajectory(ctx, changedContent)
 	require.NoError(t, err)
 	assert.Equal(t, 1, fourth.EntriesIndexed)
@@ -247,10 +246,10 @@ func TestIngestEvalTrajectoryVersionsIdentityByExtractorMetadataAndContent(t *te
 
 func TestIngestEvalTrajectoryNoStringsIndexesNothing(t *testing.T) {
 	d := testDB(t)
-	res, err := d.IngestEvalTrajectory(context.Background(), EvalTrajectoryIngest{
+	res, err := d.IngestEvalTrajectory(t.Context(), EvalTrajectoryIngest{
 		RunID:           "run1",
 		TrajectoryID:    "traj-empty",
-		Trajectory:      json.RawMessage(`{"n":1,"ok":true}`),
+		Trajectory:      jsontext.Value(`{"n":1,"ok":true}`),
 		ExtractorMethod: "eval-harness-raw-trajectory",
 		SourceVersion:   "test-harness-v1",
 	})
@@ -260,9 +259,9 @@ func TestIngestEvalTrajectoryNoStringsIndexesNothing(t *testing.T) {
 
 func TestIngestEvalTrajectoryRequiresIDs(t *testing.T) {
 	d := testDB(t)
-	_, err := d.IngestEvalTrajectory(context.Background(), EvalTrajectoryIngest{
+	_, err := d.IngestEvalTrajectory(t.Context(), EvalTrajectoryIngest{
 		TrajectoryID:    "traj1",
-		Trajectory:      json.RawMessage(`{"text":"hi"}`),
+		Trajectory:      jsontext.Value(`{"text":"hi"}`),
 		ExtractorMethod: "eval-harness-raw-trajectory",
 		SourceVersion:   "test-harness-v1",
 	})
@@ -271,11 +270,11 @@ func TestIngestEvalTrajectoryRequiresIDs(t *testing.T) {
 
 func TestIngestEvalTrajectoryRequiresExtractorMethodAndSourceVersion(t *testing.T) {
 	d := testDB(t)
-	ctx := context.Background()
+	ctx := t.Context()
 	base := EvalTrajectoryIngest{
 		RunID:        "run1",
 		TrajectoryID: "traj1",
-		Trajectory:   json.RawMessage(`{"text":"hi"}`),
+		Trajectory:   jsontext.Value(`{"text":"hi"}`),
 	}
 
 	missingExtractor := base

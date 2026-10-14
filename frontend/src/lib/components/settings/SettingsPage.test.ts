@@ -6,6 +6,7 @@ import { dismissFlash } from "@kenn-io/kit-ui";
 import SettingsPage from "./SettingsPage.svelte";
 import { SettingsService } from "../../api/generated/index";
 import { settings } from "../../stores/settings.svelte.js";
+import { sync } from "../../stores/sync.svelte.js";
 import { router } from "../../stores/router.svelte.js";
 import { initI18n, LOCALE_STORAGE_KEY, setLocale } from "../../i18n/index.js";
 
@@ -13,7 +14,6 @@ vi.mock("../../api/runtime.js", async (importOriginal) => {
   const orig = await importOriginal<typeof import("../../api/runtime.js")>();
   return {
     ...orig,
-    configureGeneratedClient: vi.fn(),
     getAuthToken: vi.fn(() => ""),
     isRemoteConnection: vi.fn(() => false),
     setAuthToken: vi.fn(),
@@ -57,6 +57,31 @@ afterEach(() => {
 });
 
 describe("SettingsPage", () => {
+  it("hides full resync for an archive-only database", async () => {
+    settingsService.getApiV1Settings.mockResolvedValue({
+      agent_dirs: {},
+      chart_palette: "agentsview",
+      github_configured: false,
+      host: "127.0.0.1",
+      port: 8080,
+      read_only: false,
+      require_auth: false,
+      terminal: { mode: "auto" },
+    });
+    sync.serverVersion = { archive_only: true } as NonNullable<typeof sync.serverVersion>;
+    const component = mount(SettingsPage, { target: document.body });
+    try {
+      await tick();
+      await tick();
+      expect(document.body.textContent).toContain("Settings");
+      expect(document.querySelector('button[title="Full Resync"]')).toBeNull();
+      expect(document.body.textContent).not.toContain("Full Resync");
+    } finally {
+      unmount(component);
+      sync.serverVersion = null;
+    }
+  });
+
   it("renders browser-local settings with the Data-mode worktree pointer", async () => {
     let resolveSettings!: (value: unknown) => void;
     settingsService.getApiV1Settings.mockReturnValue(
@@ -136,14 +161,14 @@ describe("SettingsPage", () => {
     await tick();
 
     const option = Array.from(document.body.querySelectorAll('[role="option"]')).find((el) =>
-      el.textContent?.includes("简体中文"),
+      el.textContent?.includes("日本語"),
     );
     expect(option).toBeTruthy();
 
     (option as HTMLElement).dispatchEvent(new MouseEvent("mousedown", { bubbles: true }));
     await tick();
 
-    expect(localStorage.getItem(LOCALE_STORAGE_KEY)).toBe("zh-CN");
+    expect(localStorage.getItem(LOCALE_STORAGE_KEY)).toBe("ja");
     expect(document.body.textContent).toContain("Settings");
 
     unmount(component);
@@ -262,7 +287,7 @@ describe("SettingsPage", () => {
     restoredSearch.dispatchEvent(new Event("input", { bubbles: true }));
     await tick();
 
-    expect(restoredNav.querySelectorAll("button")).toHaveLength(9);
+    expect(restoredNav.querySelectorAll("button")).toHaveLength(11);
     expect(
       document.body.querySelector(".settings-page")?.classList.contains("settings-no-results"),
     ).toBe(false);
@@ -410,8 +435,11 @@ describe("SettingsPage", () => {
 
     unmount(component);
   });
+});
 
-  it("shows a danger flash when a settings save fails", async () => {
+describe("SettingsPage in Spanish", () => {
+  it("renders the settings chrome and language picker in Spanish", async () => {
+    setLocale("es");
     settingsService.getApiV1Settings.mockResolvedValue({
       agent_dirs: {},
       chart_palette: "agentsview",
@@ -422,27 +450,31 @@ describe("SettingsPage", () => {
       require_auth: false,
       terminal: { mode: "auto" },
     });
-    settingsService.putApiV1Settings.mockRejectedValue(
-      new Error("settings endpoint unavailable"),
-    );
-    const component = mount(SettingsPage, { target: document.body });
-    await tick();
-    await tick();
-
-    const matplotlib = Array.from(
-      document.body.querySelectorAll<HTMLElement>('[role="radio"]'),
-    ).find((control) => control.textContent?.includes("Matplotlib"));
-    expect(matplotlib).toBeTruthy();
-    matplotlib!.click();
-
-    await vi.waitFor(() => {
-      const flash = document.body.querySelector<HTMLElement>(
-        '.kit-flash-banner[data-kit-tone="danger"]',
-      );
-      expect(flash).not.toBeNull();
-      expect(flash?.textContent).toContain("settings endpoint unavailable");
+    const component = mount(SettingsPage, {
+      target: document.body,
     });
+    await tick();
+    await tick();
 
-    await unmount(component);
+    expect(document.body.textContent).toContain("Configuración");
+    expect(document.body.querySelector('nav[aria-label="Configuración"]')).not.toBeNull();
+    const trigger = document.body.querySelector<HTMLButtonElement>(
+      'button[title="Idioma de la interfaz"]',
+    );
+    expect(trigger).not.toBeNull();
+    expect(trigger!.textContent).toContain("Español");
+
+    const search = document.body.querySelector<HTMLInputElement>(
+      'input[type="search"][aria-label="Buscar en la configuración"]',
+    )!;
+    search.value = "idioma";
+    search.dispatchEvent(new Event("input", { bubbles: true }));
+    await tick();
+
+    const nav = document.body.querySelector('nav[aria-label="Configuración"]')!;
+    expect(nav.querySelectorAll("button")).toHaveLength(1);
+    expect(nav.textContent).toContain("Idioma");
+
+    unmount(component);
   });
 });

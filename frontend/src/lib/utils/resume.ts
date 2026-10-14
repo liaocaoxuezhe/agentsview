@@ -1,25 +1,27 @@
+// Codex stores a thread/revert page as <thread>_<rollout>; its CLI and app open the thread.
+const CODEX_REVERT_PAGE_ID =
+  /^([0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12})_[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i;
+
+/** Map a stored Codex session key to the thread id the Codex CLI and app accept. */
+export function codexThreadId(id: string): string {
+  return CODEX_REVERT_PAGE_ID.exec(id)?.[1] ?? id;
+}
+
 /** Agent types that support CLI session resumption. */
-const RESUME_AGENTS: Record<
-  string,
-  (sessionId: string) => string
-> = Object.create(null);
-RESUME_AGENTS["claude"] = (id) =>
-  `claude --resume ${shellQuote(id)}`;
-RESUME_AGENTS["codex"] = (id) =>
-  `codex resume ${shellQuote(id)}`;
+const RESUME_AGENTS: Record<string, (sessionId: string) => string> = Object.create(null);
+RESUME_AGENTS["claude"] = (id) => `claude --resume ${shellQuote(id)}`;
+RESUME_AGENTS["codex"] = (id) => `codex resume ${shellQuote(codexThreadId(id))}`;
 // TraeX ships the traex, traecli, and trae-cli aliases; use the shortest.
-RESUME_AGENTS["traex"] = (id) =>
-  `traex resume ${shellQuote(id)}`;
-RESUME_AGENTS["copilot"] = (id) =>
-  `copilot --resume=${shellQuote(id)}`;
-RESUME_AGENTS["cursor"] = (id) =>
-  `cursor agent --resume ${shellQuote(id)}`;
-RESUME_AGENTS["gemini"] = (id) =>
-  `gemini --resume ${shellQuote(id)}`;
-RESUME_AGENTS["opencode"] = (id) =>
-  `opencode --session ${shellQuote(id)}`;
-RESUME_AGENTS["amp"] = (id) =>
-  `amp --resume ${shellQuote(id)}`;
+RESUME_AGENTS["traex"] = (id) => `traex resume ${shellQuote(codexThreadId(id))}`;
+// The Augure Code agent's command is the vendor's own `augure` CLI.
+RESUME_AGENTS["augure-code"] = (id) => `augure resume ${shellQuote(codexThreadId(id))}`;
+RESUME_AGENTS["copilot"] = (id) => `copilot --resume=${shellQuote(id)}`;
+RESUME_AGENTS["cursor"] = (id) => `cursor agent --resume ${shellQuote(id)}`;
+RESUME_AGENTS["gemini"] = (id) => `gemini --resume ${shellQuote(id)}`;
+RESUME_AGENTS["opencode"] = (id) => `opencode --session ${shellQuote(id)}`;
+RESUME_AGENTS["amp"] = (id) => `amp --resume ${shellQuote(id)}`;
+RESUME_AGENTS["kiro"] = (id) => `kiro-cli chat --resume-id ${shellQuote(id)}`;
+RESUME_AGENTS["pi"] = (id) => `pi --session ${shellQuote(id)}`;
 
 /**
  * Agents whose resume commands require server-resolved parameters
@@ -27,7 +29,7 @@ RESUME_AGENTS["amp"] = (id) =>
  * buildResumeCommand returns null for these agents so callers
  * don't produce incomplete fallback commands.
  */
-const SERVER_ONLY_RESUME = new Set(["cursor"]);
+const SERVER_ONLY_RESUME = new Set(["cursor", "pi"]);
 
 /** Flags available for Claude Code resume. */
 export interface ClaudeResumeFlags {
@@ -71,6 +73,10 @@ export function stripIdPrefix(id: string, agent?: string): string {
   return id;
 }
 
+function stripHostPrefix(id: string): string {
+  return id.slice(id.indexOf("~") + 1);
+}
+
 /**
  * Returns true if the given agent supports CLI session resumption.
  */
@@ -95,18 +101,20 @@ export function buildResumeCommand(
   const builder = RESUME_AGENTS[agent];
   if (!builder) return null;
 
-  const rawId = stripIdPrefix(sessionId, agent);
+  const rawId = stripIdPrefix(stripHostPrefix(sessionId), agent);
+  // The server owns collision IDs and provider capabilities. Callers ask it
+  // first; don't guess a fallback for any ID that might need its resolution.
+  if (rawId.includes("_alt-")) return null;
   let cmd = builder(rawId);
 
   if (flags?.model) {
     if (agent === "claude") cmd += ` --model ${shellQuote(flags.model)}`;
-    if (agent === "codex" || agent === "traex")
+    if (agent === "codex" || agent === "traex" || agent === "augure-code")
       cmd += ` -m ${shellQuote(flags.model)}`;
   }
 
   if (agent === "claude" && flags) {
-    if (flags.skipPermissions)
-      cmd += " --dangerously-skip-permissions";
+    if (flags.skipPermissions) cmd += " --dangerously-skip-permissions";
     if (flags.forkSession) cmd += " --fork-session";
     if (flags.print) cmd += " --print";
   }

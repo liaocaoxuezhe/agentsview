@@ -1,40 +1,36 @@
+import { m } from "../i18n/index.js";
+import { queryStepFrom, type QueryStep } from "../utils/refresh.js";
+import { LiveQuery } from "../utils/liveQuery.svelte.js";
+import type { AutomatedScope } from "../api/types.js";
 import type {
-  AnalyticsSummary,
-  ActivityResponse,
-  HeatmapResponse,
-  ProjectsAnalyticsResponse,
-  HourOfWeekResponse,
-  SessionShapeResponse,
-  VelocityResponse,
-  ToolsAnalyticsResponse,
-  SkillsAnalyticsResponse,
-  TopSessionsResponse,
-  SignalsAnalyticsResponse,
-  AutomatedScope,
-} from "../api/types.js";
-import { AnalyticsService } from "../api/generated/index";
+  DbAnalyticsSummary as AnalyticsSummary,
+  DbActivityResponse as ActivityResponse,
+  DbProjectsAnalyticsResponse as ProjectsAnalyticsResponse,
+  DbHourOfWeekResponse as HourOfWeekResponse,
+  DbSessionShapeResponse as SessionShapeResponse,
+  DbVelocityResponse as VelocityResponse,
+  DbToolsAnalyticsResponse as ToolsAnalyticsResponse,
+  DbSkillsAnalyticsResponse as SkillsAnalyticsResponse,
+  DbSignalsAnalyticsResponse as SignalsAnalyticsResponse,
+} from "../api/generated/index.js";
 import {
-  callGenerated,
-  isAbortError,
-} from "../api/runtime.js";
+  AnalyticsService,
+  type DbHeatmapResponse,
+  type DbTopSessionsResponse,
+} from "../api/generated/index";
+import { isAbortError, responseTimingOf } from "../api/runtime.js";
 import { sessions } from "./sessions.svelte.js";
 import { perf, type PerfEntryStatus } from "./perf.svelte.js";
 import { rollingRange, today } from "../utils/dates.js";
 
 export const ANALYTICS_DEFAULT_WINDOW_DAYS = 365;
 
-type AnalyticsParams = Parameters<
-  typeof AnalyticsService.getApiV1AnalyticsSummary
->[0];
-type ActivityParams = Parameters<
-  typeof AnalyticsService.getApiV1AnalyticsActivity
->[0];
-type HeatmapParams = Parameters<
-  typeof AnalyticsService.getApiV1AnalyticsHeatmap
->[0];
-type TopSessionsParams = Parameters<
-  typeof AnalyticsService.getApiV1AnalyticsTopSessions
->[0];
+type AnalyticsParams = NonNullable<Parameters<typeof AnalyticsService.getApiV1AnalyticsSummary>[0]>;
+type ActivityParams = NonNullable<Parameters<typeof AnalyticsService.getApiV1AnalyticsActivity>[0]>;
+type HeatmapParams = NonNullable<Parameters<typeof AnalyticsService.getApiV1AnalyticsHeatmap>[0]>;
+type TopSessionsParams = NonNullable<
+  Parameters<typeof AnalyticsService.getApiV1AnalyticsTopSessions>[0]
+>;
 export type Granularity = NonNullable<ActivityParams["granularity"]>;
 export type HeatmapMetric = NonNullable<HeatmapParams["metric"]>;
 export type TopSessionsMetric = NonNullable<TopSessionsParams["metric"]>;
@@ -52,11 +48,23 @@ type Panel =
   | "topSessions"
   | "signals";
 type FetchResult = "ok" | "error" | "aborted";
+// Execution order of a full refresh; the step breakdown follows it.
+const PANEL_ORDER = [
+  "summary",
+  "activity",
+  "heatmap",
+  "projects",
+  "hourOfWeek",
+  "sessionShape",
+  "velocity",
+  "tools",
+  "skills",
+  "topSessions",
+  "signals",
+] as const satisfies readonly Panel[];
 
 class AnalyticsStore {
-  from: string = $state(
-    rollingRange(ANALYTICS_DEFAULT_WINDOW_DAYS).from,
-  );
+  from: string = $state(rollingRange(ANALYTICS_DEFAULT_WINDOW_DAYS).from);
   to: string = $state(today());
   isPinned: boolean = $state(false);
   windowDays: number = $state(ANALYTICS_DEFAULT_WINDOW_DAYS);
@@ -64,6 +72,7 @@ class AnalyticsStore {
   skillsGranularity: Granularity = $state("week");
   metric: HeatmapMetric = $state("messages");
   selectedDate: string | null = $state(null);
+  selectedActivityRange: { from: string; to: string } | null = $state(null);
   project: string = $state("");
   machine: string = $state("");
   agent: string = $state("");
@@ -79,17 +88,36 @@ class AnalyticsStore {
 
   summary = $state<AnalyticsSummary | null>(null);
   activity = $state<ActivityResponse | null>(null);
-  heatmap = $state<HeatmapResponse | null>(null);
+  heatmap = $state<DbHeatmapResponse | null>(null);
   projects = $state<ProjectsAnalyticsResponse | null>(null);
   hourOfWeek = $state<HourOfWeekResponse | null>(null);
   sessionShape = $state<SessionShapeResponse | null>(null);
   velocity = $state<VelocityResponse | null>(null);
   tools = $state<ToolsAnalyticsResponse | null>(null);
+  toolsFilterParams = $state<AnalyticsParams | null>(null);
   skills = $state<SkillsAnalyticsResponse | null>(null);
-  topSessions = $state<TopSessionsResponse | null>(null);
+  topSessions = $state<DbTopSessionsResponse | null>(null);
   signals = $state<SignalsAnalyticsResponse | null>(null);
   topMetric: TopSessionsMetric = $state("messages");
   lastUpdatedAt: number | null = $state(null);
+  qualityLastUpdatedAt: number | null = $state(null);
+  // Wall-clock ms of the most recent refresh, request start to data applied,
+  // shown next to each page's refresh label. null until the first load.
+  lastQueryDurationMs: number | null = $state(null);
+  qualityLastQueryDurationMs: number | null = $state(null);
+  // Per-panel timings behind the durations above, in PANEL_ORDER.
+  lastQuerySteps: QueryStep[] = $state([]);
+  qualityLastQuerySteps: QueryStep[] = $state([]);
+  // Latest successful timing per panel, collected while a refresh runs and
+  // snapshotted into lastQuerySteps when the refresh completes. Offsets are
+  // relative to refreshStartedAt.
+  private stepTimings = new Map<Panel, QueryStep>();
+  private refreshStartedAt = 0;
+  // The refresh each page is running now, drawn live by its refresh
+  // control. Panel fetches report into whichever one began last.
+  readonly liveQuery = new LiveQuery();
+  readonly qualityLiveQuery = new LiveQuery();
+  private currentLiveQuery: LiveQuery = this.liveQuery;
   hasNewData: boolean = $state(false);
 
   loading = $state({
@@ -148,7 +176,9 @@ class AnalyticsStore {
     signals: 0,
   };
   private fetchAllVersion = 0;
+  private activityScope: string | null = null;
   private abortControllers: Partial<Record<Panel, AbortController>> = {};
+  private fetchStartHandler: (() => void) | undefined;
   // Scope key of the cached `signals`: the Analytics-only filters (model plus
   // the heatmap drill-down) the cached data was fetched with. Used to drop the
   // cache when a fetch crosses the Analytics / Quality boundary, where those
@@ -162,6 +192,7 @@ class AnalyticsStore {
   get hasActiveFilters(): boolean {
     return (
       this.selectedDate !== null ||
+      this.selectedActivityRange !== null ||
       this.project !== "" ||
       this.machine !== "" ||
       this.agent !== "" ||
@@ -185,6 +216,10 @@ class AnalyticsStore {
     this.hasNewData = true;
   }
 
+  setFetchStartHandler(handler: (() => void) | undefined): void {
+    this.fetchStartHandler = handler;
+  }
+
   private get effectiveAutomatedScope(): AutomatedScope {
     if (!this.includeAutomated) return "human";
     if (this.automatedScope === "human") return "all";
@@ -192,7 +227,9 @@ class AnalyticsStore {
   }
 
   clearAllFilters() {
+    const hadActivityRange = this.selectedActivityRange !== null;
     this.selectedDate = null;
+    this.selectedActivityRange = null;
     this.project = "";
     this.machine = "";
     this.agent = "";
@@ -213,23 +250,29 @@ class AnalyticsStore {
     sessions.filters.includeOneShot = true;
     sessions.filters.includeAutomated = false;
     sessions.filters.recentlyActive = false;
+    if (hadActivityRange) {
+      sessions.applyPanelDateFilters(
+        { date_from: this.from, date_to: this.to },
+        this.isPinned ? null : this.windowDays,
+      );
+    }
     sessions.activeSessionId = null;
     sessions.invalidateFilterCaches();
-    sessions.load();
-    this.fetchAll();
+    void sessions.load();
+    void this.fetchAll();
   }
 
   clearAgent() {
     this.agent = "";
     sessions.filters.agent = "";
     sessions.activeSessionId = null;
-    sessions.load();
-    this.fetchAll();
+    void sessions.load();
+    void this.fetchAll();
   }
 
   clearModel() {
     this.model = "";
-    this.fetchAll();
+    void this.fetchAll();
   }
 
   toggleAgent(agent: string) {
@@ -243,29 +286,27 @@ class AnalyticsStore {
     this.agent = current.join(",");
     sessions.filters.agent = this.agent;
     sessions.activeSessionId = null;
-    sessions.load();
-    this.fetchAll();
+    void sessions.load();
+    void this.fetchAll();
   }
 
   toggleModel(model: string) {
-    const current = new Set(
-      this.model.split(",").filter((value) => value.length > 0),
-    );
+    const current = new Set(this.model.split(",").filter((value) => value.length > 0));
     if (current.has(model)) {
       current.delete(model);
     } else {
       current.add(model);
     }
     this.model = [...current].join(",");
-    this.fetchAll();
+    void this.fetchAll();
   }
 
   clearMinUserMessages() {
     this.minUserMessages = 0;
     sessions.filters.minUserMessages = 0;
     sessions.activeSessionId = null;
-    sessions.load();
-    this.fetchAll();
+    void sessions.load();
+    void this.fetchAll();
   }
 
   clearIncludeOneShot() {
@@ -273,8 +314,8 @@ class AnalyticsStore {
     sessions.filters.includeOneShot = true;
     sessions.activeSessionId = null;
     sessions.invalidateFilterCaches();
-    sessions.load();
-    this.fetchAll();
+    void sessions.load();
+    void this.fetchAll();
   }
 
   clearIncludeAutomated() {
@@ -283,50 +324,51 @@ class AnalyticsStore {
     sessions.filters.includeAutomated = false;
     sessions.activeSessionId = null;
     sessions.invalidateFilterCaches();
-    sessions.load();
-    this.fetchAll();
+    void sessions.load();
+    void this.fetchAll();
   }
 
   setAutomatedScope(scope: AutomatedScope) {
     this.automatedScope = scope;
     this.includeAutomated = scope !== "human";
-    this.fetchSignalsForQuality();
+    void this.fetchSignalsForQuality();
   }
 
   clearRecentlyActive() {
     this.recentlyActive = false;
     sessions.filters.recentlyActive = false;
     sessions.activeSessionId = null;
-    sessions.load();
-    this.fetchAll();
+    void sessions.load();
+    void this.fetchAll();
   }
 
   clearDate() {
     this.selectedDate = null;
-    this.fetchSummary();
-    this.fetchProjects();
-    this.fetchSessionShape();
-    this.fetchVelocity();
-    this.fetchTools();
-    this.fetchSkills();
-    this.fetchTopSessions();
-    this.fetchSignals();
+    this.clearDrilldownData({ preserveHourOfWeek: true });
+    void this.fetchSummary();
+    void this.fetchProjects();
+    void this.fetchSessionShape();
+    void this.fetchVelocity();
+    void this.fetchTools();
+    void this.fetchSkills();
+    void this.fetchTopSessions();
+    void this.fetchSignals();
   }
 
   clearProject() {
     this.project = "";
     sessions.filters.project = "";
     sessions.activeSessionId = null;
-    sessions.load();
-    this.fetchAll();
+    void sessions.load();
+    void this.fetchAll();
   }
 
   clearMachine() {
     this.machine = "";
     sessions.filters.machine = "";
     sessions.activeSessionId = null;
-    sessions.load();
-    this.fetchAll();
+    void sessions.load();
+    void this.fetchAll();
   }
 
   removeMachine(machine: string) {
@@ -334,45 +376,43 @@ class AnalyticsStore {
     this.machine = current.filter((m) => m !== machine).join(",");
     sessions.filters.machine = this.machine;
     sessions.activeSessionId = null;
-    sessions.load();
-    this.fetchAll();
+    void sessions.load();
+    void this.fetchAll();
   }
 
   clearTermination() {
     this.termination = "";
     sessions.filters.termination = "";
     sessions.activeSessionId = null;
-    sessions.load();
-    this.fetchAll();
+    void sessions.load();
+    void this.fetchAll();
   }
 
   toggleTerminationStatus(status: string) {
-    const set = new Set(
-      this.termination.split(",").filter((s) => s.length > 0),
-    );
+    const set = new Set(this.termination.split(",").filter((s) => s.length > 0));
     if (set.has(status)) set.delete(status);
     else set.add(status);
     const next = [...set].join(",");
     this.termination = next;
     sessions.filters.termination = next;
     sessions.activeSessionId = null;
-    sessions.load();
-    this.fetchAll();
+    void sessions.load();
+    void this.fetchAll();
   }
 
   clearTimeFilter() {
     this.selectedDow = null;
     this.selectedHour = null;
-    this.fetchSummary();
-    this.fetchActivity();
-    this.fetchHeatmap();
-    this.fetchProjects();
-    this.fetchSessionShape();
-    this.fetchVelocity();
-    this.fetchTools();
-    this.fetchSkills();
-    this.fetchTopSessions();
-    this.fetchSignals();
+    void this.fetchSummary();
+    void this.fetchActivity();
+    void this.fetchHeatmap();
+    void this.fetchProjects();
+    void this.fetchSessionShape();
+    void this.fetchVelocity();
+    void this.fetchTools();
+    void this.fetchSkills();
+    void this.fetchTopSessions();
+    void this.fetchSignals();
   }
 
   private baseParams(
@@ -398,16 +438,14 @@ class AnalyticsStore {
     if (includeModel && this.model) p.model = this.model;
     if (this.termination) p.termination = this.termination;
     if (this.minUserMessages > 0) {
-      p.minUserMessages = this.minUserMessages;
+      p.min_user_messages = this.minUserMessages;
     }
     if (this.includeOneShot) {
-      p.includeOneShot = true;
+      p.include_one_shot = true;
     }
-    p.automatedScope = this.effectiveAutomatedScope;
+    p.automated_scope = this.effectiveAutomatedScope;
     if (this.recentlyActive) {
-      p.activeSince = new Date(
-        Date.now() - 24 * 60 * 60 * 1000,
-      ).toISOString();
+      p.active_since = new Date(Date.now() - 24 * 60 * 60 * 1000).toISOString();
     }
     if (includeTime) {
       if (this.selectedDow !== null) p.dow = this.selectedDow;
@@ -418,52 +456,22 @@ class AnalyticsStore {
     return p;
   }
 
-  private filterParams(
+  filterParams(
     opts: {
       includeProject?: boolean;
       includeTime?: boolean;
       includeModel?: boolean;
     } = {},
   ): AnalyticsParams {
-    const includeProject = opts.includeProject ?? true;
-    const includeTime = opts.includeTime ?? true;
-    const includeModel = opts.includeModel ?? true;
+    const p = this.baseParams(opts);
     if (this.selectedDate) {
-      const p: AnalyticsParams = {
-        from: this.selectedDate,
-        to: this.selectedDate,
-        timezone: this.timezone,
-      };
-      if (includeProject && this.project) {
-        p.project = this.project;
-      }
-      if (this.machine) p.machine = this.machine;
-      if (this.agent) p.agent = this.agent;
-      if (includeModel && this.model) p.model = this.model;
-      if (this.termination) p.termination = this.termination;
-      if (this.minUserMessages > 0) {
-        p.minUserMessages = this.minUserMessages;
-      }
-      if (this.includeOneShot) {
-        p.includeOneShot = true;
-      }
-      p.automatedScope = this.effectiveAutomatedScope;
-      if (this.recentlyActive) {
-        p.activeSince = new Date(
-          Date.now() - 24 * 60 * 60 * 1000,
-        ).toISOString();
-      }
-      if (includeTime) {
-        if (this.selectedDow !== null) {
-          p.dow = this.selectedDow;
-        }
-        if (this.selectedHour !== null) {
-          p.hour = this.selectedHour;
-        }
-      }
-      return p;
+      p.from = this.selectedDate;
+      p.to = this.selectedDate;
+    } else if (this.selectedActivityRange) {
+      p.from = this.selectedActivityRange.from;
+      p.to = this.selectedActivityRange.to;
     }
-    return this.baseParams({ includeProject, includeTime, includeModel });
+    return p;
   }
 
   signalEvidenceParams(): AnalyticsParams {
@@ -475,7 +483,7 @@ class AnalyticsStore {
 
   private async executeFetch<T>(
     panel: Panel,
-    fetchRequest: () => Promise<T>,
+    fetchRequest: (options?: { signal?: AbortSignal }) => Promise<T>,
     onSuccess: (data: T) => void,
     hasExistingData: () => boolean = () => false,
   ): Promise<FetchResult> {
@@ -492,12 +500,23 @@ class AnalyticsStore {
     // fresh.
     if (isFirstLoad) this.errors[panel] = null;
     const started = performance.now();
+    const liveQuery = this.currentLiveQuery;
+    const liveStep = liveQuery.start(panel, started);
     let status: Extract<PerfEntryStatus, "ok" | "error" | "aborted"> = "ok";
     try {
-      const data = await callGenerated(fetchRequest, signal);
+      const data = await fetchRequest({ signal });
       if (this.versions[panel] === v) {
         onSuccess(data);
         this.errors[panel] = null;
+        const step = queryStepFrom(
+          panel,
+          responseTimingOf(data),
+          started,
+          performance.now(),
+          this.refreshStartedAt,
+        );
+        this.stepTimings.set(panel, step);
+        liveQuery.settle(liveStep, step);
         return "ok";
       }
       return "aborted";
@@ -512,21 +531,22 @@ class AnalyticsStore {
         // existing values stay visible instead of flipping to an
         // error state. First-load failures still surface.
         if (isFirstLoad) {
-          this.errors[panel] =
-            e instanceof Error ? e.message : "Failed to load";
+          this.errors[panel] = e instanceof Error ? e.message : m.shared_failed_to_load();
         } else {
           console.warn(`analytics.${panel} refetch failed:`, e);
         }
       }
       return "error";
     } finally {
+      const durationMs = performance.now() - started;
       perf.recordPanel({
         route: "analytics",
         name: panel,
-        durationMs: performance.now() - started,
+        durationMs,
         status,
       });
       this.clearAbortSignal(panel, signal);
+      liveQuery.abandon(liveStep);
       if (this.versions[panel] === v) {
         this.querying[panel] = false;
         this.loading[panel] = false;
@@ -541,10 +561,7 @@ class AnalyticsStore {
     return controller.signal;
   }
 
-  private clearAbortSignal(
-    panel: Panel,
-    signal: AbortSignal,
-  ): void {
+  private clearAbortSignal(panel: Panel, signal: AbortSignal): void {
     if (this.abortControllers[panel]?.signal === signal) {
       delete this.abortControllers[panel];
     }
@@ -552,6 +569,8 @@ class AnalyticsStore {
 
   cancelInFlightReads(): void {
     this.fetchAllVersion++;
+    this.liveQuery.end();
+    this.qualityLiveQuery.end();
     for (const panel of Object.keys(this.abortControllers) as Panel[]) {
       this.versions[panel]++;
       this.abortControllers[panel]?.abort();
@@ -561,9 +580,15 @@ class AnalyticsStore {
     }
   }
 
-  private markRefreshComplete(): void {
+  private markRefreshComplete(startedAt: number): void {
     this.lastUpdatedAt = Date.now();
+    this.lastQueryDurationMs = performance.now() - startedAt;
+    this.lastQuerySteps = this.snapshotSteps();
     this.hasNewData = false;
+  }
+
+  private snapshotSteps(): QueryStep[] {
+    return PANEL_ORDER.flatMap((name) => this.stepTimings.get(name) ?? []);
   }
 
   private rollDates(): void {
@@ -574,6 +599,12 @@ class AnalyticsStore {
   }
 
   async fetchAll() {
+    this.fetchStartHandler?.();
+    const startedAt = performance.now();
+    this.stepTimings.clear();
+    this.refreshStartedAt = startedAt;
+    this.currentLiveQuery = this.liveQuery;
+    const live = this.liveQuery.begin(startedAt);
     const fetchVersion = ++this.fetchAllVersion;
     this.rollDates();
     const results = await Promise.all([
@@ -589,21 +620,16 @@ class AnalyticsStore {
       this.fetchTopSessions(),
       this.fetchSignals(),
     ]);
-    if (
-      fetchVersion === this.fetchAllVersion &&
-      results.every((result) => result === "ok")
-    ) {
-      this.markRefreshComplete();
+    if (fetchVersion === this.fetchAllVersion && results.every((result) => result === "ok")) {
+      this.markRefreshComplete(startedAt);
     }
+    this.liveQuery.end(live);
   }
 
   async fetchSummary(): Promise<FetchResult> {
     return await this.executeFetch(
       "summary",
-      () =>
-        AnalyticsService.getApiV1AnalyticsSummary(
-          this.filterParams(),
-        ) as unknown as Promise<AnalyticsSummary>,
+      (options) => AnalyticsService.getApiV1AnalyticsSummary(this.filterParams(), options),
       (data) => {
         this.summary = data;
       },
@@ -615,15 +641,23 @@ class AnalyticsStore {
   // stays visible as context when a date is selected (the
   // selected bar is highlighted instead of re-fetching).
   async fetchActivity(): Promise<FetchResult> {
+    const scope = JSON.stringify([this.from, this.to, this.granularity]);
+    if (this.activity !== null && this.activityScope !== scope) {
+      this.activity = null;
+    }
     return await this.executeFetch(
       "activity",
-      () =>
-        AnalyticsService.getApiV1AnalyticsActivity({
-          ...this.baseParams(),
-          granularity: this.granularity,
-        }) as unknown as Promise<ActivityResponse>,
+      (options) =>
+        AnalyticsService.getApiV1AnalyticsActivity(
+          {
+            ...this.baseParams(),
+            granularity: this.granularity,
+          },
+          options,
+        ),
       (data) => {
         this.activity = data;
+        this.activityScope = scope;
       },
       () => this.activity !== null,
     );
@@ -632,11 +666,14 @@ class AnalyticsStore {
   async fetchHeatmap(): Promise<FetchResult> {
     return await this.executeFetch(
       "heatmap",
-      () =>
-        AnalyticsService.getApiV1AnalyticsHeatmap({
-          ...this.baseParams(),
-          metric: this.metric,
-        }) as unknown as Promise<HeatmapResponse>,
+      (options) =>
+        AnalyticsService.getApiV1AnalyticsHeatmap(
+          {
+            ...this.baseParams(),
+            metric: this.metric,
+          },
+          options,
+        ),
       (data) => {
         this.heatmap = data;
       },
@@ -650,10 +687,11 @@ class AnalyticsStore {
   async fetchProjects(): Promise<FetchResult> {
     return await this.executeFetch(
       "projects",
-      () =>
+      (options) =>
         AnalyticsService.getApiV1AnalyticsProjects(
           this.filterParams({ includeProject: false }),
-        ) as unknown as Promise<ProjectsAnalyticsResponse>,
+          options,
+        ),
       (data) => {
         this.projects = data;
       },
@@ -661,13 +699,18 @@ class AnalyticsStore {
     );
   }
 
-  async fetchHourOfWeek(): Promise<FetchResult> {
+  async fetchHourOfWeek(params: AnalyticsParams | null = null): Promise<FetchResult> {
+    let requestParams = params;
+    if (requestParams === null) {
+      requestParams = this.baseParams({ includeTime: false });
+      if (this.selectedActivityRange) {
+        requestParams.from = this.selectedActivityRange.from;
+        requestParams.to = this.selectedActivityRange.to;
+      }
+    }
     return await this.executeFetch(
       "hourOfWeek",
-      () =>
-        AnalyticsService.getApiV1AnalyticsHourOfWeek(
-          this.baseParams({ includeTime: false }),
-        ) as unknown as Promise<HourOfWeekResponse>,
+      (options) => AnalyticsService.getApiV1AnalyticsHourOfWeek(requestParams, options),
       (data) => {
         this.hourOfWeek = data;
       },
@@ -678,10 +721,7 @@ class AnalyticsStore {
   async fetchSessionShape(): Promise<FetchResult> {
     return await this.executeFetch(
       "sessionShape",
-      () =>
-        AnalyticsService.getApiV1AnalyticsSessions(
-          this.filterParams(),
-        ) as unknown as Promise<SessionShapeResponse>,
+      (options) => AnalyticsService.getApiV1AnalyticsSessions(this.filterParams(), options),
       (data) => {
         this.sessionShape = data;
       },
@@ -692,10 +732,7 @@ class AnalyticsStore {
   async fetchVelocity(): Promise<FetchResult> {
     return await this.executeFetch(
       "velocity",
-      () =>
-        AnalyticsService.getApiV1AnalyticsVelocity(
-          this.filterParams(),
-        ) as unknown as Promise<VelocityResponse>,
+      (options) => AnalyticsService.getApiV1AnalyticsVelocity(this.filterParams(), options),
       (data) => {
         this.velocity = data;
       },
@@ -704,29 +741,29 @@ class AnalyticsStore {
   }
 
   async fetchTools(): Promise<FetchResult> {
+    const params = this.filterParams();
     return await this.executeFetch(
       "tools",
-      () =>
-        AnalyticsService.getApiV1AnalyticsTools(
-          this.filterParams(),
-        ) as unknown as Promise<ToolsAnalyticsResponse>,
+      (options) => AnalyticsService.getApiV1AnalyticsTools(params, options),
       (data) => {
         this.tools = data;
+        this.toolsFilterParams = params;
       },
       () => this.tools !== null,
     );
   }
 
-  async fetchSkills(
-    granularity: Granularity = this.skillsGranularity,
-  ): Promise<FetchResult> {
+  async fetchSkills(granularity: Granularity = this.skillsGranularity): Promise<FetchResult> {
     return await this.executeFetch(
       "skills",
-      () =>
-        AnalyticsService.getApiV1AnalyticsSkills({
-          ...this.filterParams(),
-          granularity,
-      }) as unknown as Promise<SkillsAnalyticsResponse>,
+      (options) =>
+        AnalyticsService.getApiV1AnalyticsSkills(
+          {
+            ...this.filterParams(),
+            granularity,
+          },
+          options,
+        ),
       (data) => {
         this.skills = data;
         this.skillsGranularity = granularity;
@@ -738,11 +775,14 @@ class AnalyticsStore {
   async fetchTopSessions(): Promise<FetchResult> {
     return await this.executeFetch(
       "topSessions",
-      () =>
-        AnalyticsService.getApiV1AnalyticsTopSessions({
-          ...this.filterParams(),
-          metric: this.topMetric,
-        }) as unknown as Promise<TopSessionsResponse>,
+      (options) =>
+        AnalyticsService.getApiV1AnalyticsTopSessions(
+          {
+            ...this.filterParams(),
+            metric: this.topMetric,
+          },
+          options,
+        ),
       (data) => {
         this.topSessions = data;
       },
@@ -750,9 +790,7 @@ class AnalyticsStore {
     );
   }
 
-  async fetchSignals(
-    opts: { includeModel?: boolean } = {},
-  ): Promise<FetchResult> {
+  async fetchSignals(opts: { includeModel?: boolean } = {}): Promise<FetchResult> {
     const includeModel = opts.includeModel ?? true;
     // `signals` is a cache shared by the Analytics page and the Quality page.
     // Key it by the filters that exist on Analytics but not Quality: the model
@@ -764,6 +802,8 @@ class AnalyticsStore {
     const scope = JSON.stringify([
       includeModel ? this.model : "",
       this.selectedDate,
+      this.selectedActivityRange?.from ?? null,
+      this.selectedActivityRange?.to ?? null,
       this.selectedDow,
       this.selectedHour,
     ]);
@@ -773,10 +813,8 @@ class AnalyticsStore {
     this.signalsScope = scope;
     return await this.executeFetch(
       "signals",
-      () =>
-        AnalyticsService.getApiV1AnalyticsSignals(
-          this.filterParams({ includeModel }),
-        ) as unknown as Promise<SignalsAnalyticsResponse>,
+      (options) =>
+        AnalyticsService.getApiV1AnalyticsSignals(this.filterParams({ includeModel }), options),
       (data) => {
         this.signals = data;
       },
@@ -787,20 +825,43 @@ class AnalyticsStore {
   async fetchSignalsForQuality() {
     this.rollDates();
     this.selectedDate = null;
+    if (this.selectedActivityRange !== null) {
+      this.selectedActivityRange = null;
+      this.restoreSessionsParentRange();
+    }
     this.selectedDow = null;
     this.selectedHour = null;
     // The Quality page has no model control and the model filter is an
     // Analytics-only scope; omit it so a model selected on Analytics does not
     // silently narrow the Quality signal facts.
-    await this.fetchSignals({ includeModel: false });
+    const startedAt = performance.now();
+    this.refreshStartedAt = startedAt;
+    this.currentLiveQuery = this.qualityLiveQuery;
+    const live = this.qualityLiveQuery.begin(startedAt);
+    const result = await this.fetchSignals({ includeModel: false });
+    if (result === "ok") {
+      this.qualityLastUpdatedAt = Date.now();
+      const durationMs = performance.now() - startedAt;
+      this.qualityLastQueryDurationMs = durationMs;
+      this.qualityLastQuerySteps = [
+        this.stepTimings.get("signals") ?? { name: "signals", startMs: 0, durationMs },
+      ];
+    }
+    this.qualityLiveQuery.end(live);
   }
 
   setTopMetric(m: TopSessionsMetric) {
     this.topMetric = m;
-    this.fetchTopSessions();
+    void this.fetchTopSessions();
   }
 
   applyDateRange(from: string, to: string) {
+    if (
+      this.selectedActivityRange &&
+      (this.selectedActivityRange.from !== from || this.selectedActivityRange.to !== to)
+    ) {
+      this.selectedActivityRange = null;
+    }
     this.isPinned = true;
     this.from = from;
     this.to = to;
@@ -815,38 +876,104 @@ class AnalyticsStore {
     this.selectedDate = null;
     this.selectedDow = null;
     this.selectedHour = null;
+    this.selectedActivityRange = null;
     this.rollDates();
+  }
+
+  setActivitySelection(from: string, to: string) {
+    this.selectedDate = null;
+    this.selectedActivityRange = { from, to };
+    this.clearDrilldownData();
+    sessions.applyPanelDateFilters({ date_from: from, date_to: to }, null);
+    sessions.activeSessionId = null;
+    void sessions.load();
+    void this.fetchSummary();
+    void this.fetchProjects();
+    void this.fetchHourOfWeek();
+    void this.fetchSessionShape();
+    void this.fetchVelocity();
+    void this.fetchTools();
+    void this.fetchSkills();
+    void this.fetchTopSessions();
+    void this.fetchSignals();
+  }
+
+  clearActivitySelection() {
+    if (this.selectedActivityRange === null) return;
+    this.selectedActivityRange = null;
+    this.clearDrilldownData();
+    this.restoreSessionsParentRange();
+    void this.fetchSummary();
+    void this.fetchProjects();
+    void this.fetchHourOfWeek();
+    void this.fetchSessionShape();
+    void this.fetchVelocity();
+    void this.fetchTools();
+    void this.fetchSkills();
+    void this.fetchTopSessions();
+    void this.fetchSignals();
   }
 
   setDateRange(from: string, to: string) {
     this.applyDateRange(from, to);
-    this.fetchAll();
+    void this.fetchAll();
   }
 
   setRollingWindow(days: number) {
     this.applyRollingWindow(days);
-    this.fetchAll();
+    void this.fetchAll();
   }
 
   selectDate(date: string) {
+    const hadActivityRange = this.selectedActivityRange !== null;
+    if (hadActivityRange) {
+      this.selectedActivityRange = null;
+      this.restoreSessionsParentRange();
+    }
     if (this.selectedDate === date) {
       this.selectedDate = null;
     } else {
       this.selectedDate = date;
     }
-    this.fetchSummary();
-    this.fetchProjects();
-    this.fetchSessionShape();
-    this.fetchVelocity();
-    this.fetchTools();
-    this.fetchSkills();
-    this.fetchTopSessions();
-    this.fetchSignals();
+    this.clearDrilldownData({ preserveHourOfWeek: !hadActivityRange });
+    void this.fetchSummary();
+    void this.fetchProjects();
+    if (hadActivityRange) void this.fetchHourOfWeek(this.baseParams({ includeTime: false }));
+    void this.fetchSessionShape();
+    void this.fetchVelocity();
+    void this.fetchTools();
+    void this.fetchSkills();
+    void this.fetchTopSessions();
+    void this.fetchSignals();
+  }
+
+  private restoreSessionsParentRange() {
+    sessions.applyPanelDateFilters(
+      { date_from: this.from, date_to: this.to },
+      this.isPinned ? null : this.windowDays,
+    );
+    sessions.activeSessionId = null;
+    void sessions.load();
+  }
+
+  private clearDrilldownData({
+    preserveHourOfWeek = false,
+  }: { preserveHourOfWeek?: boolean } = {}) {
+    this.summary = null;
+    this.projects = null;
+    if (!preserveHourOfWeek) this.hourOfWeek = null;
+    this.sessionShape = null;
+    this.velocity = null;
+    this.tools = null;
+    this.toolsFilterParams = null;
+    this.skills = null;
+    this.topSessions = null;
+    this.signals = null;
   }
 
   setGranularity(g: Granularity) {
     this.granularity = g;
-    this.fetchActivity();
+    void this.fetchActivity();
   }
 
   async setSkillsGranularity(g: Granularity): Promise<FetchResult> {
@@ -856,7 +983,7 @@ class AnalyticsStore {
 
   setMetric(m: HeatmapMetric) {
     this.metric = m;
-    this.fetchHeatmap();
+    void this.fetchHeatmap();
   }
 
   selectHourOfWeek(dow: number | null, hour: number | null) {
@@ -868,16 +995,16 @@ class AnalyticsStore {
       this.selectedDow = dow;
       this.selectedHour = hour;
     }
-    this.fetchSummary();
-    this.fetchActivity();
-    this.fetchHeatmap();
-    this.fetchProjects();
-    this.fetchSessionShape();
-    this.fetchVelocity();
-    this.fetchTools();
-    this.fetchSkills();
-    this.fetchTopSessions();
-    this.fetchSignals();
+    void this.fetchSummary();
+    void this.fetchActivity();
+    void this.fetchHeatmap();
+    void this.fetchProjects();
+    void this.fetchSessionShape();
+    void this.fetchVelocity();
+    void this.fetchTools();
+    void this.fetchSkills();
+    void this.fetchTopSessions();
+    void this.fetchSignals();
   }
 
   setProject(name: string) {
@@ -886,7 +1013,7 @@ class AnalyticsStore {
     } else {
       this.project = name;
     }
-    this.fetchAll();
+    void this.fetchAll();
   }
 }
 

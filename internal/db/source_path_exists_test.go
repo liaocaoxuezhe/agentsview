@@ -14,6 +14,7 @@ func TestHasActiveSessionSourceBelow(t *testing.T) {
 	base := filepath.Join(t.TempDir(), "sessions%_用户")
 	activePath := filepath.Join(base, "nested", "active.jsonl")
 	deletedPath := filepath.Join(base, "deleted", "gone.jsonl")
+	sourceMissingPath := filepath.Join(base, "source-missing", "gone.jsonl")
 	siblingPath := base + "-sibling" + string(filepath.Separator) + "other.jsonl"
 	otherAgentDir := filepath.Join(base, "only-other-agent")
 	otherAgentPath := filepath.Join(otherAgentDir, "session.jsonl")
@@ -23,6 +24,7 @@ func TestHasActiveSessionSourceBelow(t *testing.T) {
 	}{
 		{id: "active", agent: "codex", path: activePath},
 		{id: "deleted", agent: "codex", path: deletedPath},
+		{id: "source-missing", agent: "codex", path: sourceMissingPath},
 		{id: "sibling", agent: "codex", path: siblingPath},
 		{id: "other-agent", agent: "claude", path: otherAgentPath},
 	} {
@@ -32,7 +34,13 @@ func TestHasActiveSessionSourceBelow(t *testing.T) {
 			s.FilePath = &path
 		})
 	}
-	require.NoError(t, database.SoftDeleteSession("deleted"))
+	require.NoError(t, database.SoftDeleteSession(t.Context(), "deleted"))
+	baselineSessionSource(t, database, defaultMachine, "codex", sourceMissingPath)
+	changed, err := database.MarkSessionSourceMissing(
+		t.Context(), defaultMachine, "codex", "source-missing", sourceMissingPath,
+	)
+	require.NoError(t, err)
+	require.True(t, changed)
 
 	tests := []struct {
 		name, agent, path string
@@ -40,13 +48,14 @@ func TestHasActiveSessionSourceBelow(t *testing.T) {
 	}{
 		{name: "active descendant", agent: "codex", path: base, want: true},
 		{name: "deleted descendant", agent: "codex", path: filepath.Join(base, "deleted")},
+		{name: "source-missing descendant", agent: "codex", path: filepath.Join(base, "source-missing")},
 		{name: "sibling prefix", agent: "codex", path: base + "-sib"},
 		{name: "other agent", agent: "codex", path: otherAgentDir},
 		{name: "path itself is not below", agent: "codex", path: activePath},
 	}
 	for _, tc := range tests {
 		t.Run(tc.name, func(t *testing.T) {
-			got, err := database.HasActiveSessionSourceBelow(tc.agent, tc.path)
+			got, err := database.HasActiveSessionSourceBelow(t.Context(), tc.agent, tc.path)
 			require.NoError(t, err)
 			assert.Equal(t, tc.want, got)
 		})
@@ -62,7 +71,7 @@ func TestHasActiveSessionSourceBelow(t *testing.T) {
 	} {
 		t.Run(tc.name+" query shape", func(t *testing.T) {
 			lower, upper := activeSessionSourceBounds(tc.path)
-			rows, err := database.getReader().Query(
+			rows, err := database.getReader().Query(t.Context(),
 				hasActiveSessionSourceBelowQuery,
 				"codex", lower, upper,
 			)
@@ -74,11 +83,11 @@ func TestHasActiveSessionSourceBelow(t *testing.T) {
 				gotRows = append(gotRows, one)
 			}
 			require.NoError(t, rows.Err())
-			require.NoError(t, rows.Close())
+			defer rows.Close()
 			assert.Equal(t, tc.wantRows, gotRows,
 				"the prefix probe must return at most its one sentinel row")
 
-			planRows, err := database.getReader().Query(
+			planRows, err := database.getReader().Query(t.Context(),
 				"EXPLAIN QUERY PLAN "+hasActiveSessionSourceBelowQuery,
 				"codex", lower, upper,
 			)
@@ -91,7 +100,7 @@ func TestHasActiveSessionSourceBelow(t *testing.T) {
 				plan = append(plan, detail)
 			}
 			require.NoError(t, planRows.Err())
-			require.NoError(t, planRows.Close())
+			defer planRows.Close()
 			assert.Condition(t, func() bool {
 				return strings.Contains(strings.Join(plan, "\n"),
 					"idx_sessions_agent_file_path_active (agent=? AND file_path>? AND file_path<?)")

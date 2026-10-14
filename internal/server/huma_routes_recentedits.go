@@ -3,6 +3,8 @@ package server
 import (
 	"context"
 
+	"github.com/danielgtaylor/huma/v2"
+
 	"go.kenn.io/agentsview/internal/db"
 )
 
@@ -14,8 +16,9 @@ type recentEditsInput struct {
 }
 
 func (s *Server) registerRecentEditsRoutes() {
-	group := newRouteGroup(s.api, "/api/v1", "RecentEdits")
-	get(s, group, "/recent-edits", "List recent edits", s.humaRecentEdits)
+	group := huma.NewGroup(s.api, "/api/v1")
+	configureRouteGroup(group, "RecentEdits")
+	s.get(group, "/recent-edits", "List recent edits", s.humaRecentEdits)
 }
 
 func (s *Server) humaRecentEdits(

@@ -4,7 +4,7 @@ import (
 	"context"
 	"crypto/sha256"
 	"encoding/hex"
-	"encoding/json"
+	"encoding/json/v2"
 	"errors"
 	"fmt"
 	"strings"
@@ -13,8 +13,10 @@ import (
 	"unicode/utf8"
 
 	"go.kenn.io/agentsview/internal/db"
+	"go.kenn.io/agentsview/internal/parser"
 	recall "go.kenn.io/agentsview/internal/recall"
 	"go.kenn.io/agentsview/internal/secrets"
+	"go.kenn.io/agentsview/internal/stringutil"
 )
 
 const (
@@ -51,12 +53,26 @@ type ManagerConfig struct {
 	FailureBackoff time.Duration
 	// MaxAttempts bounds transient retries per model call. Defaults to 3.
 	MaxAttempts int
+	// AllowCandidateFindings narrows the secret gate to definite-confidence
+	// findings: candidate-tier matches (high-entropy assignments, JWT-shaped
+	// tokens, basic-auth URLs) stay recorded for review but no longer keep a
+	// session out of extraction, in discovery, the pre-send transcript
+	// re-scan, commit-time drift checks, and ineligibility reconciliation.
+	// Off by default: every recorded finding blocks. NewManager applies the
+	// same policy to the archive so the SQL boundaries agree with it.
+	AllowCandidateFindings bool
+	// Concurrency bounds how many sessions one pass distills in parallel.
+	// Units within a session stay sequential, so every cursor advance and
+	// failure mark still comes from the session's single worker. Defaults
+	// to 1.
+	Concurrency int
 }
 
 // Manager drives extraction for one generation: it scans for eligible
 // sessions, distills their units, records resumable progress, and activates
 // the generation once everything eligible is done. At most one pass runs at
 // a time; TryPass drops instead of queueing so schedulers cannot pile up.
+// Within a pass, up to Concurrency sessions distill in parallel.
 type Manager struct {
 	cfg         ManagerConfig
 	fingerprint string
@@ -128,10 +144,10 @@ type Status struct {
 // NewManager validates the configuration and computes its fingerprint.
 func NewManager(cfg ManagerConfig) (*Manager, error) {
 	if cfg.DB == nil {
-		return nil, fmt.Errorf("extraction manager requires a database")
+		return nil, errors.New("extraction manager requires a database")
 	}
 	if cfg.Client == nil {
-		return nil, fmt.Errorf("extraction manager requires a client")
+		return nil, errors.New("extraction manager requires a client")
 	}
 	if err := cfg.Client.ValidateRequestShape(); err != nil {
 		return nil, err
@@ -143,7 +159,7 @@ func NewManager(cfg ManagerConfig) (*Manager, error) {
 		)
 	}
 	if strings.TrimSpace(cfg.Identity.Model) == "" {
-		return nil, fmt.Errorf("extraction manager requires a model identity")
+		return nil, errors.New("extraction manager requires a model identity")
 	}
 	for _, role := range cfg.Segmenter.PromptRoles() {
 		if strings.TrimSpace(cfg.Prompts[role]) == "" {
@@ -156,8 +172,12 @@ func NewManager(cfg ManagerConfig) (*Manager, error) {
 	if cfg.FailureBackoff <= 0 {
 		cfg.FailureBackoff = defaultFailureBackoff
 	}
+	cfg.DB.SetExtractCandidateFindingsAllowed(cfg.AllowCandidateFindings)
 	if cfg.MaxAttempts <= 0 {
 		cfg.MaxAttempts = defaultMaxAttempts
+	}
+	if cfg.Concurrency <= 0 {
+		cfg.Concurrency = 1
 	}
 	fingerprint, err := Fingerprint(
 		cfg.Identity, cfg.Segmenter, cfg.Prompts, cfg.Client.Request,
@@ -219,6 +239,9 @@ func (m *Manager) runPassLocked(
 	ctx context.Context, opts PassOptions,
 ) (PassResult, error) {
 	var result PassResult
+	if m.cfg.DB.ArchiveContent().UsageOnly() {
+		return result, fmt.Errorf("%w: recall extraction is unavailable with archive_content=usage", db.ErrArchiveContentExcluded)
+	}
 	passStart := time.Now()
 	if err := m.ensureGeneration(ctx); err != nil {
 		return result, err
@@ -259,33 +282,10 @@ func (m *Manager) runPassLocked(
 	// archived so an unfinished corpus never serves; activation promotes
 	// them atomically.
 	staged := generation.State != db.ExtractGenerationActive
-	for _, sessionID := range sessionIDs {
-		if err := ctx.Err(); err != nil {
-			return result, err
-		}
-		outcome, err := m.extractSession(
-			ctx, sessionID, staged, opts.SessionID != "")
-		result.Units += outcome.units
-		result.Entries += outcome.entries
-		if outcome.failed {
-			result.Failed++
-		}
-		if err != nil {
-			// Ineligibility at the first snapshot is drift: selection
-			// only returned eligible sessions, so this one was excluded
-			// concurrently and the reconciliation below (and the next
-			// pass) own it. Aborting would drop the pass's remaining
-			// candidates. An explicit run keeps the error — the caller
-			// named the session and must hear why it was refused.
-			var ineligible *ineligibleSessionError
-			if opts.SessionID == "" && errors.As(err, &ineligible) {
-				continue
-			}
-			return result, err
-		}
-		if outcome.done {
-			result.Sessions++
-		}
+	if err := m.extractSessions(
+		ctx, sessionIDs, staged, opts.SessionID != "", &result,
+	); err != nil {
+		return result, err
 	}
 	// A second reconciliation after the loop catches eligibility lost
 	// while units were at the model — the mid-extraction discard reopens
@@ -325,6 +325,124 @@ func (m *Manager) runPassLocked(
 		}
 	}
 	return result, nil
+}
+
+// extractSessions distills the pass's sessions with up to Concurrency
+// workers, handing sessions out in selection order. Each session is owned by
+// exactly one worker for the whole pass, so its units still distill and
+// commit strictly in order and the progress row's optimistic guards see the
+// same single writer they do in a sequential pass. Model calls run outside
+// any transaction; the archive serializes the per-unit commits.
+//
+// The first error that would abort a sequential pass aborts this one too: no
+// further sessions start, and sessions still in flight are cancelled, which
+// leaves their rows resumable exactly as daemon shutdown does. That keeps an
+// endpoint outage from burning every in-flight session's retry ladder, and
+// only the worker that claims the abort marks its session failed, so the
+// outage backs off one session instead of every one in flight. Results from
+// every started session are still counted. When ctx itself is
+// cancelled the pass returns ctx.Err(), not the cancelled calls' errors.
+func (m *Manager) extractSessions(
+	ctx context.Context, sessionIDs []string, staged, explicit bool,
+	result *PassResult,
+) error {
+	passCtx, cancel := context.WithCancel(ctx)
+	defer cancel()
+	abort := &passAbort{ctx: passCtx, cancel: cancel}
+
+	var (
+		mu sync.Mutex
+		wg sync.WaitGroup
+	)
+	record := func(outcome sessionOutcome, err error) {
+		mu.Lock()
+		defer mu.Unlock()
+		result.Units += outcome.units
+		result.Entries += outcome.entries
+		if outcome.failed {
+			result.Failed++
+		}
+		if err == nil {
+			if outcome.done {
+				result.Sessions++
+			}
+			return
+		}
+		// Ineligibility at the first snapshot is drift: selection only
+		// returned eligible sessions, so this one was excluded concurrently
+		// and the reconciliation after the loop (and the next pass) own it.
+		// Aborting would drop the pass's remaining candidates. An explicit
+		// run keeps the error — the caller named the session and must hear
+		// why it was refused.
+		if _, ineligible := errors.AsType[*ineligibleSessionError](err); ineligible && !explicit {
+			return
+		}
+		abort.claim(err)
+	}
+	queue := make(chan string)
+	for range min(m.cfg.Concurrency, len(sessionIDs)) {
+		wg.Go(func() {
+			for sessionID := range queue {
+				if passCtx.Err() != nil {
+					continue
+				}
+				record(m.extractSession(passCtx, sessionID, staged, explicit, abort))
+			}
+		})
+	}
+	for _, sessionID := range sessionIDs {
+		if passCtx.Err() != nil {
+			break
+		}
+		select {
+		case queue <- sessionID:
+		case <-passCtx.Done():
+		}
+	}
+	close(queue)
+	wg.Wait()
+	if err := abort.error(); err != nil {
+		return err
+	}
+	return ctx.Err()
+}
+
+// passAbort records the one error that aborts a pass and cancels the pass
+// when it is recorded.
+type passAbort struct {
+	ctx    context.Context
+	cancel context.CancelFunc
+	mu     sync.Mutex
+	err    error
+}
+
+// claim records err as the pass's abort cause and cancels the pass, and
+// reports whether this caller won. Once the pass context is done, a worker's
+// error is a consequence of that cancellation, not a new cause: either an
+// earlier abort already recorded its error, or the caller cancelled ctx.
+func (a *passAbort) claim(err error) bool {
+	a.mu.Lock()
+	defer a.mu.Unlock()
+	if a.err != nil || a.ctx.Err() != nil {
+		return false
+	}
+	a.err = err
+	a.cancel()
+	return true
+}
+
+// replace swaps the recorded cause for a failure the claimant hit while
+// acting on its claim, so the pass reports the error that left work undone.
+func (a *passAbort) replace(err error) {
+	a.mu.Lock()
+	defer a.mu.Unlock()
+	a.err = err
+}
+
+func (a *passAbort) error() error {
+	a.mu.Lock()
+	defer a.mu.Unlock()
+	return a.err
 }
 
 func (m *Manager) ensureGeneration(ctx context.Context) error {
@@ -404,13 +522,29 @@ func (m *Manager) refuseSecretFindings(
 	if err != nil {
 		return err
 	}
-	if len(findings) > 0 {
+	if n := m.blockingFindings(findings); n > 0 {
 		return &ineligibleSessionError{err: fmt.Errorf(
 			"session %s has %d recorded secret findings and is excluded "+
-				"from extraction", sessionID, len(findings),
+				"from extraction", sessionID, n,
 		)}
 	}
 	return nil
+}
+
+// blockingFindings counts the recorded findings that exclude a session:
+// all of them by default, definite-confidence ones only when candidate
+// findings are allowed.
+func (m *Manager) blockingFindings(findings []db.SecretFinding) int {
+	if !m.cfg.AllowCandidateFindings {
+		return len(findings)
+	}
+	n := 0
+	for _, f := range findings {
+		if f.Confidence == secrets.ConfidenceDefinite {
+			n++
+		}
+	}
+	return n
 }
 
 // settledPastQuietPeriod refuses a session whose ended_at falls inside
@@ -526,6 +660,7 @@ func (m *Manager) sessionSnapshot(
 
 func (m *Manager) extractSession(
 	ctx context.Context, sessionID string, staged, explicit bool,
+	abort *passAbort,
 ) (sessionOutcome, error) {
 	var outcome sessionOutcome
 	// The transcript-read cutoff is captured before anything is read: a
@@ -538,7 +673,8 @@ func (m *Manager) extractSession(
 	}
 	if session == nil {
 		return outcome, &ineligibleSessionError{
-			err: fmt.Errorf("session %s not found", sessionID)}
+			err: fmt.Errorf("session %s not found", sessionID),
+		}
 	}
 	if err := extractableSession(sessionID, session); err != nil {
 		return outcome, &ineligibleSessionError{err: err}
@@ -591,7 +727,7 @@ func (m *Manager) extractSession(
 	// incremental append whose deferred rescan crashed before it landed).
 	// Re-scanning the content this function is about to send makes the
 	// boundary independent of that history.
-	secretMatches := transcriptSecretMatches(rows)
+	secretMatches := transcriptSecretMatches(rows, m.cfg.AllowCandidateFindings)
 	messages := make([]Message, 0, len(rows))
 	for _, row := range rows {
 		messages = append(messages, Message{
@@ -599,6 +735,10 @@ func (m *Manager) extractSession(
 			Role:     row.Role,
 			Content:  row.Content,
 			IsSystem: row.IsSystem,
+			// Providers record execution as a flag, call rows, or tool output.
+			ToolUse: row.HasToolUse || len(row.ToolCalls) > 0 ||
+				row.Role == string(parser.RoleTool) ||
+				row.SourceSubtype == parser.SourceSubtypeToolResult,
 		})
 	}
 	// Per-message scanning misses a secret whose structure spans messages:
@@ -610,7 +750,7 @@ func (m *Manager) extractSession(
 	// token in the scan that the endpoint still receives contiguously. Raw
 	// contents, not formatted unit texts, so interposed formatting cannot
 	// push a straddling key under the scanner's payload-purity gate.
-	secretMatches += aggregateModelSecretMatches(messages)
+	secretMatches += aggregateModelSecretMatches(messages, m.cfg.AllowCandidateFindings)
 	units := m.cfg.Segmenter.Units(messages)
 	digest := unitsDigest(units)
 	// A digest change means previously extracted units may have different
@@ -634,7 +774,7 @@ func (m *Manager) extractSession(
 		// eligible for activation. A row already carrying this digest
 		// needs no upsert at all; a missing or digest-changed row is
 		// created or reset to pending, which a crash leaves retryable.
-		cursor := 0
+		var cursor int
 		if found && previous.ContentDigest == digest {
 			cursor = previous.UnitCursor
 		} else {
@@ -783,7 +923,8 @@ func (m *Manager) extractSession(
 			return outcome, nil
 		}
 		unit := units[i]
-		entries, err := m.distillSplit(ctx, m.cfg.Prompts[unit.Role], unit.Text)
+		prompt, types := m.unitRequest(unit)
+		entries, err := m.distillSplit(ctx, prompt, unit.Text, types)
 		if err != nil {
 			if ctx.Err() != nil {
 				// Shutdown, not a poisoned session: leave the row
@@ -797,18 +938,33 @@ func (m *Manager) extractSession(
 				// picks up where it stopped once the configuration works.
 				return outcome, err
 			}
-			if markErr := m.cfg.DB.MarkExtractProgressFailed(ctx, db.ExtractFailure{
+			_, transient := errors.AsType[*transientError](err)
+			markCtx := ctx
+			if transient {
+				// Parallel workers exhaust their ladders against the same
+				// outage together. Only the worker that claims the abort
+				// marks its session; the others stay resumable like any
+				// session the abort cancels.
+				if !abort.claim(err) {
+					return outcome, err
+				}
+				// The claim cancelled ctx; the mark must still land.
+				markCtx = context.WithoutCancel(ctx)
+			}
+			if markErr := m.cfg.DB.MarkExtractProgressFailed(markCtx, db.ExtractFailure{
 				SessionID:      sessionID,
 				Fingerprint:    m.fingerprint,
 				ExpectedDigest: digest,
 				ExpectedCursor: i,
 				LastError:      boundedLastError(err),
 			}); markErr != nil && !errors.Is(markErr, db.ErrStaleExtractProgress) {
+				if transient {
+					abort.replace(markErr)
+				}
 				return outcome, markErr
 			}
 			outcome.failed = true
-			var transient *transientError
-			if errors.As(err, &transient) {
+			if transient {
 				// An exhausted retry ladder means the endpoint is down or
 				// saturated, not that this unit is poisoned: every
 				// remaining session would burn its own full ladder
@@ -909,13 +1065,13 @@ func (m *Manager) recheckExtraction(
 		return false, false, err
 	}
 	if recheck == nil || extractableSession(sessionID, recheck) != nil {
-		return false, false, nil
+		return false, false, nil //nolint:nilerr // An ineligible session is a normal extraction outcome; read errors propagate above.
 	}
 	findings, err := m.cfg.DB.SessionSecretFindings(ctx, sessionID)
 	if err != nil {
 		return false, false, err
 	}
-	if len(findings) > 0 {
+	if m.blockingFindings(findings) > 0 {
 		return false, false, nil
 	}
 	return true, !sessionSnapshotChanged(before, recheck), nil
@@ -947,11 +1103,7 @@ func boundedLastError(err error) string {
 	if len(msg) <= maxStoredErrorBytes {
 		return msg
 	}
-	cut := maxStoredErrorBytes - len(marker)
-	for cut > 0 && !utf8.RuneStart(msg[cut]) {
-		cut--
-	}
-	return msg[:cut] + marker
+	return stringutil.SafeTruncate(msg, maxStoredErrorBytes-len(marker)) + marker
 }
 
 func (m *Manager) discardSessionOutput(
@@ -985,17 +1137,29 @@ func (m *Manager) discardSessionOutput(
 // single-token credential split mid-token across messages, which the newline
 // would otherwise break so a regex needing contiguous characters could not
 // match. Either matching means the material is present.
-func aggregateModelSecretMatches(messages []Message) int {
+func aggregateModelSecretMatches(messages []Message, allowCandidates bool) int {
 	texts := VisibleContents(messages)
-	matches := len(secrets.Scan(strings.Join(texts, "\n")))
-	matches += len(secrets.Scan(strings.Join(texts, "")))
+	scan := gateScanner(allowCandidates)
+	matches := len(scan(strings.Join(texts, "\n")))
+	matches += len(scan(strings.Join(texts, "")))
 	return matches
 }
 
-func transcriptSecretMatches(rows []db.Message) int {
+// gateScanner picks the ruleset the pre-send re-scan applies: the full
+// ruleset by default, definite rules only when candidate findings are
+// allowed — the same tier split the archive's eligibility SQL uses.
+func gateScanner(allowCandidates bool) func(string) []secrets.Match {
+	if allowCandidates {
+		return secrets.ScanDefinite
+	}
+	return secrets.Scan
+}
+
+func transcriptSecretMatches(rows []db.Message, allowCandidates bool) int {
+	scan := gateScanner(allowCandidates)
 	matches := 0
 	for _, row := range rows {
-		matches += len(secrets.Scan(row.Content))
+		matches += len(scan(row.Content))
 	}
 	return matches
 }
@@ -1006,10 +1170,21 @@ func transcriptSecretMatches(rows []db.Message) int {
 // below it the text is small enough that splitting further would only
 // destroy context, so the error surfaces instead.
 func (m *Manager) distillSplit(
-	ctx context.Context, prompt, text string,
+	ctx context.Context, prompt, text string, types []string,
 ) ([]Entry, error) {
 	calls := 0
-	return m.distillSplitBounded(ctx, prompt, text, &calls)
+	return m.distillSplitBounded(ctx, prompt, text, types, &calls)
+}
+
+// unitRequest returns the system prompt and allowed entry types for unit.
+// An action unit whose messages ran no tool cannot report executed steps,
+// so it drops 'procedure' and opens with a preamble saying nothing ran.
+func (m *Manager) unitRequest(unit Unit) (string, []string) {
+	prompt := m.cfg.Prompts[unit.Role]
+	if unit.Role != RoleAction || unit.ToolUse {
+		return prompt, entryTypes
+	}
+	return unexecutedActionPreamble + "\n\n" + prompt, unexecutedEntryTypes
 }
 
 // distillSplitBounded is distillSplit with a shared call counter so one
@@ -1018,7 +1193,7 @@ func (m *Manager) distillSplit(
 // budget the unit fails closed with ErrSplitBudgetExceeded rather than
 // splitting an unbounded message into ever more leaves.
 func (m *Manager) distillSplitBounded(
-	ctx context.Context, prompt, text string, calls *int,
+	ctx context.Context, prompt, text string, types []string, calls *int,
 ) ([]Entry, error) {
 	if *calls >= maxUnitDistillCalls {
 		return nil, fmt.Errorf(
@@ -1026,8 +1201,8 @@ func (m *Manager) distillSplitBounded(
 			maxUnitDistillCalls, ErrSplitBudgetExceeded)
 	}
 	*calls++
-	entries, _, err := m.cfg.Client.DistillWithRecovery(
-		ctx, prompt, text, m.cfg.MaxAttempts,
+	entries, _, err := m.cfg.Client.distillWithRecovery(
+		ctx, prompt, text, types, m.cfg.MaxAttempts,
 	)
 	if err == nil {
 		return entries, nil
@@ -1041,11 +1216,11 @@ func (m *Manager) distillSplitBounded(
 		return nil, err
 	}
 	mid := len(runes) / 2
-	left, err := m.distillSplitBounded(ctx, prompt, string(runes[:mid]), calls)
+	left, err := m.distillSplitBounded(ctx, prompt, string(runes[:mid]), types, calls)
 	if err != nil {
 		return nil, err
 	}
-	right, err := m.distillSplitBounded(ctx, prompt, string(runes[mid:]), calls)
+	right, err := m.distillSplitBounded(ctx, prompt, string(runes[mid:]), types, calls)
 	if err != nil {
 		return nil, err
 	}
@@ -1250,8 +1425,8 @@ func (m *Manager) generation(
 func unitsDigest(units []Unit) string {
 	h := sha256.New()
 	for _, unit := range units {
-		fmt.Fprintf(h, "%s\x1f%d\x1f%d\x1f%d\x1f",
-			unit.Role, unit.OrdinalStart, unit.OrdinalEnd,
+		fmt.Fprintf(h, "%s\x1f%d\x1f%d\x1f%t\x1f%d\x1f",
+			unit.Role, unit.OrdinalStart, unit.OrdinalEnd, unit.ToolUse,
 			utf8.RuneCountInString(unit.Text),
 		)
 		h.Write([]byte(unit.Text))

@@ -2,10 +2,11 @@ package sync_test
 
 import (
 	"bytes"
-	"encoding/json"
+	"encoding/json/v2"
 	"maps"
 	"os"
 	"path/filepath"
+	"strconv"
 	"testing"
 
 	"github.com/klauspost/compress/zstd"
@@ -18,6 +19,26 @@ import (
 	"go.kenn.io/agentsview/internal/parser"
 	"go.kenn.io/agentsview/internal/sync"
 )
+
+func TestDeepSeekHarnessSyncDiscoversV4AndUpgradesV3(t *testing.T) {
+	root := t.TempDir()
+	database := dbtest.OpenTestDB(t)
+	engine := sync.NewEngine(t.Context(), database, sync.EngineConfig{
+		AgentDirs: map[parser.AgentType][]string{parser.AgentDeepSeekHarness: {root}},
+		Machine:   "local",
+	})
+	header := map[string]any{"version": 3, "isSeeded": false, "agentPreset": "minimal"}
+	harnessSyncWriteLog(t, root, "upgrade", header, harnessSyncCompleteTurn("older generation"))
+	engine.SyncAll(t.Context(), nil)
+	header["version"] = 4
+	upgradePath := harnessSyncWriteLog(t, root, "upgrade", header, harnessSyncCompleteTurn("answer"))
+	engine.SyncAll(t.Context(), nil)
+	messages, err := database.GetMessages(t.Context(), "deepseek-harness:upgrade", 0, 20, true)
+	require.NoError(t, err)
+	require.Len(t, messages, 2)
+	assert.Equal(t, "answer", messages[1].Content)
+	assert.Equal(t, upgradePath, database.GetSessionFilePath(t.Context(), "deepseek-harness:upgrade"))
+}
 
 func TestDeepSeekHarnessSyncReplacesPartialResponseAndDeduplicatesSeedUsage(t *testing.T) {
 	if testing.Short() {
@@ -38,7 +59,7 @@ func TestDeepSeekHarnessSyncReplacesPartialResponseAndDeduplicatesSeedUsage(t *t
 			OutputPerMTok: money.MustParseDollars("2"),
 		},
 	}))
-	engine := sync.NewEngine(database, sync.EngineConfig{
+	engine := sync.NewEngine(t.Context(), database, sync.EngineConfig{
 		AgentDirs: map[parser.AgentType][]string{
 			parser.AgentDeepSeekHarness: {root},
 		},
@@ -154,7 +175,7 @@ func TestDeepSeekHarnessSyncReplacesPartialResponseAndDeduplicatesSeedUsage(t *t
 	engine.SyncPaths([]string{parentPath})
 	removed, err := database.GetSession(t.Context(), parentID)
 	require.NoError(t, err)
-	assert.Nil(t, removed)
+	assert.NotNil(t, removed)
 
 	require.NoError(t, os.Remove(siblingPath))
 }
@@ -166,7 +187,7 @@ func TestDeepSeekHarnessSyncRetainsMixedEncodingSessionAndSwitchesAfterDeletion(
 
 	root := t.TempDir()
 	database := dbtest.OpenTestDB(t)
-	engine := sync.NewEngine(database, sync.EngineConfig{
+	engine := sync.NewEngine(t.Context(), database, sync.EngineConfig{
 		AgentDirs: map[parser.AgentType][]string{
 			parser.AgentDeepSeekHarness: {root},
 		},
@@ -201,7 +222,7 @@ func TestDeepSeekHarnessSyncRetainsMixedEncodingSessionAndSwitchesAfterDeletion(
 	require.NoError(t, err)
 	require.Len(t, messages, 2)
 	assert.Equal(t, "plain transcript", messages[1].Content)
-	assert.Equal(t, plainPath, database.GetSessionFilePath(sessionID))
+	assert.Equal(t, plainPath, database.GetSessionFilePath(t.Context(), sessionID))
 }
 
 func harnessSyncWriteLog(
@@ -218,9 +239,13 @@ func harnessSyncWriteLogEncoding(
 	headerExtra map[string]any, events []any,
 ) string {
 	t.Helper()
+
 	dir := filepath.Join(root, "--workspace-example--", id)
 	require.NoError(t, os.MkdirAll(dir, 0o755))
 	name := "session.jsonl"
+	if version, ok := headerExtra["version"].(int); ok && version > 0 {
+		name = "session.v" + strconv.Itoa(version) + ".jsonl"
+	}
 	if compression == "zstd" {
 		name += ".zstd"
 	}
@@ -270,6 +295,7 @@ func harnessSyncAppendFrame(t *testing.T, path string, events []any) {
 
 func harnessSyncWriteFrames(t *testing.T, path string, appendFile bool, frames ...[]any) {
 	t.Helper()
+
 	encoder, err := zstd.NewWriter(nil, zstd.WithEncoderCRC(true))
 	require.NoError(t, err)
 	defer encoder.Close()

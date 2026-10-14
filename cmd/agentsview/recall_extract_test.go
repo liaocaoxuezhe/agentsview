@@ -2,7 +2,7 @@ package main
 
 import (
 	"context"
-	"encoding/json"
+	"encoding/json/v2"
 	"fmt"
 	"net/http"
 	"net/http/httptest"
@@ -39,7 +39,7 @@ func extractModelStub(t *testing.T) *httptest.Server {
 					"prompt_tokens": 5, "completion_tokens": 2,
 				},
 			}
-			_ = json.NewEncoder(w).Encode(body)
+			_ = json.MarshalWrite(w, body)
 		}))
 	t.Cleanup(server.Close)
 	return server
@@ -63,25 +63,33 @@ endpoint = %q
 // seedExtractCLISession stores one ended, extractable session.
 func seedExtractCLISession(t *testing.T, dataDir string) {
 	t.Helper()
-	d, err := db.Open(filepath.Join(dataDir, "sessions.db"))
+
+	cfg, err := config.LoadMinimal()
+	require.NoError(t, err)
+	cfg.DBPath = filepath.Join(dataDir, "sessions.db")
+	d, err := openDB(t.Context(), cfg)
 	require.NoError(t, err)
 	defer d.Close()
 	ended := time.Now().Add(-time.Hour).UTC().Format("2006-01-02T15:04:05.000Z")
-	require.NoError(t, d.UpsertSession(db.Session{
+	require.NoError(t, d.UpsertSession(t.Context(), db.Session{
 		ID:           "extract-session",
 		Project:      "proj",
-		Machine:      "local",
+		Machine:      cfg.InstallationID,
 		Agent:        "claude",
 		EndedAt:      &ended,
 		MessageCount: 2,
 	}))
-	require.NoError(t, d.InsertMessages([]db.Message{
-		{SessionID: "extract-session", Ordinal: 0, Role: "user",
-			Content: "fix the flaky test"},
-		{SessionID: "extract-session", Ordinal: 1, Role: "assistant",
-			Content: "pinned the clock in the scheduler test"},
+	require.NoError(t, d.InsertMessages(t.Context(), []db.Message{
+		{
+			SessionID: "extract-session", Ordinal: 0, Role: "user",
+			Content: "fix the flaky test",
+		},
+		{
+			SessionID: "extract-session", Ordinal: 1, Role: "assistant",
+			Content: "pinned the clock in the scheduler test",
+		},
 	}))
-	require.NoError(t, d.ReplaceSessionSecretFindings(
+	require.NoError(t, d.ReplaceSessionSecretFindings(t.Context(),
 		"extract-session", nil, 0, secrets.RulesVersion()))
 }
 
@@ -144,10 +152,10 @@ func TestRecallExtractRunAndStatusEndToEnd(t *testing.T) {
 // keeps serving, so setup returns a reconcile-only scheduler when a
 // generation exists and nil when none does.
 func TestSetupExtractReconcileOnlyWhenDisabled(t *testing.T) {
-	ctx := context.Background()
+	ctx := t.Context()
 
 	t.Run("nil without a generation", func(t *testing.T) {
-		d, err := db.Open(filepath.Join(t.TempDir(), "sessions.db"))
+		d, err := db.Open(ctx, filepath.Join(t.TempDir(), "sessions.db"))
 		require.NoError(t, err)
 		t.Cleanup(func() { _ = d.Close() })
 		sched, err := setupRecallExtraction(config.Config{}, d, nil)
@@ -157,14 +165,14 @@ func TestSetupExtractReconcileOnlyWhenDisabled(t *testing.T) {
 	})
 
 	t.Run("reconciles an ineligible session's entries", func(t *testing.T) {
-		d, err := db.Open(filepath.Join(t.TempDir(), "sessions.db"))
+		d, err := db.Open(ctx, filepath.Join(t.TempDir(), "sessions.db"))
 		require.NoError(t, err)
 		t.Cleanup(func() { _ = d.Close() })
 		_, err = d.EnsureExtractGeneration(ctx, db.ExtractGeneration{
 			Fingerprint: "fp-a", Model: "m", Segmenter: "turns-v1",
 		})
 		require.NoError(t, err)
-		require.NoError(t, d.UpsertSession(db.Session{
+		require.NoError(t, d.UpsertSession(ctx, db.Session{
 			ID: "sess-gone", Project: "p", Machine: "m", Agent: "claude",
 		}))
 		_, err = d.InsertExtractedRecallEntries(ctx, []db.RecallEntry{{
@@ -174,7 +182,7 @@ func TestSetupExtractReconcileOnlyWhenDisabled(t *testing.T) {
 			ProvenanceOK: true,
 		}})
 		require.NoError(t, err)
-		require.NoError(t, d.SoftDeleteSession("sess-gone"))
+		require.NoError(t, d.SoftDeleteSession(ctx, "sess-gone"))
 
 		sched, err := setupRecallExtraction(config.Config{}, d, nil)
 		require.NoError(t, err)
@@ -190,6 +198,45 @@ func TestSetupExtractReconcileOnlyWhenDisabled(t *testing.T) {
 			"the startup reconcile pass must retract the ineligible entry")
 		cancel()
 		sched.Stop()
+	})
+
+	t.Run("keeps candidate-only entries when configured", func(t *testing.T) {
+		d, err := db.Open(ctx, filepath.Join(t.TempDir(), "sessions.db"))
+		require.NoError(t, err)
+		t.Cleanup(func() { _ = d.Close() })
+		_, err = d.EnsureExtractGeneration(ctx, db.ExtractGeneration{
+			Fingerprint: "fp-a", Model: "m", Segmenter: "turns-v1",
+		})
+		require.NoError(t, err)
+		require.NoError(t, d.UpsertSession(ctx, db.Session{
+			ID: "sess-candidate", Project: "p", Machine: "m", Agent: "claude",
+		}))
+		_, err = d.InsertExtractedRecallEntries(ctx, []db.RecallEntry{{
+			ID: "e-candidate", Type: "fact", ReviewState: "unreviewed_auto",
+			Status: "accepted", Title: "t", Body: "b",
+			SourceSessionID: "sess-candidate", SourceRunID: "fp-a",
+			ProvenanceOK: true,
+		}})
+		require.NoError(t, err)
+		require.NoError(t, d.ReplaceSessionSecretFindings(ctx,
+			"sess-candidate", []db.SecretFinding{{
+				SessionID: "sess-candidate", RuleName: "high-entropy-assignment",
+				Confidence: "candidate", LocationKind: "message",
+			}}, 0, "rules-v1"))
+
+		cfg := config.Config{}
+		cfg.Recall.Extract.CandidateFindings = config.RecallCandidateFindingsAllow
+		sched, err := setupRecallExtraction(cfg, d, nil)
+		require.NoError(t, err)
+		require.NotNil(t, sched)
+		started, _, err := sched.mgr.TryPass(ctx, extract.PassOptions{})
+		require.NoError(t, err)
+		require.True(t, started)
+
+		entry, err := d.GetRecallEntry(ctx, "e-candidate")
+		require.NoError(t, err)
+		assert.NotNil(t, entry,
+			"candidate-only session keeps serving when configured allow")
 	})
 }
 
@@ -251,6 +298,8 @@ func TestRecallExtractDoctorProbesTheModel(t *testing.T) {
 	require.NoError(t, err, "doctor output: %s", out)
 	assert.Contains(t, out, "Fingerprint:")
 	assert.Contains(t, out, "test-model")
+	assert.Contains(t, out, "Concurrency: 1",
+		"an unset concurrency resolves to one session at a time")
 	assert.Contains(t, out, "probe: ok")
 }
 
@@ -327,9 +376,10 @@ func TestResolveExtractDistillationAppliesOverrides(t *testing.T) {
 		FailureBackoff:   "2h",
 		Servers: map[string]config.RecallExtractServerConfig{
 			"local": {
-				Endpoint:  "http://127.0.0.1:30000/v1",
-				APIKeyEnv: "AGENTSVIEW_TEST_RECALL_API_KEY",
-				Timeout:   "120s",
+				Endpoint:    "http://127.0.0.1:30000/v1",
+				APIKeyEnv:   "AGENTSVIEW_TEST_RECALL_API_KEY",
+				Timeout:     "120s",
+				Concurrency: 3,
 			},
 		},
 		Request: config.RecallExtractRequestConfig{
@@ -344,18 +394,19 @@ func TestResolveExtractDistillationAppliesOverrides(t *testing.T) {
 		"model prefix must select the qwen profile")
 	assert.Equal(t, "http://127.0.0.1:30000/v1", dist.Client.BaseURL)
 	assert.Equal(t, "atlas-secret", dist.Client.APIKey)
-	assert.Equal(t, 0.3, dist.Client.Request.Temperature)
+	assert.InDelta(t, 0.3, dist.Client.Request.Temperature, 0)
 	assert.Equal(t, 512, dist.Client.Request.MaxTokens)
 	assert.Equal(t, map[string]any{"custom": true},
 		dist.Client.Request.ExtraBody,
 		"configured extra_body replaces the profile's")
 	assert.Equal(t, 40000, dist.Segmenter.MaxWindowChars)
-	assert.Equal(t,
-		extract.ModelIdentity{Model: "qwen3.5-27b", Deployment: "gpu-a"},
+	assert.Equal(t, extract.ModelIdentity{Model: "qwen3.5-27b", Deployment: "gpu-a"},
 		dist.Identity)
 	assert.Equal(t, 30*time.Minute, dist.Quiet)
 	assert.Equal(t, 2*time.Hour, dist.Backoff)
 	assert.Equal(t, time.Hour, dist.Backstop)
+	assert.Equal(t, 3, dist.Concurrency,
+		"the resolved server's concurrency reaches the manager")
 
 	cfg.Enabled = false
 	_, err = resolveExtractDistillation(cfg)
@@ -379,7 +430,7 @@ func TestResolveExtractDistillationLoadsPromptDir(t *testing.T) {
 		BackstopInterval: "1h",
 		FailureBackoff:   "1h",
 		Servers: map[string]config.RecallExtractServerConfig{
-			"local": {Endpoint: "http://127.0.0.1:30000/v1", Timeout: "120s"},
+			"local": {Endpoint: "http://127.0.0.1:30000/v1", Timeout: "120s", Concurrency: 1},
 		},
 		Prompts: config.RecallExtractPromptsConfig{Dir: dir},
 	}
@@ -414,7 +465,7 @@ func TestResolveExtractDistillationRefusesAllRedirects(t *testing.T) {
 		BackstopInterval: "1h",
 		FailureBackoff:   "1h",
 		Servers: map[string]config.RecallExtractServerConfig{
-			"remote": {Endpoint: "https://build-box:30000/v1", Timeout: "120s"},
+			"remote": {Endpoint: "https://build-box:30000/v1", Timeout: "120s", Concurrency: 1},
 		},
 	}
 	dist, err := resolveExtractDistillation(cfg)

@@ -42,6 +42,24 @@ func TestParseSQLiteTimestamp(t *testing.T) {
 			"2026-03-11T12:34:56Z",
 		},
 		{
+			"space separated fractional short offset",
+			"2026-03-11 12:34:56.123+00",
+			true,
+			"2026-03-11T12:34:56.123Z",
+		},
+		{
+			"space separated fractional colon offset",
+			"2026-03-11 12:34:56.123456+00:00",
+			true,
+			"2026-03-11T12:34:56.123456Z",
+		},
+		{
+			"space separated fractional non-UTC offset",
+			"2026-03-11 12:34:56.123456789-07:00",
+			true,
+			"2026-03-11T19:34:56.123456789Z",
+		},
+		{
 			"empty string",
 			"",
 			false,
@@ -145,18 +163,18 @@ func TestNormalizeLocalSyncTimestamp(t *testing.T) {
 }
 
 func TestNormalizeLocalSyncStateTimestamps(t *testing.T) {
-	local, err := db.Open(t.TempDir() + "/test.db")
+	local, err := db.Open(t.Context(), t.TempDir()+"/test.db")
 	require.NoError(t, err)
 	defer local.Close()
 
-	require.NoError(t, local.SetSyncState(
+	require.NoError(t, local.SetSyncState(t.Context(),
 		"last_push_at",
 		"2026-03-11T12:34:56.123456789Z",
 	))
 
-	require.NoError(t, NormalizeLocalSyncStateTimestamps(local))
+	require.NoError(t, NormalizeLocalSyncStateTimestamps(t.Context(), local))
 
-	got, err := local.GetSyncState("last_push_at")
+	got, err := local.GetSyncState(t.Context(), "last_push_at")
 	require.NoError(t, err)
 	assert.Equal(t, "2026-03-11T12:34:56.123Z", got)
 }

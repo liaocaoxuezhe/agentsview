@@ -2,7 +2,9 @@ package main
 
 import (
 	"context"
-	"encoding/json"
+	"encoding/json/jsontext"
+	"encoding/json/v2"
+	"errors"
 	"fmt"
 	"io"
 	"net/http"
@@ -13,7 +15,9 @@ import (
 	"text/tabwriter"
 	"time"
 
+	"github.com/doordash-oss/oapi-codegen-dd/v3/pkg/runtime"
 	"go.kenn.io/agentsview/internal/activity"
+	"go.kenn.io/agentsview/internal/apiclient"
 	"go.kenn.io/agentsview/internal/config"
 	"go.kenn.io/agentsview/internal/db"
 	"go.kenn.io/agentsview/internal/export"
@@ -21,25 +25,27 @@ import (
 
 // ActivityReportConfig holds the flags for `agentsview activity report`.
 type ActivityReportConfig struct {
-	Preset            string
-	Date              string
-	From              string
-	To                string
-	Timezone          string
-	Bucket            string
-	Project           string
-	Agent             string
-	Machine           string
-	JSON              bool
-	NoSync            bool
-	Offline           bool
-	ProgressWriter    io.Writer
-	SessionsLimit     int
-	SessionsReportID  string
-	SessionsCursor    string
-	SessionsSort      string
-	SessionsDirection string
-	SessionsBucket    string
+	ctx                 context.Context
+	Preset              string
+	Date                string
+	From                string
+	To                  string
+	Timezone            string
+	Bucket              string
+	Project             string
+	Agent               string
+	Machine             string
+	JSON                bool
+	NoSync              bool
+	Offline             bool
+	ProgressWriter      io.Writer
+	SessionsLimit       int
+	SessionsReportID    string
+	SessionsCursor      string
+	SessionsSort        string
+	SessionsDirection   string
+	SessionsBucketStart string
+	SessionsBucketEnd   string
 }
 
 var activityReportNow = time.Now
@@ -47,7 +53,10 @@ var activityReportNow = time.Now
 // runActivityReport syncs, resolves the range, runs the report, and prints it.
 func runActivityReport(cfg ActivityReportConfig) {
 	cfg.ProgressWriter = os.Stderr
-	ctx := context.Background()
+	ctx := cfg.ctx
+	if ctx == nil {
+		ctx = context.Background()
+	}
 	backend, cleanup, err := resolveArchiveQueryBackend(ctx, archiveQueryPolicy{
 		Offline:              cfg.Offline,
 		NoSync:               cfg.NoSync,
@@ -58,9 +67,8 @@ func runActivityReport(cfg ActivityReportConfig) {
 		fmt.Fprintf(os.Stderr, "error: %v\n", err)
 		os.Exit(1)
 	}
-	defer closeArchiveQueryBackend(cleanup)
-
 	r, err := backend.ActivityReport(ctx, cfg)
+	closeArchiveQueryBackend(cleanup)
 	if err != nil {
 		fmt.Fprintf(os.Stderr, "error: %v\n", err)
 		os.Exit(1)
@@ -71,9 +79,8 @@ func runActivityReport(cfg ActivityReportConfig) {
 
 func writeActivityReport(r activity.Report, jsonOutput bool) {
 	if jsonOutput {
-		enc := json.NewEncoder(os.Stdout)
-		enc.SetIndent("", "  ")
-		if err := enc.Encode(r); err != nil {
+		enc := jsontext.NewEncoder(os.Stdout, jsontext.WithIndent("  "))
+		if err := json.MarshalEncode(enc, r); err != nil {
 			fmt.Fprintf(os.Stderr, "error: %v\n", err)
 			os.Exit(1)
 		}
@@ -91,39 +98,50 @@ func fetchHTTPActivityReport(
 			ctx, tr, authToken, cfg, activity.Report{},
 		)
 	}
-	q := url.Values{}
-	setIfNotEmpty := func(k, v string) {
-		if v != "" {
-			q.Set(k, v)
+	q := &apiclient.GetAPIV1ActivityReportQuery{}
+	if cfg.Preset != "" {
+		q.Preset = new(apiclient.GetAPIV1ActivityReportQueryPreset(cfg.Preset))
+	}
+	if cfg.Bucket != "" {
+		q.Bucket = new(apiclient.GetAPIV1ActivityReportQueryBucket(cfg.Bucket))
+	}
+	if cfg.From != "" {
+		q.From = new(cfg.From)
+	}
+	if cfg.To != "" {
+		q.To = new(cfg.To)
+	}
+	if cfg.Timezone != "" {
+		q.Timezone = new(cfg.Timezone)
+	}
+	if cfg.Project != "" {
+		q.Project = new(cfg.Project)
+	}
+	if cfg.Agent != "" {
+		q.Agent = new(cfg.Agent)
+	}
+	if cfg.Machine != "" {
+		q.Machine = new(cfg.Machine)
+	}
+	if cfg.Date != "" {
+		date, err := time.Parse(time.DateOnly, cfg.Date)
+		if err != nil {
+			return activity.Report{}, err
 		}
+		q.Date = &runtime.Date{Time: date}
 	}
-	setIfNotEmpty("preset", cfg.Preset)
-	setIfNotEmpty("date", cfg.Date)
-	setIfNotEmpty("from", cfg.From)
-	setIfNotEmpty("to", cfg.To)
-	setIfNotEmpty("timezone", cfg.Timezone)
-	setIfNotEmpty("bucket", cfg.Bucket)
-	setIfNotEmpty("project", cfg.Project)
-	setIfNotEmpty("agent", cfg.Agent)
-	setIfNotEmpty("machine", cfg.Machine)
-
-	endpoint := strings.TrimSuffix(tr.URL, "/") +
-		"/api/v1/activity/report?" + q.Encode()
-	req, err := http.NewRequestWithContext(ctx, http.MethodGet, endpoint, nil)
+	api, err := apiclient.NewHTTPClient(tr.URL, authToken, &http.Client{Timeout: 0})
 	if err != nil {
 		return activity.Report{}, err
 	}
-	if authToken != "" {
-		req.Header.Set("Authorization", "Bearer "+authToken)
-	}
-	req.Header.Set("Accept", "text/event-stream, application/json")
-	resp, err := http.DefaultClient.Do(req)
-	if err != nil {
+	response, err := api.GetAPIV1ActivityReportStreamWithResponse(ctx, &apiclient.GetAPIV1ActivityReportRequestOptions{Query: q})
+	if response == nil {
 		return activity.Report{}, err
 	}
+	resp := response.HTTPResponse
 	defer resp.Body.Close()
 	if resp.StatusCode != http.StatusOK {
-		body, _ := io.ReadAll(resp.Body)
+		body := response.Body
 		return activity.Report{}, fmt.Errorf(
 			"activity report: HTTP %d: %s",
 			resp.StatusCode, strings.TrimSpace(string(body)),
@@ -135,11 +153,11 @@ func fetchHTTPActivityReport(
 		if cfg.ProgressWriter != nil {
 			onProgress = newActivityProgressPrinter(cfg.ProgressWriter)
 		}
-		r, err = parseDaemonPushSSE[activity.Report, activity.Progress](resp.Body, onProgress)
+		r, err = consumeDaemonPushEvents[activity.Report, activity.Progress](response.Stream200, onProgress)
 		if err != nil {
 			return activity.Report{}, err
 		}
-	} else if err := json.NewDecoder(resp.Body).Decode(&r); err != nil {
+	} else if err := json.Unmarshal(response.Body, &r); err != nil {
 		return activity.Report{}, err
 	}
 	if r.Projects == nil {
@@ -156,7 +174,7 @@ func fetchHTTPActivityReport(
 
 func activitySessionPageCustomized(cfg ActivityReportConfig) bool {
 	return cfg.SessionsReportID != "" || cfg.SessionsCursor != "" ||
-		cfg.SessionsBucket != "" ||
+		cfg.SessionsBucketStart != "" || cfg.SessionsBucketEnd != "" ||
 		cfg.SessionsLimit > 0 && cfg.SessionsLimit != activity.DefaultSessionPageLimit ||
 		cfg.SessionsSort != "" && cfg.SessionsSort != string(activity.SessionSortAgentMinutes) ||
 		cfg.SessionsDirection != "" && cfg.SessionsDirection != "desc"
@@ -174,77 +192,66 @@ func fetchHTTPActivitySessionPage(
 		reportID = cfg.SessionsReportID
 	}
 	if reportID == "" {
-		return activity.Report{}, fmt.Errorf(
-			"daemon does not support Activity session paging",
-		)
+		return activity.Report{}, errors.New("daemon does not support Activity session paging")
 	}
 	options, err := activitySessionPageOptions(cfg, nil)
 	if err != nil {
 		return activity.Report{}, err
 	}
-	query := url.Values{}
-	query.Set("limit", strconv.Itoa(options.Limit))
+	query := &apiclient.GetAPIV1ActivityReportReportIDSessionsQuery{Limit: new(int64(options.Limit))}
 	if cfg.SessionsCursor != "" {
-		query.Set("cursor", cfg.SessionsCursor)
-		if cfg.SessionsSort != "" {
-			query.Set("sort", string(options.Sort))
-		}
-		if cfg.SessionsDirection != "" {
-			query.Set("direction", options.Direction)
-		}
-	} else {
-		query.Set("sort", string(options.Sort))
-		query.Set("direction", options.Direction)
+		query.Cursor = new(cfg.SessionsCursor)
 	}
-	if options.Bucket != nil {
-		query.Set("bucket", strconv.Itoa(*options.Bucket))
+	if cfg.SessionsCursor == "" || cfg.SessionsSort != "" {
+		query.Sort = new(apiclient.GetAPIV1ActivityReportReportIDSessionsQuerySort(options.Sort))
+	}
+	if cfg.SessionsCursor == "" || cfg.SessionsDirection != "" {
+		query.Direction = new(apiclient.GetAPIV1ActivityReportReportIDSessionsQueryDirection(options.Direction))
+	}
+	if options.BucketRange != nil {
+		query.BucketStart = new(int64(options.BucketRange.Start))
+		query.BucketEnd = new(int64(options.BucketRange.End))
 	}
 	if cfg.SessionsReportID != "" {
-		query.Set("include_report", "true")
+		query.IncludeReport = new(true)
 	}
-	endpoint := strings.TrimSuffix(tr.URL, "/") + "/api/v1/activity/report/" +
-		url.PathEscape(reportID) + "/sessions?" + query.Encode()
-	req, err := http.NewRequestWithContext(ctx, http.MethodGet, endpoint, nil)
+	api, err := apiclient.NewHTTPClient(tr.URL, authToken, &http.Client{Timeout: 0})
 	if err != nil {
 		return activity.Report{}, err
 	}
-	if authToken != "" {
-		req.Header.Set("Authorization", "Bearer "+authToken)
-	}
-	response, err := http.DefaultClient.Do(req)
-	if err != nil {
+	result, err := api.GetAPIV1ActivityReportReportIDSessionsWithResponse(ctx, &apiclient.GetAPIV1ActivityReportReportIDSessionsRequestOptions{
+		PathParams: &apiclient.GetAPIV1ActivityReportReportIDSessionsPath{ReportID: url.PathEscape(reportID)}, Query: query,
+	})
+	if result == nil {
 		return activity.Report{}, err
 	}
-	defer response.Body.Close()
+	response := result.HTTPResponse
 	if response.StatusCode != http.StatusOK {
-		body, _ := io.ReadAll(response.Body)
+		body := result.Body
 		return activity.Report{}, fmt.Errorf(
 			"activity sessions: HTTP %d: %s",
 			response.StatusCode, strings.TrimSpace(string(body)),
 		)
 	}
-	var page struct {
-		ReportID        string                `json:"report_id"`
-		Sessions        []activity.SessionRow `json:"sessions"`
-		NextCursor      string                `json:"next_cursor"`
-		Total           int                   `json:"total"`
-		RefreshRequired bool                  `json:"refresh_required"`
-		Report          *activity.Report      `json:"report"`
-	}
-	if err := json.NewDecoder(response.Body).Decode(&page); err != nil {
+	if err != nil {
 		return activity.Report{}, err
 	}
+	if len(result.Body) == 0 {
+		return activity.Report{}, io.ErrUnexpectedEOF
+	}
+	page := result.JSON200
 	if page.Report != nil {
 		return *page.Report, nil
 	}
 	if cfg.SessionsReportID != "" {
-		return activity.Report{}, fmt.Errorf(
-			"daemon did not return the requested Activity report generation",
-		)
+		return activity.Report{}, errors.New("daemon did not return the requested Activity report generation")
 	}
 	report.BySession = page.Sessions
-	report.SessionsNextCursor = page.NextCursor
-	report.SessionsTotal = page.Total
+	report.SessionsNextCursor = ""
+	if page.NextCursor != nil {
+		report.SessionsNextCursor = *page.NextCursor
+	}
+	report.SessionsTotal = int(page.Total)
 	return report, nil
 }
 
@@ -271,15 +278,15 @@ func newActivityProgressPrinter(writer io.Writer) func(activity.Progress) {
 }
 
 type cliActivitySessionCursor struct {
-	Version   int                     `json:"v"`
-	Schema    int                     `json:"schema"`
-	Digest    string                  `json:"digest"`
-	Offset    int                     `json:"offset"`
-	Sort      activity.SessionSort    `json:"sort"`
-	Direction string                  `json:"direction"`
-	Bucket    *int                    `json:"bucket,omitempty"`
-	Query     cliActivityCursorQuery  `json:"query"`
-	Filter    cliActivityCursorFilter `json:"filter"`
+	Version     int                     `json:"v"`
+	Schema      int                     `json:"schema"`
+	Digest      string                  `json:"digest"`
+	Offset      int                     `json:"offset"`
+	Sort        activity.SessionSort    `json:"sort"`
+	Direction   string                  `json:"direction"`
+	BucketRange *activity.BucketRange   `json:"bucket_range,omitempty"`
+	Query       cliActivityCursorQuery  `json:"query"`
+	Filter      cliActivityCursorFilter `json:"filter"`
 }
 
 type cliActivityCursorQuery struct {
@@ -309,29 +316,35 @@ func activitySessionPageOptions(
 		Limit: cfg.SessionsLimit, Sort: activity.SessionSort(cfg.SessionsSort),
 		Direction: cfg.SessionsDirection,
 	}
-	if cfg.SessionsBucket != "" {
-		bucket, err := strconv.Atoi(cfg.SessionsBucket)
-		if err != nil || bucket < 0 {
+	if (cfg.SessionsBucketStart == "") != (cfg.SessionsBucketEnd == "") {
+		return activity.SessionPageOptions{}, errors.New("sessions bucket range requires both start and end")
+	}
+	if cfg.SessionsBucketStart != "" {
+		start, startErr := strconv.Atoi(cfg.SessionsBucketStart)
+		end, endErr := strconv.Atoi(cfg.SessionsBucketEnd)
+		if startErr != nil || endErr != nil || start < 0 || end <= start {
 			return activity.SessionPageOptions{}, fmt.Errorf(
-				"invalid sessions bucket %q", cfg.SessionsBucket,
+				"invalid sessions bucket range %q..%q",
+				cfg.SessionsBucketStart, cfg.SessionsBucketEnd,
 			)
 		}
-		options.Bucket = &bucket
+		options.BucketRange = &activity.BucketRange{Start: start, End: end}
 	}
 	var continuation *activity.SessionPageOptions
 	if cursor != nil {
 		continuation = &activity.SessionPageOptions{
-			Sort: cursor.Sort, Direction: cursor.Direction, Bucket: cursor.Bucket,
+			Sort: cursor.Sort, Direction: cursor.Direction,
+			BucketRange: cursor.BucketRange,
 		}
 	}
 	resolved, err := activity.ResolveSessionPageOptions(
 		options, continuation, activity.SessionPageOptionPresence{
 			Sort: cfg.SessionsSort != "", Direction: cfg.SessionsDirection != "",
-			Bucket: cfg.SessionsBucket != "",
+			BucketRange: cfg.SessionsBucketStart != "",
 		},
 	)
 	if err != nil && cursor != nil {
-		return activity.SessionPageOptions{}, fmt.Errorf("invalid sessions cursor")
+		return activity.SessionPageOptions{}, errors.New("invalid sessions cursor")
 	}
 	return resolved, err
 }
@@ -371,11 +384,15 @@ func resolveActivityReport(
 	if cursor != nil {
 		q, f, err = cursor.selection()
 		if err != nil {
-			return activity.Report{}, fmt.Errorf("invalid sessions cursor")
+			return activity.Report{}, errors.New("invalid sessions cursor")
 		}
 		options.Offset = cursor.Offset
 	} else {
 		q, f, err = resolveCLIActivitySelection(cfg)
+		if err != nil {
+			return activity.Report{}, err
+		}
+		f.Machine, err = db.ResolveMachineFilter(context.Background(), database, f.Machine)
 		if err != nil {
 			return activity.Report{}, err
 		}
@@ -391,12 +408,19 @@ func resolveActivityReport(
 	if err != nil {
 		return activity.Report{}, err
 	}
+	if options.BucketRange != nil &&
+		options.BucketRange.End > artifacts.Report.BucketCount {
+		if cursor != nil {
+			return activity.Report{}, errors.New("invalid sessions cursor")
+		}
+		return activity.Report{}, errors.New("invalid activity report bucket")
+	}
 	digest, err := activity.ArtifactDigest(artifacts)
 	if err != nil {
 		return activity.Report{}, err
 	}
 	if cursor != nil && cursor.Digest != digest {
-		return activity.Report{}, fmt.Errorf("invalid sessions cursor")
+		return activity.Report{}, errors.New("invalid sessions cursor")
 	}
 	page, err := activity.PageSessions(artifacts.Sessions, artifacts.Membership, options)
 	if err != nil {
@@ -404,6 +428,7 @@ func resolveActivityReport(
 	}
 	report := artifacts.Report
 	report.BySession = page.Sessions
+	report.SessionsNextCursor = ""
 	report.SessionsTotal = page.Total
 	if page.HasNext {
 		payload, marshalErr := json.Marshal(newCLIActivitySessionCursor(
@@ -467,9 +492,9 @@ func decodeCLIActivitySessionCursor(
 	}
 	var cursor cliActivitySessionCursor
 	if err := json.Unmarshal(payload, &cursor); err != nil ||
-		cursor.Version != 2 || cursor.Schema != export.ActivityReportSchemaVersion ||
+		cursor.Version != 3 || cursor.Schema != export.ActivityReportSchemaVersion ||
 		cursor.Offset < 0 || cursor.Digest == "" {
-		return cliActivitySessionCursor{}, fmt.Errorf("invalid sessions cursor")
+		return cliActivitySessionCursor{}, errors.New("invalid sessions cursor")
 	}
 	return cursor, nil
 }
@@ -479,7 +504,7 @@ func (cursor cliActivitySessionCursor) selection() (
 ) {
 	loc, err := time.LoadLocation(cursor.Query.Timezone)
 	if err != nil || cursor.Query.Timezone != cursor.Filter.Timezone {
-		return activity.Query{}, db.AnalyticsFilter{}, fmt.Errorf("invalid timezone")
+		return activity.Query{}, db.AnalyticsFilter{}, errors.New("invalid timezone")
 	}
 	q := activity.Query{
 		Timezone: cursor.Query.Timezone, Loc: loc,
@@ -507,9 +532,9 @@ func newCLIActivitySessionCursor(
 	f db.AnalyticsFilter,
 ) cliActivitySessionCursor {
 	return cliActivitySessionCursor{
-		Version: 2, Schema: export.ActivityReportSchemaVersion,
+		Version: 3, Schema: export.ActivityReportSchemaVersion,
 		Digest: digest, Offset: offset, Sort: options.Sort,
-		Direction: options.Direction, Bucket: options.Bucket,
+		Direction: options.Direction, BucketRange: options.BucketRange,
 		Query: cliActivityCursorQuery{
 			Timezone: q.Timezone, RangeStart: q.RangeStart, RangeEnd: q.RangeEnd,
 			EffectiveEnd: q.EffectiveEnd, Partial: q.Partial,
@@ -528,7 +553,7 @@ func newCLIActivitySessionCursor(
 func todayIn(tz string) string {
 	loc, err := time.LoadLocation(tz)
 	if err != nil {
-		loc = time.Local
+		loc = time.Local //nolint:forbidigo // Format the CLI report date in the local zone when no valid zone is supplied.
 	}
 	return activityReportNow().In(loc).Format("2006-01-02")
 }

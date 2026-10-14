@@ -29,7 +29,7 @@ func TestReconcileWatchRootsAiderOverlappingRootsReuseStableRunIdentity(t *testi
 	expectedID := "aider:" + expectedRawID
 
 	database := dbtest.OpenTestDB(t)
-	engine := NewEngine(database, EngineConfig{
+	engine := NewEngine(t.Context(), database, EngineConfig{
 		AgentDirs: map[parser.AgentType][]string{
 			parser.AgentAider: {root, repo},
 		},
@@ -74,7 +74,7 @@ func TestReconcileWatchRootsAiderScansOneLargeContainerOnce(t *testing.T) {
 		[]byte(history.String()), 0o644,
 	))
 	database := dbtest.OpenTestDB(t)
-	engine := NewEngine(database, EngineConfig{
+	engine := NewEngine(t.Context(), database, EngineConfig{
 		AgentDirs: map[parser.AgentType][]string{parser.AgentAider: {root}},
 		Machine:   "test-machine",
 	})
@@ -107,7 +107,7 @@ func TestReconcileWatchRootsAiderTombstonesDeletedVirtualRun(t *testing.T) {
 	deletedID := "aider:" + deletedRawID
 
 	database := dbtest.OpenTestDB(t)
-	engine := NewEngine(database, EngineConfig{
+	engine := NewEngine(t.Context(), database, EngineConfig{
 		AgentDirs: map[parser.AgentType][]string{parser.AgentAider: {root}},
 		Machine:   "test-machine",
 	})
@@ -119,12 +119,10 @@ func TestReconcileWatchRootsAiderTombstonesDeletedVirtualRun(t *testing.T) {
 
 	active, err := database.GetSession(t.Context(), deletedID)
 	require.NoError(t, err)
-	assert.Nil(t, active)
+	assert.NotNil(t, active)
 	archived, err := database.GetSessionFull(t.Context(), deletedID)
 	require.NoError(t, err)
-	require.NotNil(t, archived)
-	require.NotNil(t, archived.DeletionCause)
-	assert.Equal(t, "source_missing", *archived.DeletionCause)
+	assertSourceMissingState(t, archived)
 	surviving, err := database.GetSession(t.Context(), survivingID)
 	require.NoError(t, err)
 	assert.NotNil(t, surviving)
@@ -149,7 +147,7 @@ func TestReconcileWatchRootsAiderTombstonesDeletedRunWhenPositionIsReused(t *tes
 	shiftedID := "aider:" + shiftedRawID
 
 	database := dbtest.OpenTestDB(t)
-	engine := NewEngine(database, EngineConfig{
+	engine := NewEngine(t.Context(), database, EngineConfig{
 		AgentDirs: map[parser.AgentType][]string{parser.AgentAider: {root}},
 		Machine:   "test-machine",
 	})
@@ -161,12 +159,10 @@ func TestReconcileWatchRootsAiderTombstonesDeletedRunWhenPositionIsReused(t *tes
 
 	deleted, err := database.GetSession(t.Context(), deletedID)
 	require.NoError(t, err)
-	assert.Nil(t, deleted)
+	assert.NotNil(t, deleted)
 	archived, err := database.GetSessionFull(t.Context(), deletedID)
 	require.NoError(t, err)
-	require.NotNil(t, archived)
-	require.NotNil(t, archived.DeletionCause)
-	assert.Equal(t, "source_missing", *archived.DeletionCause)
+	assertSourceMissingState(t, archived)
 	shifted, err := database.GetSessionFull(t.Context(), shiftedID)
 	require.NoError(t, err)
 	require.NotNil(t, shifted)

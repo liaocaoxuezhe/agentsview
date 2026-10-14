@@ -1,20 +1,14 @@
 // @vitest-environment jsdom
-import {
-  describe,
-  it,
-  expect,
-  vi,
-  beforeEach,
-  afterEach,
-} from "vite-plus/test";
+import { describe, it, expect, vi, beforeEach, afterEach } from "vite-plus/test";
 import { mount, tick, unmount } from "svelte";
 const mocks = vi.hoisted(() => ({
   downloadExport: vi.fn().mockResolvedValue(undefined),
-  getMarkdownExportUrl: vi
-    .fn()
-    .mockReturnValue("/api/v1/sessions/sess-123/md"),
+  getMarkdownExportUrl: vi.fn().mockReturnValue("/api/v1/sessions/sess-123/md"),
   copyToClipboard: vi.fn().mockResolvedValue(true),
+  reportTelemetry: vi.fn(),
 }));
+
+vi.mock("../../utils/telemetry.js", () => ({ reportTelemetry: mocks.reportTelemetry }));
 
 vi.mock("../../api/client.js", () => ({
   downloadExport: mocks.downloadExport,
@@ -38,6 +32,19 @@ import AppHeader from "./AppHeader.svelte";
 
 function testSession(overrides: Partial<Session> = {}): Session {
   return {
+    compaction_count: 0,
+    consecutive_failure_max: 0,
+    edit_churn_count: 0,
+    ended_with_role: "",
+    final_failure_streak: 0,
+    has_peak_context_tokens: false,
+    has_total_output_tokens: false,
+    mid_task_compaction_count: 0,
+    outcome: "",
+    outcome_confidence: "",
+    secret_leak_count: 0,
+    tool_failure_signal_count: 0,
+    tool_retry_count: 0,
     id: "sess-123",
     project: "agentsview",
     machine: "test-machine",
@@ -87,6 +94,33 @@ describe("AppHeader export actions", () => {
     settings.error = null;
   });
 
+  it.each([
+    { archive_only: false, read_only: false, importDisabled: false, syncLabel: "Sync sessions" },
+    { archive_only: false, read_only: true, importDisabled: true, syncLabel: "Refresh data" },
+    { archive_only: true, read_only: false, importDisabled: true, syncLabel: null },
+  ])(
+    "offers the available actions for archive_only=$archive_only read_only=$read_only",
+    async ({ archive_only, read_only, importDisabled, syncLabel }) => {
+      sync.serverVersion = { archive_only, read_only } as NonNullable<typeof sync.serverVersion>;
+      component = mount(AppHeader, { target: document.body });
+      await tick();
+
+      const importButton = document.querySelector<HTMLButtonElement>(".import-btn")!;
+      expect(importButton.disabled).toBe(importDisabled);
+      if (archive_only) expect(importButton.title).toBe("Import unavailable in archive-only mode");
+      else if (read_only) expect(importButton.title).toBe("Import unavailable in read-only mode");
+      const syncButton = document.querySelector<HTMLButtonElement>(".sync-btn");
+      if (syncLabel) expect(syncButton?.getAttribute("aria-label")).toBe(syncLabel);
+      else expect(syncButton).toBeNull();
+      expect(
+        document.querySelector<HTMLButtonElement>('button[aria-label="Export session"]')?.disabled,
+      ).toBe(false);
+      importButton.click();
+      await tick();
+      expect(document.querySelector('[role="dialog"]') !== null).toBe(!importDisabled);
+    },
+  );
+
   it("copies markdown export link from export menu", async () => {
     component = mount(AppHeader, { target: document.body });
     await tick();
@@ -99,10 +133,8 @@ describe("AppHeader export actions", () => {
     exportButton!.click();
     await tick();
 
-    const copyButton = Array.from(
-      document.querySelectorAll<HTMLButtonElement>("button"),
-    ).find((button) =>
-      button.textContent?.includes("Copy markdown export link"),
+    const copyButton = Array.from(document.querySelectorAll<HTMLButtonElement>("button")).find(
+      (button) => button.textContent?.includes("Copy markdown export link"),
     );
     expect(copyButton).not.toBeNull();
 
@@ -112,6 +144,9 @@ describe("AppHeader export actions", () => {
     expect(mocks.getMarkdownExportUrl).toHaveBeenCalledWith("sess-123");
     expect(mocks.copyToClipboard).toHaveBeenCalledWith(
       "http://localhost:3000/api/v1/sessions/sess-123/md",
+    );
+    await vi.waitFor(() =>
+      expect(mocks.reportTelemetry).toHaveBeenCalledWith("export_run", { format: "markdown_link" }),
     );
   });
 
@@ -133,10 +168,8 @@ describe("AppHeader export actions", () => {
     exportButton!.click();
     await tick();
 
-    const copyPathButton = Array.from(
-      document.querySelectorAll<HTMLButtonElement>("button"),
-    ).find((button) =>
-      button.textContent?.includes("Copy source file path"),
+    const copyPathButton = Array.from(document.querySelectorAll<HTMLButtonElement>("button")).find(
+      (button) => button.textContent?.includes("Copy source file path"),
     );
     expect(copyPathButton).toBeDefined();
 
@@ -219,9 +252,7 @@ describe("AppHeader export actions", () => {
     );
 
     expect(sidebarButton).not.toBeNull();
-    expect(sidebarButton?.getAttribute("aria-controls")).toBe(
-      "session-sidebar",
-    );
+    expect(sidebarButton?.getAttribute("aria-controls")).toBe("session-sidebar");
     expect(sidebarButton?.getAttribute("aria-expanded")).toBe("false");
 
     sidebarButton!.click();
@@ -269,13 +300,15 @@ describe("AppHeader export actions", () => {
 
     expect(syncButton).not.toBeNull();
     expect(syncButton?.textContent?.trim()).toBe("Sync");
-    expect(
-      syncButton?.querySelector("svg.lucide-database-backup"),
-    ).not.toBeNull();
+    expect(syncButton?.querySelector("svg.lucide-database-backup")).not.toBeNull();
   });
 
   it("labels read-only global refresh with the refresh action", async () => {
     sync.serverVersion = {
+      api_version: 1,
+      data_version: 1,
+      session_stats_available: false,
+      insight_generation_available: false,
       version: "dev",
       commit: "unknown",
       build_date: "",
@@ -291,14 +324,16 @@ describe("AppHeader export actions", () => {
 
     expect(refreshButton).not.toBeNull();
     expect(refreshButton?.textContent?.trim()).toBe("Refresh");
-    expect(
-      refreshButton?.querySelector("svg.lucide-database-backup"),
-    ).not.toBeNull();
+    expect(refreshButton?.querySelector("svg.lucide-database-backup")).not.toBeNull();
     expect(document.body.textContent).toContain("Recall");
   });
 
   it("keeps Recall available when settings report a read-only backend", async () => {
     sync.serverVersion = {
+      api_version: 1,
+      data_version: 1,
+      session_stats_available: false,
+      insight_generation_available: false,
       version: "dev",
       commit: "unknown",
       build_date: "",

@@ -1,7 +1,10 @@
 package db
 
 import (
+	"context"
 	"time"
+
+	"go.kenn.io/agentsview/internal/stringutil"
 )
 
 // This file is the single centralized validation and sanitization pass
@@ -36,7 +39,7 @@ import (
 //     blanked. Empty-string handling is preserved as-is so downstream
 //     localTime treats a blanked timestamp as invalid.
 //
-// Message.TokenUsage (json.RawMessage) and transient
+// Message.TokenUsage (jsontext.Value) and transient
 // ToolResults.ContentRaw are intentionally not run through this pass. They are
 // raw provider payloads, not persisted display text. Persisted result content
 // (tool_calls.result_content and tool_result_events.content) follows the same
@@ -119,17 +122,38 @@ func (s *ValidationStats) add(o ValidationStats) {
 func ValidateAndSanitize(
 	s *Session, msgs []Message, events []UsageEvent,
 ) ValidationStats {
+	stats, _ := ValidateAndSanitizeContext(
+		context.Background(), s, msgs, events,
+	)
+	return stats
+}
+
+// ValidateAndSanitizeContext applies the central validation contract while
+// allowing bounded callers to stop between rows.
+func ValidateAndSanitizeContext(
+	ctx context.Context,
+	s *Session, msgs []Message, events []UsageEvent,
+) (ValidationStats, error) {
 	var stats ValidationStats
+	if err := ctx.Err(); err != nil {
+		return stats, err
+	}
 	if s != nil {
 		stats.add(SanitizeSession(s))
 	}
 	for i := range msgs {
+		if err := ctx.Err(); err != nil {
+			return stats, err
+		}
 		stats.add(SanitizeMessage(&msgs[i]))
 	}
 	for i := range events {
+		if err := ctx.Err(); err != nil {
+			return stats, err
+		}
 		stats.add(SanitizeUsageEvent(&events[i]))
 	}
-	return stats
+	return stats, ctx.Err()
 }
 
 // SanitizeMessage applies the contract to a single message row.
@@ -191,6 +215,7 @@ func SanitizeMessage(m *Message) ValidationStats {
 	if ClampModel(&m.Model) {
 		stats.ModelClamped++
 	}
+	sanitizeStringField(&m.ReasoningEffort, &stats)
 
 	if clampTokens(&m.ContextTokens) {
 		stats.TokensClamped++
@@ -213,6 +238,10 @@ func sanitizeToolCallContent(
 	// just like result content; unsanitized rows break DuckDB pushes
 	// and force the resync copy path to re-scan them (#945).
 	sanitizeStringField(&tc.InputJSON, stats)
+	// The recorded rendering must keep matching the message content byte
+	// for byte after the content is sanitized, so it gets the same
+	// treatment. Its stripped bytes are already counted under the content.
+	tc.Rendering = SanitizeUTF8(tc.Rendering)
 	sanitizeLengthTrackedString(
 		&tc.ResultContent, &tc.ResultContentLength, stats,
 	)
@@ -300,6 +329,7 @@ func SanitizeSession(s *Session) ValidationStats {
 	var stats ValidationStats
 
 	sanitizeStringField(&s.Project, &stats)
+	sanitizeStringField(&s.GroupKey, &stats)
 	sanitizeStringField(&s.Machine, &stats)
 	sanitizeStringField(&s.Agent, &stats)
 	sanitizeStringField(&s.AgentLabel, &stats)
@@ -307,6 +337,11 @@ func SanitizeSession(s *Session) ValidationStats {
 	sanitizeStringField(&s.SessionKind, &stats)
 	sanitizeStringField(&s.Cwd, &stats)
 	sanitizeStringField(&s.GitBranch, &stats)
+	for i := range s.PRLinks {
+		sanitizeStringField(&s.PRLinks[i].URL, &stats)
+		sanitizeStringField(&s.PRLinks[i].Host, &stats)
+		sanitizeStringField(&s.PRLinks[i].Repository, &stats)
+	}
 	sanitizeStringField(&s.SourceSessionID, &stats)
 	sanitizeStringField(&s.SourceVersion, &stats)
 	sanitizeStringField(&s.TranscriptFidelity, &stats)
@@ -392,19 +427,8 @@ func ClampModel(p *string) bool {
 	if len(*p) <= MaxModelLen {
 		return false
 	}
-	cut := MaxModelLen
-	// Back up to a rune boundary so we never split a multibyte rune.
-	for cut > 0 && !utf8RuneStart((*p)[cut]) {
-		cut--
-	}
-	*p = (*p)[:cut]
+	*p = stringutil.SafeTruncate(*p, MaxModelLen)
 	return true
-}
-
-// utf8RuneStart reports whether b is the first byte of a UTF-8
-// encoded rune (i.e. not a continuation byte 0b10xxxxxx).
-func utf8RuneStart(b byte) bool {
-	return b&0xC0 != 0x80
 }
 
 // ClampParsedTokens bounds a token count to [0, maxPlausibleTokens] and
@@ -437,7 +461,7 @@ func clampTokens(p *int) bool {
 // BlankImplausibleTimestamp blanks a stored timestamp string in place
 // when it parses to a time outside the plausibility window, returning
 // whether it changed. An empty string is left empty (no change), and an
-// unparseable-but-nonempty value is left as-is: downstream localTime
+// unparseable-but-nonempty value is left as-is: downstream LocalTime
 // already treats both as invalid, so blanking only the parseable-yet-
 // absurd case avoids reformatting otherwise-untouched values.
 func BlankImplausibleTimestamp(p *string) bool {
@@ -470,7 +494,7 @@ func BlankImplausibleTimestampPtr(p *string) (*string, bool) {
 }
 
 // ParseStoredTimestamp parses a timestamp stored in the same formats
-// the read path (db.localTime) accepts.
+// the read path (db.LocalTime) accepts.
 func ParseStoredTimestamp(s string) (time.Time, bool) {
 	if t, err := time.Parse(time.RFC3339Nano, s); err == nil {
 		return t, true

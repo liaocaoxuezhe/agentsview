@@ -26,6 +26,16 @@ func testFSNotifyBackend(t *testing.T) *fsnotifyBackend {
 	return backend
 }
 
+func TestBufferedFSNotifyWatchOpsPreservesErrors(t *testing.T) {
+	watcher, err := fsnotify.NewWatcher()
+	require.NoError(t, err)
+	t.Cleanup(func() { _ = watcher.Close() })
+	ops := bufferedFSNotifyWatchOps{Watcher: watcher}
+	require.ErrorIs(t, ops.Add(filepath.Join(t.TempDir(), "absent")), os.ErrNotExist)
+	require.NoError(t, watcher.Close())
+	require.ErrorIs(t, ops.Add(t.TempDir()), fsnotify.ErrClosed)
+}
+
 func TestFSNotifyBackendOverflowRequestsLostEventRecovery(t *testing.T) {
 	backend := testFSNotifyBackend(t)
 	errorInput := make(chan error, 1)
@@ -161,8 +171,41 @@ func TestFSNotifyBackendRemoveDoesNotInheritBudgetSkippedParentOwnership(t *test
 		"budget-skipped parent root must not own explicit nested-root watches")
 }
 
+func TestFSNotifyBackendExcludesExistingLockFileEvents(t *testing.T) {
+	backend, err := newFSNotifyBackend([]string{"*.lock*"})
+	require.NoError(t, err)
+	t.Cleanup(backend.Stop)
+
+	root := t.TempDir()
+	require.NoError(t, backend.AddRecursive(root, math.MaxInt).Err)
+	lockPath := filepath.Join(root, "session.jsonl.events.lock.temporary.pending")
+	normalPath := filepath.Join(root, "session.jsonl")
+
+	for _, op := range []fsnotify.Op{
+		fsnotify.Create,
+		fsnotify.Write,
+		fsnotify.Remove,
+		fsnotify.Rename,
+	} {
+		event, relevant := backend.translateEvent(fsnotify.Event{
+			Name: lockPath,
+			Op:   op,
+		})
+		assert.False(t, relevant, "lock event should be ignored for op %v", op)
+		assert.Equal(t, backendEvent{}, event)
+	}
+
+	event, relevant := backend.translateEvent(fsnotify.Event{
+		Name: normalPath,
+		Op:   fsnotify.Write,
+	})
+	assert.True(t, relevant)
+	assert.Equal(t, filepath.Clean(normalPath), event.Path)
+	assert.Equal(t, backendOpWrite, event.Op)
+}
+
 type blockingRemoveWatchOps struct {
-	watcher       *fsnotify.Watcher
+	watchOps      fsnotifyWatchOps
 	removeStarted chan struct{}
 	allowRemove   chan struct{}
 	addCalled     chan struct{}
@@ -171,7 +214,7 @@ type blockingRemoveWatchOps struct {
 }
 
 type failPathWatchOps struct {
-	watcher  *fsnotify.Watcher
+	watchOps fsnotifyWatchOps
 	failPath string
 	err      error
 }
@@ -180,11 +223,11 @@ func (w *failPathWatchOps) Add(path string) error {
 	if filepath.Clean(path) == filepath.Clean(w.failPath) {
 		return w.err
 	}
-	return w.watcher.Add(path)
+	return w.watchOps.Add(path)
 }
 
 func (w *failPathWatchOps) Remove(path string) error {
-	return w.watcher.Remove(path)
+	return w.watchOps.Remove(path)
 }
 
 func TestFSNotifyBackendRuntimeBudgetDegradesExactScopesToPolling(t *testing.T) {
@@ -309,7 +352,7 @@ func waitForBackendEvent(
 				return event
 			}
 		case <-deadline.C:
-			t.Fatalf("backend event %v for %s was not observed", wantOp, path)
+			require.FailNowf(t, "test failed", "backend event %v for %s was not observed", wantOp, path)
 		}
 	}
 }
@@ -338,7 +381,7 @@ func TestFSNotifyBackendRuntimeAddFailureDegradesExactScopesToPolling(t *testing
 	created := filepath.Join(root, "unwatchable")
 	require.NoError(t, os.Mkdir(created, 0o755))
 	backend.watchOps = &failPathWatchOps{
-		watcher: backend.watcher, failPath: created, err: syscall.ENOSPC,
+		watchOps: backend.watchOps, failPath: created, err: syscall.ENOSPC,
 	}
 	itemType, excluded := backend.watchCreatedPath(created)
 	assert.Equal(t, backendItemDirectory, itemType)
@@ -430,20 +473,20 @@ func TestFSNotifyBackendRuntimeCreateRecursivelyWatchesMovedSubtree(t *testing.T
 				return
 			}
 		case <-deadline.C:
-			t.Fatal("deep write under moved subtree was not observed")
+			require.FailNow(t, "deep write under moved subtree was not observed")
 		}
 	}
 }
 
 func (w *blockingRemoveWatchOps) Add(path string) error {
 	w.addOnce.Do(func() { close(w.addCalled) })
-	return w.watcher.Add(path)
+	return w.watchOps.Add(path)
 }
 
 func (w *blockingRemoveWatchOps) Remove(path string) error {
 	w.removeOnce.Do(func() { close(w.removeStarted) })
 	<-w.allowRemove
-	return w.watcher.Remove(path)
+	return w.watchOps.Remove(path)
 }
 
 func TestFSNotifyBackendConcurrentAddWaitsForRemoveOwnershipDecision(t *testing.T) {
@@ -451,7 +494,7 @@ func TestFSNotifyBackendConcurrentAddWaitsForRemoveOwnershipDecision(t *testing.
 	root := t.TempDir()
 	require.NoError(t, backend.AddShallow(root))
 	barrier := &blockingRemoveWatchOps{
-		watcher:       backend.watcher,
+		watchOps:      backend.watchOps,
 		removeStarted: make(chan struct{}),
 		allowRemove:   make(chan struct{}),
 		addCalled:     make(chan struct{}),
@@ -463,7 +506,7 @@ func TestFSNotifyBackendConcurrentAddWaitsForRemoveOwnershipDecision(t *testing.
 	select {
 	case <-barrier.removeStarted:
 	case <-time.After(time.Second):
-		t.Fatal("Remove did not reach native-watch barrier")
+		require.FailNow(t, "Remove did not reach native-watch barrier")
 	}
 
 	addErr := make(chan error, 1)
@@ -472,7 +515,7 @@ func TestFSNotifyBackendConcurrentAddWaitsForRemoveOwnershipDecision(t *testing.
 	select {
 	case <-barrier.addCalled:
 		addReachedWhileRemoveBlocked = true
-	case <-time.After(50 * time.Millisecond):
+	case <-time.After(50 * time.Millisecond): //nolint:kennlint // absence check; the held Remove barrier keeps the native Add waiting
 	}
 	close(barrier.allowRemove)
 	require.NoError(t, <-removeErr)
@@ -510,8 +553,8 @@ func TestFSNotifyBackendLifecycleStopBeforeStartReturns(t *testing.T) {
 	}()
 	select {
 	case <-stopped:
-	case <-time.After(100 * time.Millisecond):
-		t.Fatal("fsnotify backend Stop blocked before Start")
+	case <-time.After(watcherTestTimeout):
+		require.FailNow(t, "fsnotify backend Stop blocked before Start")
 	}
 	require.NoError(t, backend.Start())
 	backend.Stop()
@@ -551,7 +594,7 @@ func TestFSNotifyBackendLifecycleStartStopRace(t *testing.T) {
 		select {
 		case <-done:
 		case <-time.After(time.Second):
-			t.Fatal("fsnotify backend concurrent Start and Stop deadlocked")
+			require.FailNow(t, "fsnotify backend concurrent Start and Stop deadlocked")
 		}
 		require.NoError(t, <-startErr)
 		backend.Stop()
@@ -591,4 +634,308 @@ func TestFSNotifyBackendAddRecursiveCountsUnreadableSubtreeAsUnwatched(
 	require.NoError(t, result.Err)
 	assert.Positive(t, result.Unwatched,
 		"an unenumerable subtree must count as degraded coverage")
+}
+
+// serialNativeWatcher models fsnotify's Windows backend contract: one reader
+// goroutine delivers events on an unbuffered channel and is the only thing
+// that services Add and Remove requests, and it does so only between
+// deliveries. A request issued while the reader is blocked delivering the
+// next event completes only after that event is consumed.
+type serialNativeWatcher struct {
+	events   chan fsnotify.Event
+	requests chan chan struct{}
+	deliver  chan []fsnotify.Event
+	stop     chan struct{}
+	stopOnce sync.Once
+}
+
+func newSerialNativeWatcher() *serialNativeWatcher {
+	return &serialNativeWatcher{
+		events:   make(chan fsnotify.Event),
+		requests: make(chan chan struct{}, 1),
+		deliver:  make(chan []fsnotify.Event),
+		stop:     make(chan struct{}),
+	}
+}
+
+func (w *serialNativeWatcher) run() {
+	for {
+		select {
+		case <-w.stop:
+			return
+		case reply := <-w.requests:
+			close(reply)
+		case batch := <-w.deliver:
+			for _, event := range batch {
+				select {
+				case w.events <- event:
+				case <-w.stop:
+					return
+				}
+			}
+		}
+	}
+}
+
+func (w *serialNativeWatcher) Stop() { w.stopOnce.Do(func() { close(w.stop) }) }
+
+func (w *serialNativeWatcher) Add(string) error    { return w.request() }
+func (w *serialNativeWatcher) Remove(string) error { return w.request() }
+
+func (w *serialNativeWatcher) request() error {
+	reply := make(chan struct{})
+	select {
+	case w.requests <- reply:
+	case <-w.stop:
+		return errors.New("native watcher stopped")
+	}
+	select {
+	case <-reply:
+		return nil
+	case <-w.stop:
+		return errors.New("native watcher stopped")
+	}
+}
+
+// A directory removal that arrives in the same native batch as another event
+// must not deadlock the backend: the event loop calls Remove on the native
+// watcher, and on Windows that call is serviced by the same goroutine that is
+// blocked delivering the next event to the loop.
+func TestFSNotifyBackendRemoveDuringBatchDoesNotDeadlockEventLoop(t *testing.T) {
+	backend := testFSNotifyBackend(t)
+	native := newSerialNativeWatcher()
+	go native.run()
+	t.Cleanup(native.Stop)
+	backend.watchOps = native
+	backend.eventInput = native.events
+
+	root := t.TempDir()
+	sub := filepath.Join(root, "sub")
+	require.NoError(t, os.Mkdir(sub, 0o755))
+	result := backend.AddRecursive(root, 8)
+	require.NoError(t, result.Err)
+	require.Equal(t, 2, result.Watched)
+	require.NoError(t, backend.Start())
+
+	file := filepath.Join(root, "session.jsonl")
+	native.deliver <- []fsnotify.Event{
+		{Name: sub, Op: fsnotify.Remove},
+		{Name: file, Op: fsnotify.Write},
+	}
+
+	first := requireReceiveWithin(t, backend.Events(), 2*time.Second)
+	assert.Equal(t, sub, first.Path)
+	assert.Equal(t, backendOpRemove, first.Op)
+	second := requireReceiveWithin(t, backend.Events(), 2*time.Second)
+	assert.Equal(t, file, second.Path)
+	assert.Equal(t, backendOpWrite, second.Op)
+
+	stopped := make(chan struct{})
+	go func() {
+		backend.Stop()
+		close(stopped)
+	}()
+	select {
+	case <-stopped:
+	case <-time.After(2 * time.Second):
+		require.FailNow(t, "fsnotify backend Stop hung after a Remove during a native batch")
+	}
+}
+
+// On Windows, fsnotify delivers events and services Add on the same
+// goroutine, and registration installs watches before Start runs. An event
+// arriving between registration Adds must not block the next Add until Start:
+// the pump has to consume native events as soon as watches exist.
+func TestFSNotifyBackendEventBeforeStartDoesNotBlockRegistration(t *testing.T) {
+	backend := testFSNotifyBackend(t)
+	native := newSerialNativeWatcher()
+	go native.run()
+	t.Cleanup(native.Stop)
+	backend.watchOps = native
+	backend.eventInput = native.events
+
+	root := t.TempDir()
+	sub := filepath.Join(root, "sub")
+	require.NoError(t, os.Mkdir(sub, 0o755))
+
+	file := filepath.Join(root, "session.jsonl")
+	// Once deliver hands the batch to the native reader, the reader is
+	// committed to the delivery and services no Add requests until the event
+	// is consumed, exactly like a Windows event arriving mid-registration.
+	native.deliver <- []fsnotify.Event{{Name: file, Op: fsnotify.Write}}
+
+	registered := make(chan RecursiveWatchResult, 1)
+	go func() { registered <- backend.AddRecursive(root, 8) }()
+	select {
+	case result := <-registered:
+		require.NoError(t, result.Err)
+		require.Equal(t, 2, result.Watched)
+	case <-time.After(2 * time.Second):
+		require.FailNow(t, "AddRecursive blocked on a native event delivered before Start")
+	}
+
+	require.NoError(t, backend.Start())
+	event := requireReceiveWithin(t, backend.Events(), 2*time.Second)
+	assert.Equal(t, file, event.Path)
+	assert.Equal(t, backendOpWrite, event.Op)
+}
+
+// Overflow drops raw native events before their watch-maintenance side
+// effects run, so missed creates can leave recursive subtrees without native
+// watches. A full sync recovers the data but not the watches, so the
+// backend must hand recursive roots to polling.
+func TestFSNotifyBackendOverflowTransfersRecursiveRootsToPolling(t *testing.T) {
+	backend := testFSNotifyBackend(t)
+	errorInput := make(chan error, 1)
+	backend.errorInput = errorInput
+	root := t.TempDir()
+	require.NoError(t, backend.AddRecursive(root, 8).Err)
+	obligations := make(chan PollingObligation, 1)
+	backend.bindPollingOwnership(func(obligation PollingObligation) error {
+		obligations <- obligation
+		return nil
+	}, func(string) error { return nil })
+	require.NoError(t, backend.Start())
+
+	errorInput <- fsnotify.ErrEventOverflow
+
+	batch := requireReceiveWithin(t, backend.Events(), 2*time.Second)
+	assert.Equal(t, backendOpFullSync, batch.Op)
+	obligation := requireReceiveWithin(t, obligations, 2*time.Second)
+	assert.Equal(t, "fsnotify-runtime:"+root, obligation.Key)
+}
+
+type scriptedWatchOps struct {
+	mu    sync.Mutex
+	fail  map[string]error
+	added []string
+}
+
+func (o *scriptedWatchOps) Add(path string) error {
+	o.mu.Lock()
+	defer o.mu.Unlock()
+	if err := o.fail[path]; err != nil {
+		return err
+	}
+	o.added = append(o.added, path)
+	return nil
+}
+
+func (o *scriptedWatchOps) Remove(string) error { return nil }
+
+func (o *scriptedWatchOps) setFail(path string, err error) {
+	o.mu.Lock()
+	defer o.mu.Unlock()
+	o.fail[path] = err
+}
+
+func (o *scriptedWatchOps) addCount(path string) int {
+	o.mu.Lock()
+	defer o.mu.Unlock()
+	count := 0
+	for _, added := range o.added {
+		if added == path {
+			count++
+		}
+	}
+	return count
+}
+
+// A dropped shallow-root removal loses the native watch even though the
+// one-time full sync recovers the data, so overflow must revalidate shallow
+// coverage: re-add every shallow watch and hand roots that cannot be
+// re-added to polling, exactly as an observed removal would.
+func TestFSNotifyBackendOverflowReinstallsShallowWatches(t *testing.T) {
+	backend := testFSNotifyBackend(t)
+	errorInput := make(chan error, 1)
+	backend.errorInput = errorInput
+	ops := &scriptedWatchOps{fail: map[string]error{}}
+	backend.watchOps = ops
+	kept := filepath.Join(t.TempDir(), "kept")
+	lost := filepath.Join(t.TempDir(), "lost")
+	require.NoError(t, backend.AddShallow(kept))
+	require.NoError(t, backend.AddShallow(lost))
+	ops.setFail(lost, errors.New("directory removed"))
+	obligations := make(chan PollingObligation, 2)
+	backend.bindPollingOwnership(func(obligation PollingObligation) error {
+		obligations <- obligation
+		return nil
+	}, func(string) error { return nil })
+	require.NoError(t, backend.Start())
+
+	errorInput <- fsnotify.ErrEventOverflow
+
+	event := requireReceiveWithin(t, backend.Events(), 2*time.Second)
+	assert.Equal(t, backendOpFullSync, event.Op)
+	obligation := requireReceiveWithin(t, obligations, 2*time.Second)
+	assert.Equal(t, "fsnotify-runtime:"+lost, obligation.Key)
+	assert.Equal(t, 2, ops.addCount(kept),
+		"a reachable shallow root must have its native watch re-added")
+	select {
+	case extra := <-obligations:
+		require.FailNowf(t, "test failed", "re-addable shallow root was degraded to polling: %+v", extra)
+	default:
+	}
+}
+
+func TestNativeEventQueueOverflowSurfacesLostEventsOnce(t *testing.T) {
+	queue := newNativeEventQueue()
+	stop := make(chan struct{})
+	for range nativeEventQueueLimit + 1 {
+		queue.push(nativeItem{event: fsnotify.Event{Name: "before", Op: fsnotify.Write}})
+	}
+	queue.push(nativeItem{event: fsnotify.Event{Name: "after", Op: fsnotify.Write}})
+
+	first, ok := queue.next(stop)
+	require.True(t, ok)
+	require.ErrorIs(t, first.err, fsnotify.ErrEventOverflow)
+	remaining := []string{}
+	for {
+		item, ok := queue.next(stop)
+		if !ok {
+			break
+		}
+		require.NoError(t, item.err, "overflow must be reported once")
+		remaining = append(remaining, item.event.Name)
+		if item.event.Name == "after" {
+			break
+		}
+	}
+	assert.Equal(t, []string{"after"}, remaining, "events after the overflow survive")
+
+	queue.close()
+	_, ok = queue.next(stop)
+	assert.False(t, ok, "a closed and drained queue reports no more items")
+}
+
+func TestFSNotifyBackendQueueOverflowRequestsFullSync(t *testing.T) {
+	backend := testFSNotifyBackend(t)
+	native := newSerialNativeWatcher()
+	go native.run()
+	t.Cleanup(native.Stop)
+	backend.watchOps = native
+	backend.eventInput = native.events
+	require.NoError(t, backend.Start())
+
+	root := t.TempDir()
+	burst := make([]fsnotify.Event, 0, nativeEventQueueLimit+8)
+	for range cap(burst) {
+		burst = append(burst, fsnotify.Event{Name: filepath.Join(root, "f"), Op: fsnotify.Write})
+	}
+	native.deliver <- burst
+	// The loop is parked on its first forward because nothing reads events
+	// yet, so the pump alone must absorb the rest of the burst. A second
+	// batch is accepted only once the first has been fully delivered.
+	native.deliver <- nil
+
+	sawFullSync := false
+	deadline := time.After(5 * time.Second)
+	for !sawFullSync {
+		select {
+		case event := <-backend.Events():
+			sawFullSync = event.Op == backendOpFullSync
+		case <-deadline:
+			require.FailNow(t, "queue overflow did not request a full sync")
+		}
+	}
 }

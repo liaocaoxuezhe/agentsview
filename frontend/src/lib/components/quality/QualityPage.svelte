@@ -20,16 +20,14 @@
   import { scoreToGrade } from "../../utils/grade.js";
   import { agentLabel } from "../../utils/agents.js";
   import { AnalyticsService } from "../../api/generated/index.js";
-  import { callGenerated, isAbortError } from "../../api/runtime.js";
+  import { isAbortError } from "../../api/runtime.js";
   import { LatestRead } from "../../utils/latest-read.js";
-  import type {
-    AutomatedScope,
-    SignalCalibration,
-    SignalSessionExample,
-  } from "../../api/types.js";
-  import { Card, IconButton, Typeahead } from "@kenn-io/kit-ui";
+  import type { AutomatedScope } from "../../api/types.js";
+import type { DbSignalCalibration as SignalCalibration, DbSignalSessionExample as SignalSessionExample } from "../../api/generated/index.js";
+  import { Card, Typeahead } from "@kenn-io/kit-ui";
   import ProjectTypeahead from "../layout/ProjectTypeahead.svelte";
   import RangePicker from "../shared/RangePicker.svelte";
+  import RefreshControl from "../shared/RefreshControl.svelte";
   import {
     resolveRange,
     selectionFromWindow,
@@ -43,18 +41,16 @@
     type QualityPatternView,
   } from "./qualityPatterns.js";
 
-  const REFRESH_INTERVAL_MS = 5 * 60 * 1000;
   const QUALITY_WINDOW_PARAM = "window_days";
   const QUALITY_DATE_PARAM_KEYS = [
     QUALITY_WINDOW_PARAM,
     "date_from",
     "date_to",
   ] as const;
-  type AnalyticsParams = Parameters<
+  type AnalyticsParams = NonNullable<Parameters<
     typeof AnalyticsService.getApiV1AnalyticsSignals
-  >[0];
+  >[0]>;
 
-  let refreshTimer: ReturnType<typeof setInterval> | undefined;
   let unsubEvents: (() => void) | undefined;
   let selectedSignalId: string | null = $state(null);
   let signalExamples: SignalSessionExample[] = $state([]);
@@ -74,6 +70,7 @@
     buildRuleBasedRecommendations(patterns),
   );
   const loading = $derived(analytics.loading.signals);
+  const querying = $derived(analytics.querying.signals);
   const error = $derived(analytics.errors.signals);
   const earliestSession = $derived(sync.stats?.earliest_session ?? null);
   const rangeSelection = $derived(
@@ -315,14 +312,11 @@
     signalExamplesLoading = true;
     signalExamplesError = null;
     try {
-      const response = await callGenerated(
-        () => AnalyticsService.getApiV1AnalyticsSignalSessions({
+      const response = await AnalyticsService.getApiV1AnalyticsSignalSessions({
           ...params,
           signal,
           limit: 8,
-        }),
-        requestSignal,
-      );
+        }, { signal: requestSignal });
       if (
         signalEvidenceRead.isCurrent(requestSignal) &&
         selectedSignalId === signal &&
@@ -493,10 +487,6 @@
     sessions.loadProjects();
     sessions.loadAgents();
     fetchQualitySignals();
-    refreshTimer = setInterval(
-      () => fetchQualitySignals(),
-      REFRESH_INTERVAL_MS,
-    );
     unsubEvents = events.subscribeDebounced(() => {
       fetchQualitySignals();
     });
@@ -560,7 +550,6 @@
         qualityDateIntentEstablished,
       );
     }
-    if (refreshTimer !== undefined) clearInterval(refreshTimer);
     unsubEvents?.();
   });
 
@@ -581,7 +570,7 @@
   <header class="toolbar">
     <RangePicker
       selection={rangeSelection}
-      busy={loading}
+      busy={querying}
       {earliestSession}
       onSelect={applyRange}
     />
@@ -617,19 +606,23 @@
       </label>
     </div>
 
-    <IconButton
-      class="toolbar-refresh"
-      onclick={handleRefresh}
+    <RefreshControl
+      lastUpdatedAt={analytics.qualityLastUpdatedAt}
+      queryDurationMs={analytics.qualityLastQueryDurationMs}
+      querySteps={analytics.qualityLastQuerySteps}
+      liveQuery={analytics.qualityLiveQuery}
+      busy={querying}
+      onRefresh={handleRefresh}
+      label={m.quality_page_refresh()}
       title={m.quality_page_refresh()}
-      ariaLabel={m.quality_page_refresh()}
-    >
-      <svg width="14" height="14" viewBox="0 0 16 16" fill="currentColor">
-        <path d="M8 3a5 5 0 00-4.546 2.914.5.5 0 01-.908-.418A6 6 0 0114 8a.5.5 0 01-1 0 5 5 0 00-5-5zm4.546 7.086a.5.5 0 01.908.418A6 6 0 012 8a.5.5 0 011 0 5 5 0 005 5 5 5 0 004.546-2.914z"/>
-      </svg>
-    </IconButton>
+    />
   </header>
 
-  <main class="content">
+  <main class="content" class:querying aria-busy={querying}>
+    {#if querying}
+      <div class="query-progress" aria-hidden="true"></div>
+    {/if}
+
     <section class="section-block" aria-labelledby="actions-title">
       <div class="section-heading compact">
         <div>
@@ -916,7 +909,7 @@
                         <span>{agentLabel(example.agent)}</span>
                         <span>{example.outcome || m.insights_page_unknown()}</span>
                         <span>{qualityBadge(example)}</span>
-                        <span>{m.insights_page_failures({ count: example.failure_signals })}</span>
+                        {#if example.failure_signals != null}<span>{m.insights_page_failures({ count: example.failure_signals })}</span>{/if}
                       </span>
                     </Card>
                   {/each}
@@ -1003,10 +996,6 @@
     width: 128px;
   }
 
-  :global(.toolbar-refresh.kit-icon-button) {
-    margin-left: auto;
-  }
-
   .content {
     flex: 1;
     min-height: 0;
@@ -1015,6 +1004,41 @@
     display: flex;
     flex-direction: column;
     gap: var(--space-6);
+    position: relative;
+    transition: opacity 0.12s;
+  }
+
+  .content.querying {
+    opacity: 0.88;
+  }
+
+  .query-progress {
+    position: absolute;
+    top: 0;
+    left: 0;
+    right: 0;
+    z-index: 4;
+    height: 2px;
+    overflow: hidden;
+    background: color-mix(
+      in srgb,
+      var(--accent-blue) 16%,
+      transparent
+    );
+  }
+
+  .query-progress::before {
+    content: "";
+    display: block;
+    width: 38%;
+    height: 100%;
+    background: var(--accent-blue);
+    border-radius: 999px;
+    animation: query-progress 1s ease-in-out infinite;
+  }
+
+  .toolbar :global(.kit-refresh-control) {
+    margin-left: auto;
   }
 
   .section-block {
@@ -1106,7 +1130,6 @@
       var(--border-muted)
     );
   }
-
 
   .summary-grid {
     display: grid;
@@ -1657,6 +1680,15 @@
     }
   }
 
+  @keyframes query-progress {
+    0% {
+      transform: translateX(-105%);
+    }
+    100% {
+      transform: translateX(265%);
+    }
+  }
+
   @media (max-width: 900px) {
     .toolbar,
     .section-heading {
@@ -1664,7 +1696,7 @@
       flex-direction: column;
     }
 
-    :global(.toolbar-refresh.kit-icon-button) {
+    .toolbar :global(.kit-refresh-control) {
       margin-left: 0;
     }
 

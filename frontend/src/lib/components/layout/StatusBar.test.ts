@@ -1,12 +1,5 @@
 // @vitest-environment jsdom
-import {
-  afterEach,
-  beforeEach,
-  describe,
-  expect,
-  it,
-  vi,
-} from "vite-plus/test";
+import { afterEach, beforeEach, describe, expect, it, vi } from "vite-plus/test";
 import { mount, tick, unmount } from "svelte";
 // @ts-ignore
 import StatusBar from "./StatusBar.svelte";
@@ -17,6 +10,7 @@ describe("StatusBar", () => {
   beforeEach(() => {
     vi.useFakeTimers();
     vi.setSystemTime(new Date("2026-04-08T05:00:00Z"));
+    sync.archiveStale = false;
     sync.syncing = false;
     sync.progress = null;
     sync.lastSync = "2026-04-08T05:00:00Z";
@@ -40,6 +34,38 @@ describe("StatusBar", () => {
     sync.backendDegradedMessage = null;
     sync.progress = null;
     sync.syncing = false;
+    sync.archiveStale = false;
+  });
+
+  it("shows stale results guidance until the archive is current", async () => {
+    sync.archiveStale = true;
+    const component = mount(StatusBar, { target: document.body });
+    await tick();
+    expect(document.body.textContent).toContain("Archive results may be stale.");
+    expect(document.body.textContent).not.toContain("Changes are paused");
+    sync.syncing = true;
+    sync.progress = {
+      phase: "preparing_resync",
+      resync: true,
+      projects_total: 0,
+      projects_done: 0,
+      sessions_total: 0,
+      sessions_done: 0,
+      messages_indexed: 0,
+    };
+    await tick();
+    expect(document.body.textContent).toContain(
+      "Archive results may be stale. Changes are paused until the rebuild finishes.",
+    );
+    sync.syncing = false;
+    sync.progress = null;
+    await tick();
+    expect(document.body.textContent).toContain("Archive results may be stale.");
+    expect(document.body.textContent).not.toContain("Changes are paused");
+    sync.archiveStale = false;
+    await tick();
+    expect(document.body.textContent).not.toContain("Archive results may be stale.");
+    await unmount(component);
   });
 
   it("refreshes the sync label as time passes", async () => {
@@ -48,25 +74,19 @@ describe("StatusBar", () => {
     });
 
     await tick();
-    const syncLabel = document.querySelector(
-      ".kit-status-bar__section--right span[title]",
-    );
+    const syncLabel = document.querySelector(".kit-status-bar__section--right span[title]");
     // Compute the expected title through the same i18n path the component
     // uses. toLocaleString(undefined, ...) resolves to the OS locale, which
     // diverges from the Paraglide app locale on non-English systems (#1195).
     const expectedTitle = formatTimestamp(sync.lastSync!);
 
-    expect(document.body.textContent).toContain(
-      "synced just now",
-    );
+    expect(document.body.textContent).toContain("synced just now");
     expect(syncLabel?.getAttribute("title")).toBe(expectedTitle);
 
     await vi.advanceTimersByTimeAsync(70_000);
     await tick();
 
-    expect(document.body.textContent).toContain(
-      "synced 1m ago",
-    );
+    expect(document.body.textContent).toContain("synced 1m ago");
 
     unmount(component);
   });
@@ -77,15 +97,11 @@ describe("StatusBar", () => {
       target: document.body,
     });
     await tick();
-    expect(document.body.textContent).toContain(
-      "remote server unreachable",
-    );
+    expect(document.body.textContent).toContain("remote server unreachable");
 
     sync.remoteUnreachable = false;
     await tick();
-    expect(document.body.textContent).not.toContain(
-      "remote server unreachable",
-    );
+    expect(document.body.textContent).not.toContain("remote server unreachable");
 
     unmount(component);
   });
@@ -99,9 +115,7 @@ describe("StatusBar", () => {
     await tick();
 
     expect(document.body.textContent).toContain("sync not ready");
-    expect(
-      document.querySelector(".backend-warn")?.getAttribute("title"),
-    ).toBe("sync not ready");
+    expect(document.querySelector(".backend-warn")?.getAttribute("title")).toBe("sync not ready");
 
     sync.backendDegraded = false;
     await tick();

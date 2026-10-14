@@ -55,6 +55,15 @@ func (db *DB) GetSessionStats(
 	if err != nil {
 		return nil, &StatsInputError{Msg: err.Error()}
 	}
+	release, err := db.acquireBulkRead(ctx)
+	if err != nil {
+		return nil, err
+	}
+	defer func() {
+		if release != nil {
+			release()
+		}
+	}()
 
 	// Root-only rows drive every consumer (distributions, velocity,
 	// timing, the human/automation split, archetypes, outcomes), so
@@ -143,6 +152,8 @@ func (db *DB) GetSessionStats(
 		return nil, fmt.Errorf("computing adoption: %w", err)
 	}
 
+	release()
+	release = nil
 	if f.IncludeGitOutcomes || f.IncludeGitHubOutcomes {
 		if err := db.computeOutcomeStats(ctx, stats, f, from, to, rows); err != nil {
 			return nil, fmt.Errorf("computing outcome stats: %w", err)
@@ -190,7 +201,7 @@ func (db *DB) computeToolAndModelMix(
 func (db *DB) accumulateToolMix(
 	ctx context.Context, stats *SessionStats, sessionIDs []string,
 ) error {
-	ph, args := inPlaceholders(sessionIDs)
+	ph, args := InPlaceholders(sessionIDs)
 	q := `SELECT category, COUNT(*)
 		FROM tool_calls
 		WHERE session_id IN ` + ph + `
@@ -225,7 +236,7 @@ func (db *DB) accumulateToolMix(
 func (db *DB) accumulateModelMix(
 	ctx context.Context, stats *SessionStats, sessionIDs []string,
 ) error {
-	ph, args := inPlaceholders(sessionIDs)
+	ph, args := InPlaceholders(sessionIDs)
 	q := `SELECT model, COALESCE(SUM(output_tokens), 0)
 		FROM messages
 		WHERE session_id IN ` + ph + `
@@ -291,7 +302,7 @@ func resolveTimezone(name string) (*time.Location, error) {
 }
 
 // windowBounds resolves Since/Until into absolute time bounds.
-// Supported inputs: "Nd" (days), "Nh" (hours), or "YYYY-MM-DD".
+// Supported inputs: "Nd" (days), "Nh" (hours), "YYYY-MM-DD", or RFC3339.
 // Until defaults to now; Since defaults to 28 days before Until.
 // Returned days is the calendar-style span in whole days, rounded
 // up when Since is a non-integer-day duration (e.g. "48h" → 2).
@@ -341,9 +352,9 @@ func windowBounds(
 }
 
 // ParseWindowPoint resolves a single window bound — a compact
-// duration-relative-to-now form ("28d", "12h") or an absolute YYYY-MM-DD
-// date (the start of that UTC day) — to an instant. A duration anchors at
-// now; passing a resolved bound as now lets a caller anchor a duration
+// duration-relative-to-now form ("28d", "12h"), an absolute YYYY-MM-DD
+// date (the start of that UTC day), or an RFC3339 timestamp — to an instant.
+// A duration anchors at now; passing a resolved bound as now anchors it
 // against it (as usage daily anchors --since to --until). Shared by stats'
 // windowBounds and the usage CLI.
 func ParseWindowPoint(s string, now time.Time) (time.Time, error) {
@@ -353,8 +364,11 @@ func ParseWindowPoint(s string, now time.Time) (time.Time, error) {
 	if t, err := time.Parse("2006-01-02", s); err == nil {
 		return t.UTC(), nil
 	}
+	if t, err := time.Parse(time.RFC3339, s); err == nil {
+		return t.UTC(), nil
+	}
 	return time.Time{}, fmt.Errorf(
-		"expected Nd, Nh, or YYYY-MM-DD, got %q", s,
+		"expected Nd, Nh, YYYY-MM-DD, or RFC3339, got %q", s,
 	)
 }
 
@@ -463,7 +477,7 @@ func (db *DB) loadSessionsInWindow(
 	}
 
 	if f.Agent != "" {
-		agents := csvFilterValues(f.Agent)
+		agents := CSVFilterValues(f.Agent)
 		if len(agents) == 1 {
 			preds = append(preds, "agent = ?")
 			args = append(args, agents[0])
@@ -479,12 +493,12 @@ func (db *DB) loadSessionsInWindow(
 	}
 
 	if len(f.IncludeProjects) > 0 {
-		ph, inArgs := inPlaceholders(f.IncludeProjects)
+		ph, inArgs := InPlaceholders(f.IncludeProjects)
 		preds = append(preds, "project IN "+ph)
 		args = append(args, inArgs...)
 	}
 	if len(f.ExcludeProjects) > 0 {
-		ph, inArgs := inPlaceholders(f.ExcludeProjects)
+		ph, inArgs := InPlaceholders(f.ExcludeProjects)
 		preds = append(preds, "project NOT IN "+ph)
 		args = append(args, inArgs...)
 	}
@@ -974,7 +988,7 @@ type sessionCacheTotals struct {
 // the same way keeps merge semantics stable.
 //
 // dollars_spent prices every eligible Claude message using the
-// model_pricing table. dollars_saved_vs_uncached reprices cache_read
+// effective pricing catalog. dollars_saved_vs_uncached reprices cache_read
 // tokens at the input rate and zeroes cache_creation (the
 // counterfactual where the workload never cached), then subtracts
 // dollars_spent. A missing pricing row zeroes out that model's
@@ -1090,14 +1104,14 @@ func (db *DB) accumulateCacheTotals(
 	pricing *export.PricingResolver,
 	perSession map[string]*sessionCacheTotals,
 ) error {
-	ph, args := inPlaceholders(sessionIDs)
+	ph, args := InPlaceholders(sessionIDs)
 	// ORDER BY (session_id, ordinal) so floating-point sums are
 	// reproducible across runs: SQLite is free to return rows in any
 	// physical order otherwise, and (a+b)+c != a+(b+c) in IEEE 754.
 	// The cross-session fold in computeCacheEconomics already sorts
 	// session IDs; the per-message order completes the determinism
 	// chain so golden tests stay byte-stable.
-	q := `SELECT session_id, model, token_usage
+	q := `SELECT session_id, model, token_usage, COALESCE(timestamp, '')
 		FROM messages
 		WHERE session_id IN ` + ph + `
 			AND token_usage != ''
@@ -1110,14 +1124,14 @@ func (db *DB) accumulateCacheTotals(
 	}
 	defer sqlRows.Close()
 	for sqlRows.Next() {
-		var sessionID, model, tokenJSON string
+		var sessionID, model, tokenJSON, timestamp string
 		if err := sqlRows.Scan(
-			&sessionID, &model, &tokenJSON,
+			&sessionID, &model, &tokenJSON, &timestamp,
 		); err != nil {
 			return fmt.Errorf("scanning cache tokens: %w", err)
 		}
 		if err := addMessageToCacheTotals(
-			perSession, sessionID, model, tokenJSON, pricing,
+			perSession, sessionID, model, tokenJSON, timestamp, pricing,
 		); err != nil {
 			return err
 		}
@@ -1130,11 +1144,11 @@ func (db *DB) accumulateCacheTotals(
 // accumulateCacheTotals so the row loop stays a thin scan+dispatch.
 func addMessageToCacheTotals(
 	perSession map[string]*sessionCacheTotals,
-	sessionID, model, tokenJSON string,
+	sessionID, model, tokenJSON, timestamp string,
 	pricing *export.PricingResolver,
 ) error {
-	inputTok, outputTok, cacheCrTok, cacheRdTok :=
-		clampedUsageTokenCounters(tokenJSON)
+	inputTok, outputTok, cacheCrTok, cacheRdTok := clampedUsageTokenCounters(tokenJSON)
+	cacheCr1hTok := clampedCacheCreation1hTokens(tokenJSON)
 
 	totals, ok := perSession[sessionID]
 	if !ok {
@@ -1145,9 +1159,12 @@ func addMessageToCacheTotals(
 	totals.cacheCreateT += int64(cacheCrTok)
 	totals.cacheReadT += int64(cacheRdTok)
 
-	rates := pricing.Lookup(model).Rates
+	_, lookup := pricing.ResolveAt(
+		model, usageLookupModel(model, timestamp), usagePricingTimestamp(timestamp),
+	)
+	rates := lookup.Rates
 	spent, err := rates.CostForTokens(
-		inputTok, outputTok, 0, cacheCrTok, cacheRdTok)
+		inputTok, outputTok, 0, cacheCrTok, cacheCr1hTok, cacheRdTok)
 	if err != nil {
 		return fmt.Errorf("pricing cache usage for model %q: %w", model, err)
 	}
@@ -1162,7 +1179,7 @@ func addMessageToCacheTotals(
 	// (see internal/db/usage.go and the savings calculation in
 	// frontend/src/lib/utils/usageSavings.ts).
 	uncached, err := rates.CostForTokens(
-		inputTok+cacheCrTok+cacheRdTok, outputTok, 0, 0, 0)
+		inputTok+cacheCrTok+cacheRdTok, outputTok, 0, 0, 0, 0)
 	if err != nil {
 		return fmt.Errorf("pricing uncached usage for model %q: %w", model, err)
 	}
@@ -1190,9 +1207,10 @@ func addMessageToCacheTotals(
 // the JSON output emits "hourly_utc": [] rather than null.
 //
 // ReporterTimezone reflects f.Timezone when set (honouring the CLI
-// --timezone flag), otherwise the best-effort local IANA name. When
-// the env/local fallback cannot be resolved safely, the field stays
-// empty so downstream fallback logic can take over.
+// --timezone flag), otherwise the best-effort local IANA name resolved
+// from TZ, the local location, or the OS-aware platform adapter. When
+// no loadable name can be resolved safely, the field stays empty so
+// downstream fallback logic can take over.
 func (db *DB) computeTemporal(
 	ctx context.Context, stats *SessionStats, f StatsFilter,
 	from, to time.Time, sessionIDs []string,
@@ -1253,7 +1271,7 @@ func (db *DB) accumulateHourlyUTC(
 	from, to time.Time,
 	perHour map[string]*TemporalHourlyUTCEntry,
 ) error {
-	ph, args := inPlaceholders(sessionIDs)
+	ph, args := InPlaceholders(sessionIDs)
 	args = append(args,
 		from.UTC().Format(time.RFC3339Nano),
 		to.UTC().Format(time.RFC3339Nano),
@@ -1264,6 +1282,7 @@ func (db *DB) accumulateHourlyUTC(
 		FROM messages m
 		WHERE m.session_id IN ` + ph + `
 			AND m.role = 'user'
+			AND COALESCE(m.source_subtype, '') <> 'tool_result'
 			AND m.timestamp IS NOT NULL
 			AND m.timestamp != ''
 			AND m.timestamp >= ?
@@ -1306,9 +1325,10 @@ func (db *DB) accumulateHourlyUTC(
 // SessionStats.Temporal.ReporterTimezone. Precedence:
 //
 //  1. f.Timezone when non-empty — echoes the --timezone flag.
-//  2. Valid IANA names from TZ or the current local location.
-//  3. Empty string when the fallback name is only a sentinel or
-//     otherwise cannot be resolved safely.
+//  2. Valid IANA names from TZ or the current local location, followed
+//     by the OS-aware platform adapter for identities such as Windows
+//     registry names.
+//  3. Empty string when no loadable name can be resolved safely.
 func reporterTimezone(f StatsFilter) string {
 	if f.Timezone != "" {
 		return f.Timezone
@@ -1452,7 +1472,7 @@ func (db *DB) accumulateAdoption(
 	skillNames map[string]struct{},
 	totalSubagents *int,
 ) error {
-	ph, args := inPlaceholders(sessionIDs)
+	ph, args := InPlaceholders(sessionIDs)
 	q := `SELECT session_id, tool_name, COALESCE(skill_name, '')
 		FROM tool_calls
 		WHERE session_id IN ` + ph + `
@@ -1491,9 +1511,9 @@ func (db *DB) accumulateAdoption(
 // missing git, unreadable config) is logged via the error path but does
 // not abort the aggregation — per-repo errors are swallowed so a single
 // broken checkout can't erase every other repo's numbers. Repos with no
-// resolvable author email are skipped; without an author filter the log
-// aggregation would attribute every other contributor's commits to the
-// local user.
+// resolvable author email are reported as skipped; without an author filter
+// the log aggregation would attribute every other contributor's commits to
+// the local user.
 //
 // PR counts are only populated when f.GHToken is set. When gh is
 // configured, PRsOpened and PRsMerged accumulate across every repo that
@@ -1512,6 +1532,13 @@ func (db *DB) computeOutcomeStats(
 	ctx context.Context, s *SessionStats, f StatsFilter,
 	from, to time.Time, rows []sessionStatsRow,
 ) error {
+	archiveOnly, err := db.IsArchiveOnly(ctx)
+	if err != nil {
+		return err
+	}
+	if archiveOnly {
+		return nil
+	}
 	cwds := make([]string, 0, len(rows))
 	for _, r := range rows {
 		if r.cwd != "" {
@@ -1523,65 +1550,87 @@ func (db *DB) computeOutcomeStats(
 		return nil
 	}
 	since := from.UTC().Format(time.RFC3339)
-	until := to.UTC().Format(time.RFC3339)
+	// Git and GitHub include the upper bound at second precision; stats
+	// windows exclude it. Keep the last whole second strictly before to.
+	until := to.Add(-time.Nanosecond).UTC().Format(time.RFC3339)
 	var cache *git.Cache
 	// Snapshot the writer pool once: CloseWriter can nil it concurrently for a
 	// worker maintenance pass, so a check-then-load would hand git.NewCache a nil
-	// *sql.DB and panic on first use. When the snapshot is nil (writer closed) or
-	// the store is read-only, fall back to the read-only cache: analytics keep
-	// computing from the reader without persisting git stats.
-	if writer := db.rawWriter(); !db.ReadOnly() && writer != nil {
+	// *sql.DB and panic on first use. Compaction reopens the pool before its
+	// rollback window closes, so writerClosed remains the authority even when the
+	// snapshot is non-nil. Fall back to the read-only cache while either barrier
+	// is active so analytics never persists git stats that a rollback can discard.
+	if writer := db.rawWriter(); !db.ReadOnly() && !db.WriterClosed() && writer != nil {
 		cache = git.NewCache(writer)
 	} else {
 		cache = git.NewReadOnlyCache(db.rawReader())
 	}
 	out := &StatsOutcomeStats{}
 	contributed := false
-	for _, repo := range repos {
-		email := git.AuthorEmail(ctx, repo)
-		if email == "" {
-			continue
-		}
-		logRes, err := git.AggregateLogCached(
-			ctx, cache, repo, email, since, until, time.Hour,
-		)
-		if err != nil {
-			// Per-repo failures are logged but don't abort
-			// aggregation across other repos.
-			log.Printf(
-				"computeOutcomeStats: repo=%s op=log err=%v",
-				repo, err,
-			)
-			continue
-		}
-		contributed = true
-		out.ReposActive++
-		out.Commits += logRes.Commits
-		out.LOCAdded += logRes.LOCAdded
-		out.LOCRemoved += logRes.LOCRemoved
-		out.FilesChanged += logRes.FilesChanged
-
-		if f.GHToken != "" {
-			prRes, err := git.AggregatePRsCached(
-				ctx, cache, repo, since, until,
-				f.GHToken, time.Hour,
+	for _, checkouts := range repos {
+		seen := make(map[string]struct{})
+		counted := false
+		for _, repo := range checkouts {
+			email := git.AuthorEmail(ctx, repo)
+			if email == "" {
+				out.Skipped = append(out.Skipped, StatsOutcomeSkippedRepo{
+					Repo: repo, Op: "author", Reason: "no author email configured",
+				})
+				continue
+			}
+			logRes, err := git.AggregateLogCached(
+				ctx, cache, repo, email, since, until, time.Hour, seen,
 			)
 			if err != nil {
+				// Per-repo failures are logged but don't abort
+				// aggregation across other repos. Report the skipped checkout
+				// so callers know its commits are missing from the totals.
 				log.Printf(
-					"computeOutcomeStats: repo=%s op=pr err=%v",
+					"computeOutcomeStats: repo=%s op=log err=%v",
 					repo, err,
 				)
-			} else if prRes != nil {
-				addPtr(&out.PRsOpened, prRes.Opened)
-				addPtr(&out.PRsMerged, prRes.Merged)
+				out.Skipped = append(out.Skipped, StatsOutcomeSkippedRepo{
+					Repo: repo, Op: "log", Reason: err.Error(),
+				})
+				continue
+			}
+			contributed = true
+			out.Commits += logRes.Commits
+			out.LOCAdded += logRes.LOCAdded
+			out.LOCRemoved += logRes.LOCRemoved
+			out.FilesChanged += logRes.FilesChanged
+
+			if counted {
+				continue
+			}
+			counted = true
+			out.ReposActive++
+			if f.GHToken != "" {
+				prRes, err := git.AggregatePRsCached(
+					ctx, cache, repo, since, until,
+					f.GHToken, time.Hour,
+				)
+				if err != nil {
+					log.Printf(
+						"computeOutcomeStats: repo=%s op=pr err=%v",
+						repo, err,
+					)
+					out.Skipped = append(out.Skipped, StatsOutcomeSkippedRepo{
+						Repo: repo, Op: "pr", Reason: err.Error(),
+					})
+				} else if prRes != nil {
+					addPtr(&out.PRsOpened, prRes.Opened)
+					addPtr(&out.PRsMerged, prRes.Merged)
+				}
 			}
 		}
 	}
-	// Leave OutcomeStats nil when every repo was skipped (missing
-	// author email) or every git command failed. Emitting an
-	// all-zero block would falsely advertise "no commits" when the
-	// real signal is "we couldn't derive any".
-	if !contributed {
+	// Leave OutcomeStats nil when no repo contributed and nothing failed —
+	// an all-zero block would falsely advertise "no commits" when the real
+	// signal is "we couldn't derive any". A recorded failure is different:
+	// the block then carries the reason the totals are short, which is the
+	// only way a caller learns the answer is partial.
+	if !contributed && len(out.Skipped) == 0 {
 		return nil
 	}
 	s.OutcomeStats = out

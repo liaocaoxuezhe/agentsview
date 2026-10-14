@@ -14,6 +14,7 @@ import (
 	"go.kenn.io/agentsview/internal/config"
 	"go.kenn.io/agentsview/internal/pathutil"
 	"go.kenn.io/agentsview/internal/service"
+	"go.kenn.io/agentsview/internal/servicehttp"
 	"go.kenn.io/agentsview/internal/timeutil"
 )
 
@@ -51,6 +52,8 @@ func newSessionCommand() *cobra.Command {
 	cmd.AddCommand(newSessionSyncCommand())
 	cmd.AddCommand(newSessionWatchCommand())
 	cmd.AddCommand(newSessionSearchCommand())
+	cmd.AddCommand(newSessionLabelCommand())
+	cmd.AddCommand(newSessionParentCommand())
 	return cmd
 }
 
@@ -71,7 +74,7 @@ func resolveService(
 		if err != nil {
 			return nil, nil, err
 		}
-		return service.NewHTTPBackend(remote, token, false),
+		return servicehttp.NewHTTPBackend(remote, token, false, ""),
 			func() {}, nil
 	}
 	cfg, err := config.LoadPFlags(cmd.Flags())
@@ -91,7 +94,7 @@ func resolveService(
 	if err != nil {
 		return nil, nil, err
 	}
-	return newService(cfg, tr)
+	return newService(cmd.Context(), cfg, tr)
 }
 
 // resolveSinceFlag validates the --since/--active-since pair shared by
@@ -145,7 +148,7 @@ func resolveWritableServiceWithIntent(
 		if err != nil {
 			return nil, nil, err
 		}
-		return service.NewHTTPBackend(remote, token, false),
+		return servicehttp.NewHTTPBackend(remote, token, false, ""),
 			func() {}, nil
 	}
 	if pgReadRequested(cmd) {
@@ -184,7 +187,7 @@ func resolveWritableServiceWithIntent(
 				"is reachable and compatible, or stop it to write locally",
 		)
 	}
-	return syncService(cfg, tr)
+	return syncService(cmd.Context(), cfg, tr)
 }
 
 func resolvePGReadConfig(

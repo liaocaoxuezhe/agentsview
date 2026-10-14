@@ -5,7 +5,8 @@ import (
 	"bytes"
 	"context"
 	"encoding/hex"
-	"encoding/json"
+	"encoding/json/jsontext"
+	"encoding/json/v2"
 	"errors"
 	"fmt"
 	"io"
@@ -17,17 +18,27 @@ import (
 	"strings"
 	"unicode/utf16"
 
+	"go.kenn.io/agentsview/internal/ctxio"
+
 	"github.com/klauspost/compress/zstd"
 )
 
 const (
-	deepSeekHarnessFormatVersion = 0
-	deepSeekHarnessMaxSafeInt    = int64(1<<53 - 1)
-	deepSeekHarnessMaxWindow     = 8 << 20
-	deepSeekHarnessDecoderMemory = 64 << 20
+	// deepSeekHarnessOldestFormatVersion and deepSeekHarnessNewestFormatVersion
+	// bound the released log generations Agentsview interprets. Generation zero
+	// keeps the original suffix-only filename (session.jsonl[.zstd]); later
+	// generations add a lowercase .vN component (session.vN.jsonl[.zstd]).
+	deepSeekHarnessOldestFormatVersion = 0
+	deepSeekHarnessNewestFormatVersion = 4
+	deepSeekHarnessMaxSafeInt          = int64(1<<53 - 1)
+	deepSeekHarnessMaxWindow           = 8 << 20
+	deepSeekHarnessDecoderMemory       = 64 << 20
 )
 
 type deepSeekHarnessHeader struct {
+	Version         int64
+	IsSeeded        bool
+	HasIsSeeded     bool
 	ID              string
 	CreatedAt       int64
 	Cwd             string
@@ -44,9 +55,9 @@ type deepSeekHarnessEvent struct {
 	Type      string
 	Seq       int64
 	Time      int64
-	Data      json.RawMessage
+	Data      jsontext.Value
 	Ignorable bool
-	SurfaceOp json.RawMessage
+	SurfaceOp jsontext.Value
 }
 
 type deepSeekHarnessScan struct {
@@ -71,29 +82,42 @@ func (err deepSeekHarnessUnsupportedError) Error() string {
 	return err.message
 }
 
+// deepSeekHarnessKnownEvents is the union of the released generation-0 and
+// generation-4 inventories plus the compatibility events introduced between
+// them; see the pinned provenance in session-format-sources.md.
 var deepSeekHarnessKnownEvents = map[string]struct{}{
 	"agent-preset/selected": {}, "agent/inbox/spliced": {},
 	"approval/asked": {}, "approval/decided": {}, "approval/policy": {},
-	"assistant/chunk": {}, "assistant/message": {},
+	"assistant/attempt": {}, "assistant/chunk": {}, "assistant/message": {},
 	"command/done": {}, "command/run": {},
 	"compaction/end": {}, "compaction/prune": {}, "compaction/start": {},
-	"compaction/summary": {}, "feedback/record": {}, "goal/change": {},
-	"hook/invoked": {}, "hook/result": {}, "llm/retry": {},
-	"llm/retry-started": {}, "permission/preset": {}, "plan/mode": {},
+	"compaction/summary": {}, "deliverables/presented": {}, "developer/message": {},
+	"feedback/message-delete": {}, "feedback/message-put": {},
+	"feedback/record": {}, "goal/change": {},
+	"hook/invoked": {}, "hook/result": {}, "image/offload": {}, "llm/retry": {},
+	"llm/retry-started": {}, "model/selection": {},
+	"permission/preset": {}, "plan/mode": {},
 	"request/context": {}, "request/header": {}, "sandbox/mode": {},
-	"schedule/change": {}, "session/end-seed": {}, "session/title": {},
+	"schedule/change": {}, "session-log-deepseek/delivery-accepted": {},
+	"session/end-seed": {}, "session/title": {},
 	"session/title-llm-request": {}, "step/end": {}, "step/start": {},
-	"subagent/descriptor": {}, "todo/write": {},
+	"subagent/catalog": {}, "subagent/descriptor": {},
+	"subagent/model-selection-policy": {}, "system/message": {},
+	"team/member": {}, "team/message/delivered": {},
+	"team/message/queued": {}, "team/task": {}, "todo/write": {},
 	"tool-workflow/agent-end": {}, "tool-workflow/agent-start": {},
 	"tool-workflow/run-end": {}, "tool-workflow/run-start": {},
 	"tool/call": {}, "tool/code-dispatch": {},
-	"tool/code-dispatch-start": {}, "tool/result": {},
+	"tool/code-dispatch-start": {}, "tool/ptc-dispatch": {},
+	"tool/ptc-dispatch-start": {}, "tool/result": {},
 	"turn/end": {}, "turn/start": {}, "user/message": {},
-	"web/deepseek-search-llm-request": {},
+	"web/deepseek-search-llm-request": {}, "workspace/changes": {},
+	"working-directory/change": {},
 }
 
 var deepSeekHarnessSurfaceEvents = map[string]struct{}{
-	"user/message": {}, "assistant/message": {}, "tool/result": {},
+	"system/message": {}, "developer/message": {}, "user/message": {}, "assistant/message": {},
+	"tool/result": {},
 }
 
 func scanDeepSeekHarnessLog(
@@ -137,7 +161,7 @@ func scanDeepSeekHarnessLog(
 		source = decoder
 	}
 
-	reader := newDeepSeekHarnessLineReader(&contextReader{ctx: ctx, r: source})
+	reader := newDeepSeekHarnessLineReader(ctxio.Reader{Context: ctx, Reader: source})
 	headerLine, complete, lineErr := reader.next()
 	if lineErr != nil {
 		return deepSeekHarnessScan{}, classifyDeepSeekHarnessPhysicalError(path, lineErr)
@@ -197,8 +221,7 @@ func scanDeepSeekHarnessLog(
 		}
 		decoded, decodeErr := decodeDeepSeekHarnessRecord(line)
 		if decodeErr != nil {
-			var unsupported deepSeekHarnessUnsupportedError
-			if errors.As(decodeErr, &unsupported) {
+			if _, ok := errors.AsType[deepSeekHarnessUnsupportedError](decodeErr); ok {
 				return deepSeekHarnessScan{}, decodeErr
 			}
 			if issue == nil {
@@ -239,8 +262,7 @@ func scanDeepSeekHarnessLog(
 		if consume != nil {
 			for _, event := range decoded {
 				if err := consume(header, event); err != nil {
-					var unsupported deepSeekHarnessUnsupportedError
-					if errors.As(err, &unsupported) {
+					if _, ok := errors.AsType[deepSeekHarnessUnsupportedError](err); ok {
 						return deepSeekHarnessScan{}, err
 					}
 					issue = fmt.Errorf("event row %d: %w", lineNo, err)
@@ -419,7 +441,7 @@ func validateDeepSeekHarnessZstdHeaderFrame(
 		return fmt.Errorf("open DeepSeek Harness zstd header frame: %w", err)
 	}
 	defer decoder.Close()
-	reader := newDeepSeekHarnessLineReader(&contextReader{ctx: ctx, r: decoder})
+	reader := newDeepSeekHarnessLineReader(ctxio.Reader{Context: ctx, Reader: decoder})
 	line, complete, readErr := reader.next()
 	if readErr != nil || !complete || len(line) == 0 {
 		return errors.New("corrupt DeepSeek Harness zstd log: first frame has no complete header line")
@@ -429,18 +451,6 @@ func validateDeepSeekHarnessZstdHeaderFrame(
 		return errors.New("corrupt DeepSeek Harness zstd log: first frame is not exactly one header line")
 	}
 	return nil
-}
-
-type contextReader struct {
-	ctx context.Context
-	r   io.Reader
-}
-
-func (r *contextReader) Read(p []byte) (int, error) {
-	if err := r.ctx.Err(); err != nil {
-		return 0, err
-	}
-	return r.r.Read(p)
 }
 
 type deepSeekHarnessLineReader struct {
@@ -511,7 +521,10 @@ func parseDeepSeekHarnessHeader(line []byte) (deepSeekHarnessHeader, error) {
 		return deepSeekHarnessHeader{}, errors.New("invalid DeepSeek Harness header: version is not a number")
 	}
 	numericVersion, numericErr := strconv.ParseFloat(version.String(), 64)
-	if numericErr != nil || numericVersion != deepSeekHarnessFormatVersion {
+	if numericErr != nil ||
+		numericVersion != math.Trunc(numericVersion) ||
+		numericVersion < deepSeekHarnessOldestFormatVersion ||
+		numericVersion > deepSeekHarnessNewestFormatVersion {
 		return deepSeekHarnessHeader{}, deepSeekHarnessUnsupportedError{message: fmt.Sprintf(
 			"unsupported DeepSeek Harness session format version %s", version,
 		)}
@@ -539,7 +552,17 @@ func parseDeepSeekHarnessHeader(line []byte) (deepSeekHarnessHeader, error) {
 		return deepSeekHarnessHeader{}, fmt.Errorf("invalid DeepSeek Harness header: %w", err)
 	}
 	header := deepSeekHarnessHeader{
-		ID: id, CreatedAt: createdAt, DelegationDepth: depth,
+		Version: int64(numericVersion), ID: id, CreatedAt: createdAt,
+		DelegationDepth: depth,
+	}
+	if raw, ok := fields["isSeeded"]; ok {
+		if err := json.Unmarshal(raw, &header.IsSeeded); err != nil {
+			return deepSeekHarnessHeader{}, errors.New("DeepSeek Harness header has invalid isSeeded")
+		}
+		header.HasIsSeeded = true
+	}
+	if header.Version >= 2 && !header.HasIsSeeded {
+		return deepSeekHarnessHeader{}, errors.New("DeepSeek Harness header is missing isSeeded")
 	}
 	if raw, ok := fields["cwd"]; ok {
 		header.Cwd, err = deepSeekHarnessString(raw)
@@ -579,9 +602,16 @@ func parseDeepSeekHarnessHeader(line []byte) (deepSeekHarnessHeader, error) {
 func validateDeepSeekHarnessPathIdentity(
 	path string, header deepSeekHarnessHeader,
 ) error {
+	pathVersion, versionOK := deepSeekHarnessPathVersion(path)
+	if !versionOK || pathVersion != header.Version {
+		return fmt.Errorf(
+			"DeepSeek Harness header version %d does not match source path",
+			header.Version,
+		)
+	}
 	encodedID := filepath.Base(filepath.Dir(path))
 	if encodeDeepSeekHarnessSegment(header.ID) != encodedID {
-		return fmt.Errorf("DeepSeek Harness header id does not match source path")
+		return errors.New("DeepSeek Harness header id does not match source path")
 	}
 	projectDir := filepath.Base(filepath.Dir(filepath.Dir(path)))
 	wantProject := "_no-cwd"
@@ -589,7 +619,7 @@ func validateDeepSeekHarnessPathIdentity(
 		wantProject = deepSeekHarnessProjectKey(header.Cwd)
 	}
 	if projectDir != wantProject {
-		return fmt.Errorf("DeepSeek Harness header cwd does not match source path")
+		return errors.New("DeepSeek Harness header cwd does not match source path")
 	}
 	return nil
 }
@@ -626,7 +656,7 @@ func decodeDeepSeekHarnessRecord(line []byte) ([]deepSeekHarnessEvent, error) {
 }
 
 func parseDeepSeekHarnessEvent(
-	fields map[string]json.RawMessage,
+	fields map[string]jsontext.Value,
 ) (deepSeekHarnessEvent, error) {
 	for key := range fields {
 		switch key {
@@ -675,8 +705,8 @@ func parseDeepSeekHarnessEvent(
 		)
 	}
 	if hasSourceEventSeqs {
-		if _, err := deepSeekHarnessSafeIntArray(sourceEventSeqs, true); err != nil {
-			return deepSeekHarnessEvent{}, errors.New("event sourceEventSeqs is invalid")
+		if err := validateDeepSeekHarnessSourceEventSeqs(sourceEventSeqs, seq); err != nil {
+			return deepSeekHarnessEvent{}, fmt.Errorf("event sourceEventSeqs is invalid: %w", err)
 		}
 	}
 	if hasSurfaceOp {
@@ -690,7 +720,7 @@ func parseDeepSeekHarnessEvent(
 	}, nil
 }
 
-func validateDeepSeekHarnessSurfaceOp(raw json.RawMessage) error {
+func validateDeepSeekHarnessSurfaceOp(raw jsontext.Value) error {
 	var appendOp string
 	if json.Unmarshal(raw, &appendOp) == nil {
 		if appendOp == "append" {
@@ -704,24 +734,30 @@ func validateDeepSeekHarnessSurfaceOp(raw json.RawMessage) error {
 	if err != nil {
 		return errors.New("invalid surface operation")
 	}
-	if !deepSeekHarnessExactKeys(fields, "op", "start", "end") {
-		return errors.New("invalid surface replacement")
+	startKey, endKey := "start", "end"
+	if !deepSeekHarnessExactKeys(fields, "op", startKey, endKey) {
+		// Generation 3 canonicalized envelope replacements to the explicit
+		// startSeq/endSeq coordinate names.
+		startKey, endKey = "startSeq", "endSeq"
+		if !deepSeekHarnessExactKeys(fields, "op", startKey, endKey) {
+			return errors.New("invalid surface replacement")
+		}
 	}
 	op, err := deepSeekHarnessRequiredString(fields, "op")
 	if err != nil || op != "replace" {
 		return errors.New("invalid surface replacement")
 	}
-	if _, err := deepSeekHarnessRequiredSafeInt(fields, "start", true); err != nil {
+	if _, err := deepSeekHarnessRequiredSafeInt(fields, startKey, true); err != nil {
 		return err
 	}
-	if _, err := deepSeekHarnessRequiredSafeInt(fields, "end", true); err != nil {
+	if _, err := deepSeekHarnessRequiredSafeInt(fields, endKey, true); err != nil {
 		return err
 	}
 	return nil
 }
 
 func expandDeepSeekHarnessPackedRow(
-	typeName string, fields map[string]json.RawMessage,
+	typeName string, fields map[string]jsontext.Value,
 ) ([]deepSeekHarnessEvent, error) {
 	if !deepSeekHarnessExactKeys(fields, "type", "seq0", "time0", "data") {
 		return nil, errors.New("packed chunk row has unexpected fields")
@@ -819,15 +855,15 @@ func expandDeepSeekHarnessPackedRow(
 	return events, nil
 }
 
-func decodeDeepSeekHarnessObject(raw []byte) (map[string]json.RawMessage, error) {
-	var fields map[string]json.RawMessage
+func decodeDeepSeekHarnessObject(raw []byte) (map[string]jsontext.Value, error) {
+	var fields map[string]jsontext.Value
 	if err := json.Unmarshal(raw, &fields); err != nil || fields == nil {
 		return nil, errors.New("expected JSON object")
 	}
 	return fields, nil
 }
 
-func deepSeekHarnessExactKeys(fields map[string]json.RawMessage, keys ...string) bool {
+func deepSeekHarnessExactKeys(fields map[string]jsontext.Value, keys ...string) bool {
 	if len(fields) != len(keys) {
 		return false
 	}
@@ -840,7 +876,7 @@ func deepSeekHarnessExactKeys(fields map[string]json.RawMessage, keys ...string)
 }
 
 func deepSeekHarnessRequiredString(
-	fields map[string]json.RawMessage, key string,
+	fields map[string]jsontext.Value, key string,
 ) (string, error) {
 	raw, ok := fields[key]
 	if !ok {
@@ -853,7 +889,7 @@ func deepSeekHarnessRequiredString(
 	return value, nil
 }
 
-func deepSeekHarnessString(raw json.RawMessage) (string, error) {
+func deepSeekHarnessString(raw jsontext.Value) (string, error) {
 	var value string
 	if err := json.Unmarshal(raw, &value); err != nil {
 		return "", err
@@ -862,7 +898,7 @@ func deepSeekHarnessString(raw json.RawMessage) (string, error) {
 }
 
 func deepSeekHarnessRequiredSafeInt(
-	fields map[string]json.RawMessage, key string, nonNegative bool,
+	fields map[string]jsontext.Value, key string, nonNegative bool,
 ) (int64, error) {
 	raw, ok := fields[key]
 	if !ok {
@@ -884,29 +920,22 @@ func deepSeekHarnessRequiredSafeInt(
 	return int64(numeric), nil
 }
 
-func deepSeekHarnessJSONNumber(raw json.RawMessage) (json.Number, error) {
-	decoder := json.NewDecoder(strings.NewReader(string(raw)))
-	decoder.UseNumber()
-	var value any
-	if err := decoder.Decode(&value); err != nil {
-		return "", err
+func deepSeekHarnessJSONNumber(raw jsontext.Value) (jsontext.Value, error) {
+	if raw.Kind() != jsontext.KindNumber {
+		return nil, errors.New("value is not a JSON number")
 	}
-	number, ok := value.(json.Number)
-	if !ok {
-		return "", errors.New("value is not a JSON number")
-	}
-	return number, nil
+	return raw, nil
 }
 
-func deepSeekHarnessSafeIntArray(raw json.RawMessage, nonNegative bool) ([]int64, error) {
-	var values []json.RawMessage
+func deepSeekHarnessSafeIntArray(raw jsontext.Value, nonNegative bool) ([]int64, error) {
+	var values []jsontext.Value
 	if err := json.Unmarshal(raw, &values); err != nil {
 		return nil, err
 	}
 	out := make([]int64, 0, len(values))
 	for _, rawValue := range values {
 		value, err := deepSeekHarnessRequiredSafeInt(
-			map[string]json.RawMessage{"value": rawValue}, "value", nonNegative,
+			map[string]jsontext.Value{"value": rawValue}, "value", nonNegative,
 		)
 		if err != nil {
 			return nil, err
@@ -916,7 +945,49 @@ func deepSeekHarnessSafeIntArray(raw json.RawMessage, nonNegative bool) ([]int64
 	return out, nil
 }
 
-func deepSeekHarnessStringArray(raw json.RawMessage) ([]string, error) {
+func validateDeepSeekHarnessSourceEventSeqs(raw jsontext.Value, maxEntries int64) error {
+	if raw.Kind() != '[' {
+		return errors.New("expected array")
+	}
+	var entries []jsontext.Value
+	if err := json.Unmarshal(raw, &entries); err != nil {
+		return err
+	}
+	// Lineage is not used for transcript reconstruction. Validate inclusive
+	// ranges and their expanded count without allocating the expanded list.
+	previous := int64(-1)
+	hasRange, increasing := false, true
+	for _, entry := range entries {
+		var start, end int64
+		if entry.Kind() == '[' {
+			pair, err := deepSeekHarnessSafeIntArray(entry, true)
+			if err != nil || len(pair) != 2 || pair[0] > pair[1] {
+				return errors.New("expected safe integer range [start, end] with start <= end")
+			}
+			start, end = pair[0], pair[1]
+			hasRange = true
+		} else {
+			value, err := deepSeekHarnessRequiredSafeInt(map[string]jsontext.Value{"value": entry}, "value", true)
+			if err != nil {
+				return err
+			}
+			start, end = value, value
+		}
+		count := end - start + 1
+		if count > maxEntries {
+			return errors.New("expanded sources exceed event sequence")
+		}
+		maxEntries -= count
+		increasing = increasing && start > previous
+		previous = end
+	}
+	if hasRange && !increasing {
+		return errors.New("ranges must be strictly increasing")
+	}
+	return nil
+}
+
+func deepSeekHarnessStringArray(raw jsontext.Value) ([]string, error) {
 	var values []string
 	if err := json.Unmarshal(raw, &values); err != nil {
 		return nil, err

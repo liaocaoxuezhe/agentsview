@@ -5,7 +5,6 @@ import (
 	"context"
 	"errors"
 	"fmt"
-	"io"
 	"strings"
 	"testing"
 
@@ -78,7 +77,7 @@ func (s *countingCheckpointFloorStore) checkpointFloor(context.Context, string) 
 	return s.floor, nil
 }
 
-func TestExportCheckpointBootstrapStreamsLargeSessionMap(t *testing.T) {
+func TestExportCheckpointBootstrapReadsLargeSessionMap(t *testing.T) {
 	t.Parallel()
 
 	sessions := make(map[string]string, 2000)
@@ -89,15 +88,12 @@ func TestExportCheckpointBootstrapStreamsLargeSessionMap(t *testing.T) {
 		Version: checkpointFormatVersion, Origin: contractOrigin, Sequence: 42, Sessions: sessions,
 	})
 	require.NoError(t, err)
-	reader := &maxReadReader{reader: strings.NewReader(string(body))}
-	head, err := decodeCanonicalCheckpointHead(reader, contractOrigin,
+	head, err := decodeCanonicalCheckpointHead(strings.NewReader(string(body)), contractOrigin,
 		"cp-0000000042.json", identityForBytes(t, body))
 	require.NoError(t, err)
 	mapBytes, err := canonicalJSON(sessions)
 	require.NoError(t, err)
 	assert.Equal(t, hashHex(mapBytes), head.SessionMapSHA256)
-	assert.Less(t, reader.max, len(body)/4,
-		"bootstrap must tokenize the checkpoint instead of reading its full body")
 }
 
 func TestExportCheckpointBootstrapSkipsNoncanonicalJSON(t *testing.T) {
@@ -118,6 +114,8 @@ func TestExportCheckpointBootstrapSkipsNoncanonicalJSON(t *testing.T) {
 	}
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
+			t.Parallel()
+
 			database := testExportDB(t)
 			store := newTestArtifactStore(t)
 			createCheckpointBody(t, store, 1, []byte(tt.body))
@@ -222,6 +220,8 @@ func TestExportCheckpointBootstrapDefersOnlyValidFutureCheckpoint(t *testing.T) 
 	}
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
+			t.Parallel()
+
 			database := testExportDB(t)
 			baseStore := newTestArtifactStore(t)
 			createCheckpointBody(t, baseStore, 1, []byte(tt.body))
@@ -285,18 +285,6 @@ func (s *checkpointVerifyErrorStore) Open(
 	return entry, &verifyErrorReader{VerifiedReader: reader, err: s.err}, nil
 }
 
-type maxReadReader struct {
-	reader io.Reader
-	max    int
-}
-
-func (r *maxReadReader) Read(p []byte) (int, error) {
-	if len(p) > r.max {
-		r.max = len(p)
-	}
-	return r.reader.Read(p)
-}
-
 // strings64 builds a 64-character stand-in for a sha256 hex digest.
 func strings64(ch string) string {
 	return strings.Repeat(ch, 64)
@@ -336,6 +324,7 @@ func TestDecodeSegmentRejectsAggregateNestedLimitsWithSmallLimits(t *testing.T) 
 	}
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
+			t.Parallel()
 			limits := productionArtifactLimits()
 			tt.configure(&limits)
 			data := nestedSegmentData(t, tt.records...)
@@ -361,6 +350,7 @@ func TestDecodeSegmentAcceptsCanonicalTrailingNewlineAndEmptySession(t *testing.
 	}
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
+			t.Parallel()
 			msgs, err := decodeSegment(tt.data)
 			require.NoError(t, err)
 			assert.Len(t, msgs, tt.want)

@@ -46,6 +46,11 @@
     usage.summary?.totals.cacheReadTokens ?? 0,
   );
 
+  // Everything the model read: uncached input plus cache writes and reads.
+  const totalInputTokens = $derived(
+    inputTokens + cacheCreationTokens + cacheReadTokens,
+  );
+
   const totalTokens = $derived(
     usage.summary
       ? sumSelectedTokens(
@@ -128,7 +133,7 @@
     }
     switch (usage.selectedTokenTypes[0]) {
       case "input":
-        return m.usage_summary_input_tokens();
+        return m.usage_uncached_input();
       case "cache_write":
         return m.usage_cache_writes();
       case "cache_read":
@@ -178,7 +183,11 @@
           featured: true,
         },
         {
-          label: () => m.usage_summary_input_tokens(),
+          label: () => m.usage_summary_total_input(),
+          value: () => fmtTokens(totalInputTokens),
+        },
+        {
+          label: () => m.usage_uncached_input(),
           value: () => fmtTokens(inputTokens),
           sub: () =>
             cachedTokens > 0
@@ -209,9 +218,7 @@
           label: () => m.analytics_summary_projects(),
           value: () =>
             String(
-              Object.keys(
-                usage.summary?.sessionCounts.byProject ?? {},
-              ).length,
+              usage.summary?.projectTotals.length ?? 0,
             ),
         },
         {
@@ -232,7 +239,7 @@
         sub: () => vsPrior ?? "",
         featured: true,
       },
-      ...(usage.summary?.totals.copilotAICredits
+      ...(usage.colorSummary?.totals.copilotAICredits
         ? [
             {
               label: () => m.usage_summary_copilot_ai_credits(),
@@ -241,7 +248,11 @@
           ]
         : []),
       {
-        label: () => m.usage_summary_input_tokens(),
+        label: () => m.usage_summary_total_input(),
+        value: () => fmtTokens(totalInputTokens),
+      },
+      {
+        label: () => m.usage_uncached_input(),
         value: () => fmtTokens(inputTokens),
         sub: () =>
           cachedTokens > 0
@@ -273,9 +284,7 @@
         label: () => m.analytics_summary_projects(),
         value: () =>
           String(
-            Object.keys(
-              usage.summary?.sessionCounts.byProject ?? {},
-            ).length,
+            usage.summary?.projectTotals.length ?? 0,
           ),
       },
       {
@@ -321,7 +330,7 @@
     <span>{usage.errors.summary}</span>
     <button
       class="retry-btn"
-      onclick={() => usage.fetchSummary()}
+      onclick={() => usage.fetchAll({ preserveTimeRange: true })}
     >
       {m.shared_retry()}
     </button>
@@ -338,6 +347,7 @@
   .summary-cards :global(.card) {
     flex: 1;
     min-width: 120px;
+    min-height: 90px;
     padding: 12px;
     display: flex;
     flex-direction: column;

@@ -3,6 +3,7 @@ package parser
 import (
 	"context"
 	"crypto/sha256"
+	"encoding/hex"
 	"errors"
 	"fmt"
 	"os"
@@ -32,11 +33,9 @@ func (f vscodeCopilotProviderFactory) Capabilities() Capabilities {
 func (f vscodeCopilotProviderFactory) NewProvider(cfg ProviderConfig) Provider {
 	cfg = cfg.Clone()
 	return &vscodeCopilotProvider{
-		ProviderBase: ProviderBase{
-			Def:    cloneAgentDef(f.def),
-			Caps:   vscodeCopilotProviderCapabilities(),
-			Config: cfg,
-		},
+		Def:     cloneAgentDef(f.def),
+		Caps:    vscodeCopilotProviderCapabilities(),
+		Config:  cfg,
 		sources: newVSCodeCopilotSourceSet(cfg.Roots),
 	}
 }
@@ -89,7 +88,7 @@ func (p *vscodeCopilotProvider) Parse(
 	}
 	path, project, ok := p.sources.pathFromSource(req.Source)
 	if !ok {
-		return ParseOutcome{}, fmt.Errorf("vscode copilot source path unavailable")
+		return ParseOutcome{}, errors.New("vscode copilot source path unavailable")
 	}
 	if req.Source.ProjectHint != "" {
 		project = req.Source.ProjectHint
@@ -434,7 +433,7 @@ func (s vscodeCopilotSourceSet) Fingerprint(
 	}
 	path, _, ok := s.pathFromSource(source)
 	if !ok {
-		return SourceFingerprint{}, fmt.Errorf("vscode copilot source path unavailable")
+		return SourceFingerprint{}, errors.New("vscode copilot source path unavailable")
 	}
 	info, err := os.Stat(path)
 	if err != nil {
@@ -716,7 +715,7 @@ func vscodeCopilotSourceHash(path, workspacePath string) (string, error) {
 	}
 	h := sha256.New()
 	_, _ = h.Write([]byte("chat\x00" + hash + "\x00workspace\x00" + workspaceHash))
-	return fmt.Sprintf("%x", h.Sum(nil)), nil
+	return hex.EncodeToString(h.Sum(nil)), nil
 }
 
 func vscodeCopilotProviderCapabilities() Capabilities {
@@ -736,6 +735,7 @@ func vscodeCopilotProviderCapabilities() Capabilities {
 		},
 		Content: ContentCapabilities{
 			FirstMessage:         CapabilitySupported,
+			SessionName:          CapabilitySupported,
 			ToolCalls:            CapabilitySupported,
 			ToolResults:          CapabilitySupported,
 			Thinking:             CapabilitySupported,

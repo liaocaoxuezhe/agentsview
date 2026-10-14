@@ -67,6 +67,15 @@ func TestVectorConfigValidate(t *testing.T) {
 			wantErr: "model is required",
 		},
 		{
+			name:    "enabled negative recall_max_revision_lag",
+			mutate:  func(c *VectorConfig) { c.RecallMaxRevisionLag = -1 },
+			wantErr: "recall_max_revision_lag",
+		},
+		{
+			name:   "enabled zero recall_max_revision_lag is valid",
+			mutate: func(c *VectorConfig) { c.RecallMaxRevisionLag = 0 },
+		},
+		{
 			name:    "enabled missing dimension",
 			mutate:  func(c *VectorConfig) { c.Embeddings.Dimension = 0 },
 			wantErr: "dimension",
@@ -85,6 +94,11 @@ func TestVectorConfigValidate(t *testing.T) {
 			name:    "enabled negative max_input_chars",
 			mutate:  func(c *VectorConfig) { c.Embeddings.MaxInputChars = -1 },
 			wantErr: "max_input_chars",
+		},
+		{
+			name:    "enabled negative model_context_tokens",
+			mutate:  func(c *VectorConfig) { c.Embeddings.ModelContextTokens = -1 },
+			wantErr: "model_context_tokens",
 		},
 		{
 			name:    "enabled with no servers",
@@ -132,6 +146,43 @@ func TestVectorConfigValidate(t *testing.T) {
 				mutateServer(c, "local", func(s *VectorEmbeddingsServerConfig) { s.BatchSize = -1 })
 			},
 			wantErr: "batch_size",
+		},
+		{
+			name: "server negative max_batch_tokens",
+			mutate: func(c *VectorConfig) {
+				mutateServer(c, "local", func(s *VectorEmbeddingsServerConfig) {
+					s.MaxBatchTokens = -1
+				})
+			},
+			wantErr: "max_batch_tokens",
+		},
+		{
+			name: "server max_batch_tokens requires model context",
+			mutate: func(c *VectorConfig) {
+				mutateServer(c, "local", func(s *VectorEmbeddingsServerConfig) {
+					s.MaxBatchTokens = 120000
+				})
+			},
+			wantErr: "requires [vector.embeddings] model_context_tokens",
+		},
+		{
+			name: "server max_batch_tokens must fit one model context",
+			mutate: func(c *VectorConfig) {
+				c.Embeddings.ModelContextTokens = 32000
+				mutateServer(c, "local", func(s *VectorEmbeddingsServerConfig) {
+					s.MaxBatchTokens = 30000
+				})
+			},
+			wantErr: "must be at least model_context_tokens",
+		},
+		{
+			name: "server token budget accepts Voyage repro limits",
+			mutate: func(c *VectorConfig) {
+				c.Embeddings.ModelContextTokens = 32000
+				mutateServer(c, "local", func(s *VectorEmbeddingsServerConfig) {
+					s.MaxBatchTokens = 120000
+				})
+			},
 		},
 		{
 			name: "server zero concurrency",
@@ -239,6 +290,8 @@ func TestVectorConfigDefaults(t *testing.T) {
 		"run_after_sync defaults to true when unset")
 	assert.False(t, cfg.Vector.Embed.Recall,
 		"automatic Recall embedding requires explicit opt-in")
+	assert.Equal(t, DefaultRecallMaxRevisionLag, cfg.Vector.RecallMaxRevisionLag,
+		"the Recall index may trail the corpus by the default lag")
 
 	disabled := false
 	cfg.Vector.Embed.RunAfterSync = &disabled
@@ -255,10 +308,10 @@ func TestVectorConfigDefaults(t *testing.T) {
 
 func TestVectorConfigAPIKeyEnv(t *testing.T) {
 	server := VectorEmbeddingsServerConfig{}
-	assert.Equal(t, "", server.APIKey(), "no env var configured")
+	assert.Empty(t, server.APIKey(), "no env var configured")
 
 	server.APIKeyEnv = "AGENTSVIEW_TEST_VECTOR_API_KEY"
-	assert.Equal(t, "", server.APIKey(), "configured env var not set in environment")
+	assert.Empty(t, server.APIKey(), "configured env var not set in environment")
 
 	t.Setenv("AGENTSVIEW_TEST_VECTOR_API_KEY", "secret-123")
 	assert.Equal(t, "secret-123", server.APIKey())
@@ -284,12 +337,14 @@ func TestVectorConfigTOMLLoad(t *testing.T) {
 			"vector": map[string]any{
 				"enabled": true,
 				"embeddings": map[string]any{
-					"model":     "nomic-embed-text",
-					"dimension": 768,
+					"model":                "nomic-embed-text",
+					"dimension":            768,
+					"model_context_tokens": 32000,
 					"servers": map[string]any{
 						"local": map[string]any{
-							"endpoint":    "http://localhost:11434/v1",
-							"max_retries": 0,
+							"endpoint":         "http://localhost:11434/v1",
+							"max_retries":      0,
+							"max_batch_tokens": 120000,
 						},
 					},
 				},
@@ -302,7 +357,9 @@ func TestVectorConfigTOMLLoad(t *testing.T) {
 		assert.Equal(t, 4, server.Concurrency, "unset concurrency keeps default")
 		assert.Equal(t, "30s", server.Timeout, "unset timeout keeps default")
 		assert.Equal(t, 0, server.MaxRetries, "explicit max_retries=0 overrides default")
+		assert.Equal(t, 120000, server.MaxBatchTokens)
 		assert.Equal(t, 8192, cfg.Vector.Embeddings.MaxInputChars, "unset max_input_chars keeps default")
+		assert.Equal(t, 32000, cfg.Vector.Embeddings.ModelContextTokens)
 		assert.Equal(t, "24h", cfg.Vector.Embed.BackstopInterval, "unset backstop_interval keeps default")
 		assert.False(t, cfg.Vector.IncludeAutomated, "unset include_automated keeps the false default")
 		assert.Empty(t, cfg.Vector.Embeddings.QueryPrefix, "unset query_prefix defaults to empty")
@@ -402,6 +459,23 @@ func TestVectorConfigTOMLLoad(t *testing.T) {
 		assert.Equal(t, "300s", remote.Timeout, "per-server timeout override")
 		assert.Equal(t, 6, remote.Concurrency, "per-server concurrency override")
 		assert.Equal(t, 32, remote.BatchSize, "unset per-server batch_size keeps default")
+	})
+
+	t.Run("recall_max_revision_lag is loaded, including an explicit 0", func(t *testing.T) {
+		for _, want := range []int{0, 32} {
+			cfg := loadMinimalWithConfig(t, map[string]any{
+				"vector": map[string]any{
+					"enabled":                 true,
+					"recall_max_revision_lag": want,
+					"embeddings": map[string]any{
+						"model":     "nomic-embed-text",
+						"dimension": 768,
+						"servers":   minimalServers(),
+					},
+				},
+			})
+			assert.Equal(t, want, cfg.Vector.RecallMaxRevisionLag)
+		}
 	})
 
 	t.Run("include_automated true is loaded", func(t *testing.T) {
@@ -548,5 +622,161 @@ func TestVectorConfigTOMLLoad(t *testing.T) {
 				assert.Contains(t, err.Error(), tt.wantErr)
 			})
 		}
+	})
+}
+
+// TestVectorConfigTOMLLoadUnknownKeys covers #1866: keys under [vector] that
+// no config field decodes loaded without error and were then dropped. A
+// max_batch_tokens written under [vector.embeddings] instead of the per-server
+// table left builds at the default batch size with no diagnostic.
+func TestVectorConfigTOMLLoadUnknownKeys(t *testing.T) {
+	serverOnly := []struct {
+		key   string
+		value any
+	}{
+		{"endpoint", "http://localhost:11434/v1"},
+		{"ollama_cpu_fallback", true},
+		{"api_key_env", "OPENAI_API_KEY"},
+		{"batch_size", 8},
+		{"max_batch_tokens", 32768},
+		{"concurrency", 4},
+		{"timeout", "300s"},
+		{"max_retries", 1},
+	}
+	for _, tt := range serverOnly {
+		t.Run(tt.key+" in the parent table fails to load", func(t *testing.T) {
+			embeddings := map[string]any{
+				"model":                "nomic-embed-text",
+				"dimension":            768,
+				"model_context_tokens": 32000,
+				"servers":              minimalServers(),
+			}
+			embeddings[tt.key] = tt.value
+			err := loadMinimalErrWithConfig(t, map[string]any{
+				"vector": map[string]any{
+					"enabled":    true,
+					"embeddings": embeddings,
+				},
+			})
+			require.Error(t, err)
+			assert.Contains(t, err.Error(), tt.key)
+			assert.Contains(t, err.Error(), "[vector.embeddings.servers.<name>]")
+		})
+	}
+
+	unknown := []struct {
+		name string
+		// place writes the unknown key into an otherwise valid section.
+		place func(vector, embeddings, server map[string]any)
+		want  string
+	}{
+		{
+			name: "misspelled enabled key",
+			place: func(vector, _, _ map[string]any) {
+				delete(vector, "enabled")
+				vector["enabeld"] = true
+			},
+			want: "vector.enabeld",
+		},
+		{
+			name: "misspelled key under vector",
+			place: func(vector, _, _ map[string]any) {
+				vector["include_automatd"] = true
+			},
+			want: "vector.include_automatd",
+		},
+		{
+			name: "misspelled key under vector.embeddings",
+			place: func(_, embeddings, _ map[string]any) {
+				embeddings["model_context_token"] = 32000
+			},
+			want: "vector.embeddings.model_context_token",
+		},
+		{
+			name: "misspelled key in a server table",
+			place: func(_, _, server map[string]any) {
+				server["max_batch_token"] = 32768
+			},
+			want: "vector.embeddings.servers.local.max_batch_token",
+		},
+	}
+	for _, tt := range unknown {
+		t.Run(tt.name+" fails to load", func(t *testing.T) {
+			server := map[string]any{"endpoint": "http://localhost:11434/v1"}
+			embeddings := map[string]any{
+				"model":     "nomic-embed-text",
+				"dimension": 768,
+				"servers":   map[string]any{"local": server},
+			}
+			vector := map[string]any{"enabled": true, "embeddings": embeddings}
+			tt.place(vector, embeddings, server)
+			err := loadMinimalErrWithConfig(t, map[string]any{"vector": vector})
+			require.Error(t, err)
+			assert.Contains(t, err.Error(), tt.want)
+			assert.Contains(t, err.Error(), "unknown config key")
+		})
+	}
+
+	t.Run("unknown key outside vector still loads", func(t *testing.T) {
+		cfg := loadMinimalWithConfig(t, map[string]any{
+			"not_a_real_key": true,
+			"vector": map[string]any{
+				"enabled": true,
+				"embeddings": map[string]any{
+					"model":     "nomic-embed-text",
+					"dimension": 768,
+					"servers":   minimalServers(),
+				},
+			},
+		})
+		assert.True(t, cfg.Vector.Enabled)
+	})
+
+	t.Run("correctly placed max_batch_tokens still applies", func(t *testing.T) {
+		cfg := loadMinimalWithConfig(t, map[string]any{
+			"vector": map[string]any{
+				"enabled": true,
+				"embeddings": map[string]any{
+					"model":                "nomic-embed-text",
+					"dimension":            768,
+					"model_context_tokens": 32000,
+					"servers": map[string]any{
+						"local": map[string]any{
+							"endpoint":         "http://localhost:11434/v1",
+							"max_batch_tokens": 120000,
+						},
+					},
+				},
+			},
+		})
+		assert.Equal(t, 120000, cfg.Vector.Embeddings.Servers["local"].MaxBatchTokens)
+	})
+
+	t.Run("no max_batch_tokens anywhere is unaffected", func(t *testing.T) {
+		cfg := loadMinimalWithConfig(t, map[string]any{
+			"vector": map[string]any{
+				"enabled": true,
+				"embeddings": map[string]any{
+					"model":     "nomic-embed-text",
+					"dimension": 768,
+					"servers":   minimalServers(),
+				},
+			},
+		})
+		assert.Zero(t, cfg.Vector.Embeddings.Servers["local"].MaxBatchTokens)
+	})
+
+	t.Run("disabled section with a misplaced key fails to load", func(t *testing.T) {
+		err := loadMinimalErrWithConfig(t, map[string]any{
+			"vector": map[string]any{
+				"enabled": false,
+				"embeddings": map[string]any{
+					"max_batch_tokens": 32768,
+				},
+			},
+		})
+		require.Error(t, err)
+		assert.Contains(t, err.Error(), "max_batch_tokens")
+		assert.Contains(t, err.Error(), "[vector.embeddings.servers.<name>]")
 	})
 }

@@ -9,6 +9,7 @@ import (
 	"os"
 	"os/exec"
 	"path/filepath"
+	"slices"
 	"strings"
 	"testing"
 
@@ -16,6 +17,62 @@ import (
 	"github.com/stretchr/testify/require"
 	"go.kenn.io/agentsview/internal/pricing/catalog"
 )
+
+func TestRetainMissingModels(t *testing.T) {
+	current := []catalog.ModelPricing{{ModelPattern: "current", InputPerMTok: mustRate("4")}}
+	retained := []catalog.ModelPricing{
+		{ModelPattern: "current", InputPerMTok: mustRate("5")},
+		{ModelPattern: "retired", InputPerMTok: mustRate("1.5")},
+		{ModelPattern: "retired", InputPerMTok: mustRate("9")},
+	}
+	wantCurrent, wantRetained := slices.Clone(current), slices.Clone(retained)
+	got := retainMissingModels(current, retained)
+	assert.Equal(t, []catalog.ModelPricing{
+		{ModelPattern: "current", InputPerMTok: mustRate("4")},
+		{ModelPattern: "retired", InputPerMTok: mustRate("1.5")},
+	}, got)
+	assert.Equal(t, wantCurrent, current)
+	assert.Equal(t, wantRetained, retained)
+	got[0].ModelPattern = "mutated"
+	assert.Equal(t, "current", current[0].ModelPattern)
+}
+
+func FuzzRetainMissingModels(f *testing.F) {
+	f.Add("current", "retired")
+	f.Add("same", "same")
+	f.Fuzz(func(t *testing.T, currentName, retiredName string) {
+		current := []catalog.ModelPricing{{ModelPattern: currentName, InputPerMTok: mustRate("4")}}
+		retained := []catalog.ModelPricing{
+			{ModelPattern: currentName, InputPerMTok: mustRate("5")},
+			{ModelPattern: retiredName, InputPerMTok: mustRate("1.5")},
+			{ModelPattern: retiredName, InputPerMTok: mustRate("9")},
+		}
+		got := retainMissingModels(current, retained)
+		require.NotEmpty(t, got)
+		assert.Equal(t, current[0], got[0], "current row must win")
+		if currentName == retiredName {
+			assert.Len(t, got, 1)
+		} else {
+			require.Len(t, got, 2)
+			assert.Equal(t, retiredName, got[1].ModelPattern)
+			assert.Equal(t, mustRate("1.5"), got[1].InputPerMTok)
+		}
+		assert.Equal(t, currentName, current[0].ModelPattern)
+		assert.Equal(t, mustRate("5"), retained[0].InputPerMTok)
+	})
+}
+
+func TestValidateSnapshotFileRejectsInvalidRetainedSourceRef(t *testing.T) {
+	path := writeSnapshotFile(t, []byte(`{
+		"version": "litellm-test",
+		"source_ref": "551e5d097c11f08fd2400a25a651b1844fcf89c2",
+		"retained_source_ref": "main",
+		"models": [{"ModelPattern": "test", "InputPerMTok": {"microdollars": 1000000}}]
+	}`))
+	err := validateSnapshotFile(path)
+	require.Error(t, err)
+	assert.Contains(t, err.Error(), "immutable retained LiteLLM source ref")
+}
 
 func TestAppendModelOverlay_FillsGaps(t *testing.T) {
 	base := []catalog.ModelPricing{
@@ -47,6 +104,32 @@ func TestAppendModelOverlay_DoesNotOverwriteExisting(t *testing.T) {
 		}
 	}
 	require.Equal(t, 1, count, "no duplicate entries for existing model")
+}
+
+func TestAppendModelOverlay_Carries1hCacheWriteRates(t *testing.T) {
+	byPattern := make(map[string]catalog.ModelPricing)
+	for _, p := range appendModelOverlay(nil) {
+		byPattern[p.ModelPattern] = p
+	}
+
+	// Anthropic bills 1h cache writes at 2x input; every overlaid Claude
+	// model with a 5m rate must carry the matching 1h rate so a
+	// regenerated snapshot prices 1h writes correctly even for models
+	// absent from the upstream catalog.
+	for model, price := range byPattern {
+		if !strings.HasPrefix(model, "claude-") {
+			continue
+		}
+		if price.CacheCreationPerMTok.Microdollars == 0 {
+			continue
+		}
+		assert.Equal(t,
+			2*price.InputPerMTok.Microdollars,
+			price.CacheCreation1hPerMTok.Microdollars,
+			"%s 1h cache-write rate", model)
+	}
+	require.Equal(t, int64(20_000_000),
+		byPattern["claude-fable-5"].CacheCreation1hPerMTok.Microdollars)
 }
 
 func TestComputeVersion_Deterministic(t *testing.T) {
@@ -183,15 +266,10 @@ func TestRestoreSnapshotFileRestoresPinnedArtifact(t *testing.T) {
 	runGit(t, repo, "commit", "-m", "snapshot")
 	ref := runGit(t, repo, "rev-parse", "HEAD")
 
-	cwd, err := os.Getwd()
-	require.NoError(t, err)
-	require.NoError(t, os.Chdir(repo))
-	defer func() {
-		require.NoError(t, os.Chdir(cwd))
-	}()
+	t.Chdir(repo)
 
 	out := filepath.Join(repo, "out", "snapshot.json.gz")
-	require.NoError(t, restoreSnapshotFile(
+	require.NoError(t, restoreSnapshotFile(t.Context(),
 		out,
 		ref,
 		"litellm_snapshot.json.gz",
@@ -234,15 +312,10 @@ func TestRestoreSnapshotFileFetchesPinnedArtifactAfterBranchAdvances(t *testing.
 
 	clone := filepath.Join(t.TempDir(), "clone")
 	runGit(t, "", "clone", "--depth=1", fileURLForPath(remote), clone)
-	cwd, err := os.Getwd()
-	require.NoError(t, err)
-	require.NoError(t, os.Chdir(clone))
-	t.Cleanup(func() {
-		require.NoError(t, os.Chdir(cwd))
-	})
+	t.Chdir(clone)
 
 	out := filepath.Join(clone, "out", "snapshot.json.gz")
-	require.NoError(t, restoreSnapshotFile(
+	require.NoError(t, restoreSnapshotFile(t.Context(),
 		out,
 		oldRef,
 		"litellm_snapshot.json.gz",
@@ -270,15 +343,10 @@ func TestRestoreSnapshotFileDownloadsPinnedArtifactWithoutGitCheckout(t *testing
 	t.Cleanup(server.Close)
 
 	workspace := t.TempDir()
-	cwd, err := os.Getwd()
-	require.NoError(t, err)
-	require.NoError(t, os.Chdir(workspace))
-	t.Cleanup(func() {
-		require.NoError(t, os.Chdir(cwd))
-	})
+	t.Chdir(workspace)
 
 	out := filepath.Join(workspace, "snapshot", "litellm_snapshot.json.gz")
-	require.NoError(t, restoreSnapshotFile(
+	require.NoError(t, restoreSnapshotFile(t.Context(),
 		out,
 		"deadbeefdeadbeefdeadbeefdeadbeefdeadbeef",
 		"litellm_snapshot.json.gz",
@@ -313,7 +381,7 @@ func gzipSnapshot(t *testing.T, data []byte) []byte {
 func runGit(t *testing.T, dir string, args ...string) string {
 	t.Helper()
 
-	cmd := exec.Command("git", args...)
+	cmd := exec.CommandContext(t.Context(), "git", args...)
 	cmd.Dir = dir
 	out, err := cmd.CombinedOutput()
 	require.NoError(t, err, "git %v failed:\n%s", args, out)

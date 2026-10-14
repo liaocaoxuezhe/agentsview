@@ -2,6 +2,7 @@ package parser
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"os"
 	"path/filepath"
@@ -32,11 +33,9 @@ func (f commandCodeProviderFactory) Capabilities() Capabilities {
 func (f commandCodeProviderFactory) NewProvider(cfg ProviderConfig) Provider {
 	cfg = cfg.Clone()
 	return &commandCodeProvider{
-		ProviderBase: ProviderBase{
-			Def:    cloneAgentDef(f.def),
-			Caps:   commandCodeProviderCapabilities(),
-			Config: cfg,
-		},
+		Def:     cloneAgentDef(f.def),
+		Caps:    commandCodeProviderCapabilities(),
+		Config:  cfg,
 		sources: newCommandCodeSourceSet(cfg.Roots),
 	}
 }
@@ -97,10 +96,10 @@ func (p *commandCodeProvider) Parse(
 		return ParseOutcome{}, err
 	}
 	if !ok {
-		return ParseOutcome{}, fmt.Errorf("commandcode source path unavailable")
+		return ParseOutcome{}, errors.New("commandcode source path unavailable")
 	}
 	machine := firstNonEmptyJSONLString(req.Machine, p.Config.Machine)
-	sess, msgs, err := p.parseSession(path, machine)
+	sess, msgs, err := p.parseSessionContext(ctx, path, machine)
 	if err != nil {
 		return ParseOutcome{}, err
 	}

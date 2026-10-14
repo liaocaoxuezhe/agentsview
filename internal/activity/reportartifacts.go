@@ -3,7 +3,9 @@ package activity
 import (
 	"crypto/sha256"
 	"encoding/hex"
-	"encoding/json"
+	"encoding/json/jsontext"
+	"encoding/json/v2"
+	"errors"
 	"fmt"
 	"slices"
 	"strings"
@@ -38,6 +40,9 @@ type ProgressFunc func(Progress)
 // archive changes may force a harmless refresh, while the canonical artifact
 // digest remains the final consistency check.
 type SourceProbe struct {
+	HostedIdentityRevision    int64  `json:"hosted_identity_revision,omitempty"`
+	HostedSelectionRevision   int64  `json:"hosted_selection_revision,omitempty"`
+	HostedCorpusRevision      int64  `json:"hosted_corpus_revision,omitempty"`
 	SessionCount              int64  `json:"session_count"`
 	MaxSessionModified        string `json:"max_session_modified"`
 	MaxDataVersion            int64  `json:"max_data_version"`
@@ -45,6 +50,7 @@ type SourceProbe struct {
 	MaxUsageID                int64  `json:"max_usage_id"`
 	MaxPricingUpdated         string `json:"max_pricing_updated"`
 	ProjectIdentityGeneration int64  `json:"project_identity_generation"`
+	PreparedUsageFingerprint  string `json:"prepared_usage_fingerprint,omitempty"`
 }
 
 type SessionSort string
@@ -58,20 +64,25 @@ const (
 )
 
 type SessionPageOptions struct {
-	Limit     int
-	Offset    int
-	Sort      SessionSort
-	Direction string
-	Bucket    *int
+	Limit       int
+	Offset      int
+	Sort        SessionSort
+	Direction   string
+	BucketRange *BucketRange
+}
+
+type BucketRange struct {
+	Start int `json:"start"`
+	End   int `json:"end"` // Exclusive.
 }
 
 // SessionPageOptionPresence records which cursor-bound options the caller
 // explicitly supplied. Omitted options inherit their values from a
 // continuation cursor; explicit values must match it.
 type SessionPageOptionPresence struct {
-	Sort      bool
-	Direction bool
-	Bucket    bool
+	Sort        bool
+	Direction   bool
+	BucketRange bool
 }
 
 type SessionPage struct {
@@ -90,7 +101,7 @@ func NormalizeSessionPageOptions(options SessionPageOptions) (SessionPageOptions
 		options.Limit = MaxSessionPageLimit
 	}
 	if options.Offset < 0 {
-		return SessionPageOptions{}, fmt.Errorf("session page offset must be non-negative")
+		return SessionPageOptions{}, errors.New("session page offset must be non-negative")
 	}
 	if options.Sort == "" {
 		options.Sort = SessionSortAgentMinutes
@@ -108,6 +119,10 @@ func NormalizeSessionPageOptions(options SessionPageOptions) (SessionPageOptions
 		return SessionPageOptions{}, fmt.Errorf(
 			"invalid activity session direction %q", options.Direction,
 		)
+	}
+	if options.BucketRange != nil &&
+		(options.BucketRange.Start < 0 || options.BucketRange.End <= options.BucketRange.Start) {
+		return SessionPageOptions{}, errors.New("invalid activity session bucket range")
 	}
 	return options, nil
 }
@@ -128,21 +143,22 @@ func ResolveSessionPageOptions(
 		return SessionPageOptions{}, err
 	}
 	if presence.Sort && requested.Sort != normalizedContinuation.Sort {
-		return SessionPageOptions{}, fmt.Errorf("activity session sort does not match cursor")
+		return SessionPageOptions{}, errors.New("activity session sort does not match cursor")
 	}
 	if presence.Direction && requested.Direction != normalizedContinuation.Direction {
-		return SessionPageOptions{}, fmt.Errorf("activity session direction does not match cursor")
+		return SessionPageOptions{}, errors.New("activity session direction does not match cursor")
 	}
-	if presence.Bucket && !sameSessionBucket(requested.Bucket, normalizedContinuation.Bucket) {
-		return SessionPageOptions{}, fmt.Errorf("activity session bucket does not match cursor")
+	if presence.BucketRange &&
+		!sameSessionBucketRange(requested.BucketRange, normalizedContinuation.BucketRange) {
+		return SessionPageOptions{}, errors.New("activity session bucket range does not match cursor")
 	}
 	requested.Sort = normalizedContinuation.Sort
 	requested.Direction = normalizedContinuation.Direction
-	requested.Bucket = normalizedContinuation.Bucket
+	requested.BucketRange = normalizedContinuation.BucketRange
 	return NormalizeSessionPageOptions(requested)
 }
 
-func sameSessionBucket(left, right *int) bool {
+func sameSessionBucketRange(left, right *BucketRange) bool {
 	if left == nil || right == nil {
 		return left == nil && right == nil
 	}
@@ -180,7 +196,9 @@ func OrderSessions(
 	}
 	order := make([]int, 0, len(rows))
 	for index, row := range rows {
-		if options.Bucket != nil && !membership[row.SessionID].Contains(*options.Bucket) {
+		if options.BucketRange != nil && !membership[row.SessionID].Intersects(
+			options.BucketRange.Start, options.BucketRange.End,
+		) {
 			continue
 		}
 		order = append(order, index)
@@ -243,7 +261,7 @@ func PageSessionsFromOrder(
 	page.Sessions = make([]SessionRow, 0, end-options.Offset)
 	for _, index := range order[options.Offset:end] {
 		if index < 0 || index >= len(rows) {
-			return SessionPage{}, fmt.Errorf("activity session order index out of range")
+			return SessionPage{}, errors.New("activity session order index out of range")
 		}
 		page.Sessions = append(page.Sessions, rows[index])
 	}
@@ -320,11 +338,11 @@ func compareInt64(left, right int64) int {
 // map keys, making this stable across store row order and daemon restarts.
 func ArtifactDigest(artifacts CandidateArtifacts) (string, error) {
 	hash := sha256.New()
-	if err := json.NewEncoder(hash).Encode(struct {
+	if err := json.MarshalEncode(jsontext.NewEncoder(hash), struct {
 		Report     Report                      `json:"report"`
 		Sessions   []SessionRow                `json:"sessions"`
 		Membership map[string]BucketMembership `json:"membership"`
-	}{artifacts.Report, artifacts.Sessions, artifacts.Membership}); err != nil {
+	}{artifacts.Report, artifacts.Sessions, artifacts.Membership}, json.Deterministic(true)); err != nil {
 		return "", fmt.Errorf("encoding activity report artifact digest: %w", err)
 	}
 	return hex.EncodeToString(hash.Sum(nil)), nil

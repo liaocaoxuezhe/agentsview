@@ -3,7 +3,7 @@ package sync
 import (
 	"context"
 	"database/sql"
-	"encoding/json"
+	"encoding/json/v2"
 	"errors"
 	"fmt"
 	"os"
@@ -57,7 +57,7 @@ func TestReconcileWatchRootsWindsurf300MembersUsesOneExactBoundedScan(t *testing
 	require.NoError(t, err)
 	writeSyncWindsurfStateDB(t, dbPath, string(encoded))
 	database := dbtest.OpenTestDB(t)
-	engine := NewEngine(database, EngineConfig{
+	engine := NewEngine(t.Context(), database, EngineConfig{
 		AgentDirs: map[parser.AgentType][]string{parser.AgentWindsurf: {root}},
 		Machine:   "local",
 	})
@@ -106,7 +106,7 @@ func TestReconcileWatchRootsWindsurfTombstonesDeletedVirtualMember(t *testing.T)
 		"surviving-member", "deleted-member",
 	))
 	database := dbtest.OpenTestDB(t)
-	engine := NewEngine(database, EngineConfig{
+	engine := NewEngine(t.Context(), database, EngineConfig{
 		AgentDirs: map[parser.AgentType][]string{parser.AgentWindsurf: {root}},
 		Machine:   "local",
 	})
@@ -118,12 +118,10 @@ func TestReconcileWatchRootsWindsurfTombstonesDeletedVirtualMember(t *testing.T)
 
 	active, err := database.GetSession(t.Context(), "windsurf:deleted-member")
 	require.NoError(t, err)
-	assert.Nil(t, active)
+	assert.NotNil(t, active)
 	archived, err := database.GetSessionFull(t.Context(), "windsurf:deleted-member")
 	require.NoError(t, err)
-	require.NotNil(t, archived)
-	require.NotNil(t, archived.DeletionCause)
-	assert.Equal(t, "source_missing", *archived.DeletionCause)
+	assertSourceMissingState(t, archived)
 	surviving, err := database.GetSession(t.Context(), "windsurf:surviving-member")
 	require.NoError(t, err)
 	assert.NotNil(t, surviving)
@@ -142,7 +140,7 @@ func TestSyncPathsWindsurfTombstonesRemovedVirtualMember(t *testing.T) {
 		"surviving-member", "removed-member",
 	))
 	database := dbtest.OpenTestDB(t)
-	engine := NewEngine(database, EngineConfig{
+	engine := NewEngine(t.Context(), database, EngineConfig{
 		AgentDirs: map[parser.AgentType][]string{parser.AgentWindsurf: {root}},
 		Machine:   "local",
 	})
@@ -157,13 +155,10 @@ func TestSyncPathsWindsurfTombstonesRemovedVirtualMember(t *testing.T) {
 
 	active, err := database.GetSession(t.Context(), "windsurf:removed-member")
 	require.NoError(t, err)
-	assert.Nil(t, active, "removed member must not stay active")
+	assert.NotNil(t, active, "removed member must remain browsable")
 	archived, err := database.GetSessionFull(t.Context(), "windsurf:removed-member")
 	require.NoError(t, err)
-	require.NotNil(t, archived,
-		"removed member must be preserved in the archive, not hard-deleted")
-	require.NotNil(t, archived.DeletionCause)
-	assert.Equal(t, "source_missing", *archived.DeletionCause)
+	assertSourceMissingState(t, archived)
 	surviving, err := database.GetSession(t.Context(), "windsurf:surviving-member")
 	require.NoError(t, err)
 	assert.NotNil(t, surviving)
@@ -244,7 +239,7 @@ func (probe *retainedOverlapProbe) waitAndRelease(t *testing.T) {
 		select {
 		case <-probe.arrived:
 		case <-time.After(30 * time.Second):
-			t.Fatal("timed out waiting for concurrent retained members")
+			require.FailNow(t, "timed out waiting for concurrent retained members")
 		}
 	}
 	close(probe.release)
@@ -281,7 +276,7 @@ func TestReconcileWatchRootsWindsurfDiskIndexFailuresStayIncomplete(t *testing.T
 			dbPath := filepath.Join(workspaceDir, "state.vscdb")
 			writeSyncWindsurfStateDB(t, dbPath, windsurfSyncPayload("fault-session", "reply"))
 			database := dbtest.OpenTestDB(t)
-			engine := NewEngine(database, EngineConfig{
+			engine := NewEngine(t.Context(), database, EngineConfig{
 				AgentDirs: map[parser.AgentType][]string{parser.AgentWindsurf: {root}},
 			})
 			defer engine.Close()
@@ -317,7 +312,7 @@ func TestSourceMtimeWindsurfUsesProviderFingerprint(t *testing.T) {
 		}]
 	}`)
 	database := dbtest.OpenTestDB(t)
-	engine := NewEngine(database, EngineConfig{
+	engine := NewEngine(t.Context(), database, EngineConfig{
 		AgentDirs: map[parser.AgentType][]string{
 			parser.AgentWindsurf: {root},
 		},
@@ -325,17 +320,17 @@ func TestSourceMtimeWindsurfUsesProviderFingerprint(t *testing.T) {
 	})
 	defer engine.Close()
 
-	stats := engine.SyncAll(context.Background(), nil)
+	stats := engine.SyncAll(t.Context(), nil)
 	require.Equal(t, 1, stats.Synced)
 	virtualPath := dbPath + "#mtime-session"
-	assert.Equal(t, virtualPath, engine.FindSourceFile("windsurf:mtime-session"))
-	before := engine.SourceMtime("windsurf:mtime-session")
+	assert.Equal(t, virtualPath, engine.FindSourceFile(t.Context(), "windsurf:mtime-session"))
+	before := engine.SourceMtime(t.Context(), "windsurf:mtime-session")
 	require.NotZero(t, before)
 
 	future := time.Unix(0, before).Add(2 * time.Second)
 	require.NoError(t, os.Chtimes(manifestPath, future, future))
 
-	after := engine.SourceMtime("windsurf:mtime-session")
+	after := engine.SourceMtime(t.Context(), "windsurf:mtime-session")
 	assert.Greater(t, after, before)
 }
 
@@ -358,7 +353,7 @@ func TestProcessFileWindsurfSameMtimeHashChangeReparses(t *testing.T) {
 			writeSyncWindsurfStateDB(t, dbPath, windsurfSyncPayload("hash-session", "Alpha reply"))
 			virtualPath := dbPath + "#hash-session"
 			database := dbtest.OpenTestDB(t)
-			engine := NewEngine(database, EngineConfig{
+			engine := NewEngine(t.Context(), database, EngineConfig{
 				AgentDirs: map[parser.AgentType][]string{
 					parser.AgentWindsurf: {root},
 				},
@@ -394,7 +389,7 @@ func TestProcessFileWindsurfSameMtimeHashChangeReparses(t *testing.T) {
 			}
 			if tt.freshSync {
 				engine.Close()
-				engine = NewEngine(database, EngineConfig{
+				engine = NewEngine(t.Context(), database, EngineConfig{
 					AgentDirs: map[parser.AgentType][]string{
 						parser.AgentWindsurf: {root},
 					},
@@ -403,7 +398,7 @@ func TestProcessFileWindsurfSameMtimeHashChangeReparses(t *testing.T) {
 				defer engine.Close()
 			}
 
-			second := engine.processFile(context.Background(), parser.DiscoveredFile{
+			second := engine.processFile(t.Context(), parser.DiscoveredFile{
 				Path:  virtualPath,
 				Agent: parser.AgentWindsurf,
 			})
@@ -419,12 +414,13 @@ func TestProcessFileWindsurfSameMtimeHashChangeReparses(t *testing.T) {
 
 func writeSyncWindsurfStateDB(t *testing.T, dbPath, payload string) {
 	t.Helper()
+
 	conn, err := sql.Open("sqlite3", dbPath)
 	require.NoError(t, err)
 	defer conn.Close()
-	_, err = conn.Exec(`CREATE TABLE ItemTable (key TEXT PRIMARY KEY, value TEXT)`)
+	_, err = conn.ExecContext(t.Context(), `CREATE TABLE ItemTable (key TEXT PRIMARY KEY, value TEXT)`)
 	require.NoError(t, err)
-	_, err = conn.Exec(
+	_, err = conn.ExecContext(t.Context(),
 		`INSERT INTO ItemTable (key, value) VALUES (?, ?)`,
 		"workbench.panel.aichat.view.aichat.chatdata",
 		payload,
@@ -437,7 +433,7 @@ func updateSyncWindsurfStateDB(t *testing.T, dbPath, payload string) {
 	conn, err := sql.Open("sqlite3", dbPath)
 	require.NoError(t, err)
 	defer conn.Close()
-	_, err = conn.Exec(
+	_, err = conn.ExecContext(t.Context(),
 		`UPDATE ItemTable SET value = ? WHERE key = ?`,
 		payload,
 		"workbench.panel.aichat.view.aichat.chatdata",
@@ -451,10 +447,11 @@ func syncInitialWindsurfSession(
 	sessionID string,
 ) (int64, string) {
 	t.Helper()
-	stats := engine.SyncAll(context.Background(), nil)
+
+	stats := engine.SyncAll(t.Context(), nil)
 	require.Equal(t, 1, stats.Synced)
 	sess, err := engine.db.GetSessionFull(
-		context.Background(), "windsurf:"+sessionID,
+		t.Context(), "windsurf:"+sessionID,
 	)
 	require.NoError(t, err)
 	require.NotNil(t, sess)

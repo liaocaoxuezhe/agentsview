@@ -1,8 +1,7 @@
 import { defineConfig } from "@playwright/test";
 
 const isCI = process.env.CI === "true";
-const isSelfHostedCI =
-  isCI && process.env.RUNNER_ENVIRONMENT === "self-hosted";
+const isSelfHostedCI = isCI && process.env.RUNNER_ENVIRONMENT === "self-hosted";
 
 function parseE2EPort(raw: string | undefined): number {
   if (raw === undefined || raw === "") {
@@ -27,11 +26,18 @@ const e2ePort = parseE2EPort(process.env.AGENTSVIEW_E2E_PORT);
 export default defineConfig({
   testDir: "e2e",
   timeout: isCI ? 45_000 : 20_000,
+  expect: { timeout: isCI ? 15_000 : 5_000 },
   // The managed runner exposes more host CPUs than its pod can use, so keep
   // its worker count bounded. GitHub-hosted runners should retain Playwright's
   // adaptive default rather than overcommitting a smaller VM.
-  workers: isSelfHostedCI ? 8 : undefined,
-  retries: 0,
+  workers: isSelfHostedCI ? 4 : undefined,
+  // GitHub-hosted runners intermittently freeze the whole VM for up to a
+  // minute (observed as goto timeouts on embedded static assets with both
+  // workers idle and no server logs), which no per-test wait can absorb.
+  // Retries keep those one-offs from failing the job while deterministic
+  // failures still fail after every attempt; retried passes are reported
+  // as "flaky" so they stay visible.
+  retries: isCI ? 2 : 0,
   use: {
     baseURL: `http://127.0.0.1:${e2ePort}`,
     headless: true,

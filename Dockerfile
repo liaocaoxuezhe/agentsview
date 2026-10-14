@@ -13,11 +13,11 @@ RUN npm ci
 COPY frontend/ ./
 RUN npm run build
 
-FROM golang:1.26.6-bookworm AS build
+FROM golang:1.27.2-bookworm AS build
 
-RUN apt-get update \
-    && apt-get install -y --no-install-recommends build-essential ca-certificates \
-    && rm -rf /var/lib/apt/lists/*
+ENV GOPROXY="https://proxy.golang.org|direct"
+
+# The Go Bookworm image already includes the C/C++ toolchain and CA bundle.
 
 WORKDIR /src
 
@@ -55,10 +55,8 @@ RUN /out/agentsview --version
 
 FROM debian:bookworm-slim
 
-RUN apt-get update \
-    && apt-get install -y --no-install-recommends ca-certificates \
-    && rm -rf /var/lib/apt/lists/* \
-    && mkdir -p /data /agents
+COPY --from=build /etc/ssl/certs/ca-certificates.crt /etc/ssl/certs/ca-certificates.crt
+RUN mkdir -p /data /agents
 
 ENV AGENTSVIEW_DATA_DIR=/data
 

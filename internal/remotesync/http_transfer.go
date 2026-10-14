@@ -11,6 +11,7 @@ import (
 	"path/filepath"
 	"sync"
 
+	"go.kenn.io/agentsview/internal/ctxio"
 	syncpkg "go.kenn.io/agentsview/internal/sync"
 )
 
@@ -24,6 +25,24 @@ type downloadedArchive struct {
 	compressed bool
 	open       func() (io.ReadCloser, error)
 	remove     func(string) error
+}
+
+type httpBodyReadError struct{ err error }
+
+func (e *httpBodyReadError) Error() string { return e.err.Error() }
+func (e *httpBodyReadError) Unwrap() error { return e.err }
+
+type httpBodyReader struct {
+	r   io.Reader
+	err error
+}
+
+func (r *httpBodyReader) Read(p []byte) (int, error) {
+	n, err := r.r.Read(p)
+	if errors.Is(err, io.ErrUnexpectedEOF) {
+		r.err = &httpBodyReadError{err: err}
+	}
+	return n, err
 }
 
 // downloadedArchiveCleanupError retains a spool whose removal failed so the
@@ -117,7 +136,7 @@ func (hs HTTPSync) downloadArchive(
 	total := positiveContentLength(resp.ContentLength)
 	hs.report(syncpkg.Progress{Detail: label, BytesTotal: total})
 	reader := &progressReader{
-		r:     &contextReader{ctx: ctx, r: resp.Body},
+		r:     ctxio.Reader{Context: ctx, Reader: resp.Body},
 		total: total,
 		report: func(done, total int64) {
 			hs.report(syncpkg.Progress{
@@ -131,27 +150,16 @@ func (hs HTTPSync) downloadArchive(
 	closeErr := spool.Close()
 	if copyErr != nil {
 		return nil, errors.Join(
-			fmt.Errorf("download archive: %w", copyErr), closeErr,
+			&httpBodyReadError{
+				err: fmt.Errorf("download archive: %w", copyErr),
+			},
+			closeErr,
 		)
 	}
 	if closeErr != nil {
 		return nil, fmt.Errorf("close archive spool: %w", closeErr)
 	}
 	return owned, nil
-}
-
-type contextReader struct {
-	ctx context.Context
-	r   io.Reader
-}
-
-func (r *contextReader) Read(p []byte) (int, error) {
-	select {
-	case <-r.ctx.Done():
-		return 0, r.ctx.Err()
-	default:
-		return r.r.Read(p)
-	}
 }
 
 func (a *downloadedArchive) extract(
@@ -205,7 +213,7 @@ func (a *downloadedArchive) extractWithSelection(
 		defer func() { err = errors.Join(err, gz.Close()) }()
 		stream = gz
 	}
-	stream = &contextReader{ctx: ctx, r: stream}
+	stream = ctxio.Reader{Context: ctx, Reader: stream}
 	if _, err := extractTarStream(ctx, stream, dst, selected); err != nil {
 		return fmt.Errorf("extract archive: %w", err)
 	}

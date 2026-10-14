@@ -2,7 +2,8 @@ package server
 
 import (
 	"context"
-	"encoding/json"
+	"encoding/json/v2"
+	"errors"
 	"fmt"
 	"html"
 	"html/template"
@@ -101,7 +102,7 @@ func createGistWithURL(
 	}
 
 	var result gistResponse
-	if err := json.NewDecoder(resp.Body).Decode(&result); err != nil {
+	if err := json.UnmarshalRead(resp.Body, &result); err != nil {
 		return nil, fmt.Errorf("parsing github response: %w", err)
 	}
 	return &result, nil
@@ -152,8 +153,8 @@ func validateGithubTokenWithURL(
 	}
 	defer resp.Body.Close()
 
-	if resp.StatusCode == 401 {
-		return "", fmt.Errorf("invalid GitHub token")
+	if resp.StatusCode == http.StatusUnauthorized {
+		return "", errors.New("invalid GitHub token")
 	}
 	if resp.StatusCode >= 400 {
 		return "", fmt.Errorf("GitHub API error: %d", resp.StatusCode)
@@ -162,7 +163,7 @@ func validateGithubTokenWithURL(
 	var user struct {
 		Login string `json:"login"`
 	}
-	if err := json.NewDecoder(resp.Body).Decode(&user); err != nil {
+	if err := json.UnmarshalRead(resp.Body, &user); err != nil {
 		return "", fmt.Errorf("parsing user response: %w", err)
 	}
 	return user.Login, nil
@@ -643,7 +644,7 @@ func generateExportHTML(
 		Messages:     make([]exportMessage, len(msgs)),
 	}
 
-	focusedVisible := focusedExportOrdinals(msgs)
+	focusedVisible := focusedExportOrdinals(msgs, session.Agent)
 	for i, m := range msgs {
 		roleClass := "unknown"
 		if m.Role == "user" || m.Role == "assistant" {
@@ -744,7 +745,12 @@ func isThinkingOnly(content string) bool {
 	return strings.TrimSpace(without) == ""
 }
 
-func focusedExportOrdinals(msgs []db.Message) map[int]bool {
+func focusedExportOrdinals(
+	msgs []db.Message, agent string,
+) map[int]bool {
+	keepAnswerBeforeTrailingTools := parser.AgentHasPostAnswerToolWork(
+		parser.AgentType(agent),
+	)
 	visible := make(map[int]bool, len(msgs))
 	pendingOrdinal := 0
 	hasPendingAssistant := false
@@ -771,7 +777,7 @@ func focusedExportOrdinals(msgs []db.Message) map[int]bool {
 		}
 
 		if isExportToolOnly(m) {
-			if hasPendingAssistant {
+			if hasPendingAssistant && !keepAnswerBeforeTrailingTools {
 				toolAfterPendingAssistant = true
 			}
 			continue
@@ -872,10 +878,7 @@ func insightExportMarkdownFilename(insight *db.Insight) string {
 }
 
 func insightExportTitle(insight *db.Insight) string {
-	return fmt.Sprintf(
-		"%s Insight",
-		insightTypeLabel(insight.Type),
-	)
+	return insightTypeLabel(insight.Type) + " Insight"
 }
 
 func insightPublishDescription(insight *db.Insight) string {
@@ -893,6 +896,8 @@ func insightTypeLabel(insightType string) string {
 		return "Daily Activity"
 	case "agent_analysis":
 		return "Agent Analysis"
+	case "tool_effectiveness":
+		return "Tool Effectiveness"
 	default:
 		return strings.ReplaceAll(insightType, "_", " ")
 	}
@@ -923,7 +928,7 @@ func publishExportHTML(
 		return nil, err
 	}
 	if gist.ID == "" || gist.HTMLURL == "" {
-		return nil, fmt.Errorf("GitHub API returned incomplete gist data")
+		return nil, errors.New("GitHub API returned incomplete gist data")
 	}
 	encoded := urlPathEscape(filename)
 	rawURL := fmt.Sprintf(
@@ -943,17 +948,4 @@ func derefString(value *string) string {
 		return ""
 	}
 	return *value
-}
-
-func truncateStr(s string, max int) string {
-	if len(s) <= max {
-		return s
-	}
-	// Truncate at a valid rune boundary to avoid producing
-	// invalid UTF-8.
-	r := []rune(s)
-	if len(r) <= max {
-		return s
-	}
-	return string(r[:max]) + "..."
 }

@@ -18,21 +18,22 @@ import (
 )
 
 func (s *Server) registerInsightsRoutes() {
-	group := newRouteGroup(s.api, "/api/v1/insights", "Insights")
+	group := huma.NewGroup(s.api, "/api/v1")
+	configureRouteGroup(group, "Insights")
 
-	get(s, group, "", "List insights", s.humaListInsights)
-	get(s, group, "/{id}", "Get insight", s.humaGetInsight)
-	raw(s, group, http.MethodGet, "/{id}/export", "Export insight as HTML", s.humaExportInsight)
-	raw(s, group, http.MethodGet, "/{id}/md", "Export insight as Markdown", s.humaMarkdownInsight)
-	post(s, group, "/{id}/publish", "Publish insight", s.humaPublishInsight)
-	deleteRoute(s, group, "/{id}", "Delete insight", s.humaDeleteInsight)
-	stream(s, group, http.MethodPost, "/generate", "Generate insight", s.humaGenerateInsight)
+	s.get(group, "/insights", "List insights", s.humaListInsights)
+	s.get(group, "/insights/{id}", "Get insight", s.humaGetInsight)
+	s.raw(group, http.MethodGet, "/insights/{id}/export", "Export insight as HTML", "text/html", s.humaExportInsight)
+	s.raw(group, http.MethodGet, "/insights/{id}/md", "Export insight as Markdown", "text/markdown", s.humaMarkdownInsight)
+	s.post(group, "/insights/{id}/publish", "Publish insight", s.humaPublishInsight)
+	s.deleteRoute(group, "/insights/{id}", "Delete insight", s.humaDeleteInsight)
+	s.stream(group, http.MethodPost, "/insights/generate", "Generate insight", s.humaGenerateInsight)
 }
 
 type insightType string
 
 type insightsInput struct {
-	Type     insightType `query:"type" enum:"daily_activity,agent_analysis,llm_canned" doc:"Insight type"`
+	Type     insightType `query:"type" enum:"daily_activity,agent_analysis,llm_canned,tool_effectiveness" doc:"Insight type"`
 	Project  string      `query:"project" doc:"Filter by project"`
 	DateFrom string      `query:"date_from" format:"date" doc:"Filter date_from >= (YYYY-MM-DD)"`
 	DateTo   string      `query:"date_to" format:"date" doc:"Filter date_to <= (YYYY-MM-DD)"`
@@ -59,11 +60,10 @@ func supportsInsightGeneration(store db.Store) bool {
 	if store == nil {
 		return false
 	}
-	if !store.ReadOnly() {
-		return true
+	if capable, ok := store.(insightGenerationCapableStore); ok {
+		return capable.InsightGenerationAvailable()
 	}
-	capable, ok := store.(insightGenerationCapableStore)
-	return ok && capable.InsightGenerationAvailable()
+	return !store.ReadOnly()
 }
 
 func (s *Server) humaListInsights(
@@ -181,7 +181,7 @@ func (s *Server) humaDeleteInsight(
 	if _, err := s.insightByID(ctx, in.ID); err != nil {
 		return nil, err
 	}
-	if err := s.db.DeleteInsight(in.ID); err != nil {
+	if err := s.db.DeleteInsight(ctx, in.ID); err != nil {
 		if handled := handleHumaReadOnly(err); handled != nil {
 			return nil, handled
 		}
@@ -196,22 +196,26 @@ func (s *Server) humaGenerateInsight(
 ) (*huma.StreamResponse, error) {
 	if !supportsInsightGeneration(s.db) {
 		return nil, apiError(http.StatusNotImplemented,
-			"insight generation is not available in read-only mode")
+			"insight generation is not available for this archive")
 	}
 	if err := s.rejectWriterClosedWrite(); err != nil {
 		return nil, err
 	}
 	req := in.Body
-	if !validInsightTypes[req.Type] {
+	if !insight.ValidTypes[req.Type] {
 		return nil, apiError(http.StatusBadRequest,
-			"invalid type: must be daily_activity, agent_analysis, or llm_canned")
+			"invalid type: must be daily_activity, agent_analysis, llm_canned, or tool_effectiveness")
 	}
-	if req.SessionID != "" && req.Type != "agent_analysis" {
+	if req.SessionID != "" && req.Type != "agent_analysis" && req.Type != insight.ToolEffectivenessType {
 		return nil, apiError(http.StatusBadRequest,
-			"session_id is only supported for agent_analysis")
+			"session_id is only supported for agent_analysis and tool_effectiveness")
+	}
+	if req.Type == insight.ToolEffectivenessType && req.SessionID == "" {
+		return nil, apiError(http.StatusBadRequest,
+			"session_id is required for tool_effectiveness")
 	}
 	if req.Type == insight.CannedType {
-		return s.humaGenerateCannedInsight(req)
+		return s.humaGenerateCannedInsight(ctx, req)
 	}
 	if req.SessionID != "" {
 		session, err := s.db.GetSession(ctx, req.SessionID)
@@ -243,7 +247,7 @@ func (s *Server) humaGenerateInsight(
 			"date_to must be >= date_from")
 	}
 	if req.Agent == "" {
-		req.Agent = "claude"
+		req.Agent = s.insightDefaultAgent()
 	}
 	if !insight.ValidAgents[req.Agent] {
 		return nil, apiError(http.StatusBadRequest,
@@ -260,7 +264,7 @@ func (s *Server) humaGenerateInsight(
 		stream, ok := newHumaSSEStream(hctx)
 		if !ok {
 			writeHumaJSON(hctx, http.StatusInternalServerError,
-				apiErrorResponse{Message: "streaming not supported"})
+				apiResponseError{Message: "streaming not supported"})
 			return
 		}
 		var streamMu stdsync.Mutex
@@ -280,6 +284,7 @@ func (s *Server) humaGenerateInsight(
 			Prompt:         req.Prompt,
 			SessionID:      req.SessionID,
 			AutomatedScope: req.AutomatedScope,
+			MaxPromptBytes: insight.PromptArgLimit(req.Agent, s.currentInsightGenerateOptions(hctx.Context())),
 		}
 		// Attach the activity summary for any valid range, single day
 		// included: daily_activity insights are commonly one day and the
@@ -293,7 +298,22 @@ func (s *Server) humaGenerateInsight(
 				genReq.Summary = summary
 			}
 		}
-		prompt, err := insight.BuildPrompt(hctx.Context(), s.db, genReq)
+		var (
+			prompt   string
+			evidence insight.ToolEffectivenessEvidence
+			err      error
+		)
+		if req.Type == insight.ToolEffectivenessType {
+			prompt, evidence, err = insight.BuildToolEffectivenessPrompt(hctx.Context(), s.db, genReq)
+		} else {
+			prompt, err = insight.BuildPrompt(hctx.Context(), s.db, genReq)
+		}
+		if errors.Is(err, db.ErrSessionChanged) || errors.Is(err, db.ErrSessionRevisionUnavailable) ||
+			errors.Is(err, insight.ErrNoCitableMessages) ||
+			errors.Is(err, insight.ErrPromptTooLarge) {
+			sendJSON("error", map[string]string{"message": err.Error()})
+			return
+		}
 		if err != nil {
 			log.Printf("insight prompt error: %v", err)
 			sendJSON("error", map[string]string{"message": "failed to build prompt"})
@@ -384,6 +404,17 @@ func (s *Server) humaGenerateInsight(
 		}
 
 		result, err := s.generateStreamFunc(genCtx, req.Agent, prompt, enqueueLog)
+		if err == nil && req.Type == insight.ToolEffectivenessType {
+			// One bad citation shouldn't throw away a paid run, so a rejected reply gets one corrected retry.
+			report, rejected := insight.ParseToolEffectivenessReport(result.Content)
+			if rejected == nil {
+				rejected = insight.ValidateToolEffectivenessReport(report, evidence)
+			}
+			if rejected != nil {
+				enqueueLog(insight.LogEvent{Stream: "stderr", Line: "report failed validation, asking once more: " + rejected.Error()})
+				result, err = s.generateStreamFunc(genCtx, req.Agent, insight.ToolEffectivenessCorrectionPrompt(prompt, rejected), enqueueLog)
+			}
+		}
 		dropped, drained, senderStopped, timedOut := finishLogStream()
 		if !senderStopped {
 			stream.ForceWriteDeadlineNow()
@@ -420,6 +451,28 @@ func (s *Server) humaGenerateInsight(
 			})
 			return
 		}
+		content := result.Content
+		var schemaVersion, structuredJSON string
+		if req.Type == insight.ToolEffectivenessType {
+			report, err := insight.ParseToolEffectivenessReport(result.Content)
+			if err == nil {
+				err = insight.ValidateToolEffectivenessReport(report, evidence)
+			}
+			var raw []byte
+			if err == nil {
+				raw, err = insight.ToolEffectivenessStructuredJSON(report, evidence)
+			}
+			if err != nil {
+				log.Printf("tool effectiveness validation error: %v", err)
+				sendJSON("error", map[string]string{
+					"message": "tool effectiveness report failed validation: " + err.Error(),
+				})
+				return
+			}
+			content = insight.RenderToolEffectivenessMarkdown(report, evidence)
+			schemaVersion = insight.ToolEffectivenessSchemaVersion
+			structuredJSON = string(raw)
+		}
 		var project *string
 		if req.Project != "" {
 			project = &req.Project
@@ -433,24 +486,26 @@ func (s *Server) humaGenerateInsight(
 			promptPtr = &req.Prompt
 		}
 		var id int64
-		err = s.serializeArchiveWrite(func() error {
+		err = s.serializeArchiveWrite(genCtx, func() error {
 			var insertErr error
-			id, insertErr = s.db.InsertInsight(db.Insight{
-				Type:     req.Type,
-				DateFrom: req.DateFrom,
-				DateTo:   req.DateTo,
-				Project:  project,
-				Agent:    result.Agent,
-				Model:    model,
-				Prompt:   promptPtr,
-				Content:  result.Content,
+			id, insertErr = s.db.InsertInsight(genCtx, db.Insight{
+				Type:           req.Type,
+				DateFrom:       req.DateFrom,
+				DateTo:         req.DateTo,
+				Project:        project,
+				Agent:          result.Agent,
+				Model:          model,
+				Prompt:         promptPtr,
+				Content:        content,
+				SchemaVersion:  schemaVersion,
+				StructuredJSON: structuredJSON,
 			})
 			return insertErr
 		})
 		if err != nil {
 			log.Printf("insight insert error: %v", err)
 			sendJSON("error", map[string]string{
-				"message": insightSaveErrorMessage(err),
+				"message": s.insightSaveErrorMessage(err),
 			})
 			return
 		}
@@ -466,12 +521,10 @@ func (s *Server) humaGenerateInsight(
 	}}, nil
 }
 
-// insightSaveErrorMessage names a failed insight save for the SSE error event.
-// A writer closed for a maintenance pass is transient and worth telling the
-// client to retry; anything else stays a generic failure.
-func insightSaveErrorMessage(err error) string {
+// Saves can fail after the response stream opens.
+func (s *Server) insightSaveErrorMessage(err error) string {
 	if errors.Is(err, db.ErrWriterClosed) {
-		return "archive is briefly read-only for a maintenance pass; retry shortly"
+		return writerClosedResponse(func(string, string) {}, s.archiveStale()).Message
 	}
 	return "failed to save insight"
 }

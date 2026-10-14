@@ -2,12 +2,14 @@ package parser
 
 import (
 	"context"
-	"encoding/json"
+	"encoding/json/jsontext"
+	"encoding/json/v2"
 	"errors"
 	"fmt"
 	"os"
 	"slices"
 	"sort"
+	"strconv"
 	"strings"
 	"time"
 )
@@ -31,7 +33,7 @@ type deepSeekHarnessBlockState struct {
 	Arguments      strings.Builder
 	ToolCallID     string
 	ToolName       string
-	CompletedBlock json.RawMessage
+	CompletedBlock jsontext.Value
 }
 
 type deepSeekHarnessResponse struct {
@@ -41,6 +43,7 @@ type deepSeekHarnessResponse struct {
 	HasChunk       bool
 	Blocks         map[int64]*deepSeekHarnessBlockState
 	FinalSeen      bool
+	FinalSeq       int64
 	FinalUsage     *deepSeekHarnessUsage
 	ChunkUsage     *deepSeekHarnessUsage
 	UsageTime      int64
@@ -65,6 +68,11 @@ type deepSeekHarnessLifecycle struct {
 	HasOpenTurn  bool
 	HasOpenStep  bool
 	PendingCalls map[string]struct{}
+
+	// CanRestartOpenTurn records a non-empty next-turn inbox splice immediately
+	// before the next turn/start. Released v3 logs use that legacy restart
+	// shape instead of emitting an explicit turn/end for the interrupted turn.
+	CanRestartOpenTurn bool
 }
 
 type deepSeekHarnessCandidate struct {
@@ -91,6 +99,8 @@ func parseDeepSeekHarnessSession(
 	latestAgentPreset := ""
 	latestOwnedTime := int64(0)
 	headerSeen := false
+	hasInheritedCut := false
+	inheritedCutSeq := int64(0)
 	lastTurnEndKind := ""
 	lifecycle := deepSeekHarnessLifecycle{
 		NextTurn: 1, NextStep: 1, PendingCalls: make(map[string]struct{}),
@@ -159,11 +169,20 @@ func parseDeepSeekHarnessSession(
 			}
 			return nil
 		}
+		trackingInheritedCut := header.Version >= 2 && header.IsSeeded
 		defer func() {
-			if consumeErr == nil && event.Time > latestOwnedTime {
+			if consumeErr == nil && event.Time > latestOwnedTime &&
+				(!trackingInheritedCut || hasInheritedCut) {
 				latestOwnedTime = event.Time
 			}
 		}()
+		if trackingInheritedCut && event.Type == "session/end-seed" &&
+			deepSeekHarnessInheritedSeed(event.Data) {
+			hasInheritedCut = true
+			inheritedCutSeq = event.Seq
+			lastTurnEndKind = ""
+			currentStep = nil
+		}
 		switch event.Type {
 		case "turn/start":
 			if _, err := deepSeekHarnessEventTurn(event.Data); err != nil {
@@ -202,6 +221,18 @@ func parseDeepSeekHarnessSession(
 				return nil
 			}
 			appendCandidate(event.Seq, message)
+		case "system/message", "developer/message":
+			message, err := deepSeekHarnessSystemMessage(event)
+			if err != nil {
+				return eventError(event, err)
+			}
+			if !deepSeekHarnessSurfaceAppend(event.SurfaceOp) {
+				return nil
+			}
+			if !deepSeekHarnessMessageVisible(message) {
+				return nil
+			}
+			appendCandidate(event.Seq, message)
 		case "assistant/chunk":
 			key, chunk, err := deepSeekHarnessChunkData(event.Data)
 			if err != nil {
@@ -224,6 +255,13 @@ func parseDeepSeekHarnessSession(
 			if err != nil {
 				return eventError(event, err)
 			}
+			streamUsage, stopReason, err := deepSeekHarnessEmbeddedAssistantStream(event.Data)
+			if err != nil {
+				return eventError(event, err)
+			}
+			if usage == nil {
+				usage = streamUsage
+			}
 			message, model, err := deepSeekHarnessAssistantMessage(rawMessage, event.Time)
 			if err != nil {
 				return eventError(event, err)
@@ -236,6 +274,10 @@ func parseDeepSeekHarnessSession(
 				response.RequestModel = latestRequestModel
 			}
 			response.FinalSeen = true
+			response.FinalSeq = event.Seq
+			if stopReason != "" {
+				response.StopReason = stopReason
+			}
 			if usage != nil {
 				response.FinalUsage = usage
 				response.UsageTime = event.Time
@@ -284,6 +326,20 @@ func parseDeepSeekHarnessSession(
 			"DeepSeek Harness seedLength %d exceeds decoded event count %d",
 			scan.Header.SeedLength, scan.EventCount,
 		)
+	}
+	if hasInheritedCut {
+		candidates = slices.DeleteFunc(candidates, func(candidate deepSeekHarnessCandidate) bool {
+			return candidate.Seq < inheritedCutSeq
+		})
+		compactionUsage = slices.DeleteFunc(compactionUsage, func(record deepSeekHarnessUsageRecord) bool {
+			return record.Seq < inheritedCutSeq
+		})
+		for key, response := range responses {
+			if response.FinalSeq < inheritedCutSeq &&
+				response.FirstChunkSeq < inheritedCutSeq {
+				delete(responses, key)
+			}
+		}
 	}
 
 	for _, response := range responses {
@@ -395,7 +451,7 @@ func parseDeepSeekHarnessSession(
 		AgentLabel:          latestAgentPreset,
 		Cwd:                 scan.Header.Cwd,
 		SourceSessionID:     scan.Header.ID,
-		SourceVersion:       "0",
+		SourceVersion:       strconv.FormatInt(scan.Header.Version, 10),
 		MalformedLines:      scan.MalformedLines,
 		IsTruncated:         scan.Truncated,
 		FirstMessage:        firstMessage,
@@ -463,6 +519,9 @@ func validateDeepSeekHarnessSemanticEvent(event deepSeekHarnessEvent) error {
 	case "user/message":
 		_, err := deepSeekHarnessUserMessage(event)
 		return err
+	case "system/message", "developer/message":
+		_, err := deepSeekHarnessSystemMessage(event)
+		return err
 	case "assistant/chunk":
 		_, chunk, err := deepSeekHarnessChunkData(event.Data)
 		if err != nil {
@@ -507,6 +566,13 @@ func (state *deepSeekHarnessLifecycle) validate(event deepSeekHarnessEvent) erro
 		return nil
 	}
 
+	restartAfterInbox := state.CanRestartOpenTurn
+	state.CanRestartOpenTurn = false
+	if event.Type == "agent/inbox/spliced" {
+		state.CanRestartOpenTurn = deepSeekHarnessNextTurnSpliceRestart(event.Data)
+		return nil
+	}
+
 	switch event.Type {
 	case "turn/start":
 		turn, err := deepSeekHarnessEventTurn(event.Data)
@@ -514,7 +580,17 @@ func (state *deepSeekHarnessLifecycle) validate(event deepSeekHarnessEvent) erro
 			return err
 		}
 		if state.HasOpenTurn {
-			return fmt.Errorf("turn/start %d while turn %d is still open", turn, state.OpenTurn)
+			switch {
+			case restartAfterInbox && !state.HasOpenStep && turn == state.OpenTurn+1:
+				state.HasOpenTurn = false
+				state.OpenTurn = 0
+				state.NextTurn = turn
+				clear(state.PendingCalls)
+			default:
+				return fmt.Errorf(
+					"turn/start %d while turn %d is still open", turn, state.OpenTurn,
+				)
+			}
 		}
 		if turn != state.NextTurn {
 			return fmt.Errorf("turn/start expected turn %d, got %d", state.NextTurn, turn)
@@ -578,7 +654,7 @@ func (state *deepSeekHarnessLifecycle) validate(event deepSeekHarnessEvent) erro
 		clear(state.PendingCalls)
 		state.HasOpenStep = false
 		state.NextStep++
-	case "assistant/chunk", "assistant/message":
+	case "assistant/chunk", "assistant/message", "developer/message":
 		key, err := deepSeekHarnessEventTurnStep(event.Data)
 		if err != nil {
 			return err
@@ -621,22 +697,54 @@ func (state *deepSeekHarnessLifecycle) validate(event deepSeekHarnessEvent) erro
 	return nil
 }
 
+func deepSeekHarnessInheritedSeed(raw jsontext.Value) bool {
+	fields, err := decodeDeepSeekHarnessObject(raw)
+	if err != nil {
+		return false
+	}
+	rawInherited, ok := fields["inherited"]
+	if !ok {
+		return false
+	}
+	var inherited bool
+	if err := json.Unmarshal(rawInherited, &inherited); err != nil {
+		return false
+	}
+	return inherited
+}
+
+func deepSeekHarnessNextTurnSpliceRestart(raw jsontext.Value) bool {
+	fields, err := decodeDeepSeekHarnessObject(raw)
+	if err != nil {
+		return false
+	}
+	target, err := deepSeekHarnessRequiredString(fields, "target")
+	if err != nil || target != "next-turn" {
+		return false
+	}
+	var inserted []jsontext.Value
+	if err := json.Unmarshal(fields["inserted"], &inserted); err != nil {
+		return false
+	}
+	return len(inserted) > 0
+}
+
 func deepSeekHarnessOpenNumber(value int64, present bool) string {
 	if !present {
 		return "none"
 	}
-	return fmt.Sprintf("%d", value)
+	return strconv.FormatInt(value, 10)
 }
 
 func eventError(event deepSeekHarnessEvent, err error) error {
 	return fmt.Errorf("DeepSeek Harness event %d (%s): %w", event.Seq, event.Type, err)
 }
 
-func deepSeekHarnessSurfaceAppend(raw json.RawMessage) bool {
+func deepSeekHarnessSurfaceAppend(raw jsontext.Value) bool {
 	return string(raw) == `"append"`
 }
 
-func deepSeekHarnessTitle(raw json.RawMessage) (string, error) {
+func deepSeekHarnessTitle(raw jsontext.Value) (string, error) {
 	fields, err := decodeDeepSeekHarnessObject(raw)
 	if err != nil {
 		return "", errors.New("session title data is not an object")
@@ -648,7 +756,7 @@ func deepSeekHarnessTitle(raw json.RawMessage) (string, error) {
 	return title, nil
 }
 
-func deepSeekHarnessAgentPreset(raw json.RawMessage) (string, error) {
+func deepSeekHarnessAgentPreset(raw jsontext.Value) (string, error) {
 	fields, err := decodeDeepSeekHarnessObject(raw)
 	if err != nil {
 		return "", errors.New("agent preset selection data is not an object")
@@ -660,7 +768,7 @@ func deepSeekHarnessAgentPreset(raw json.RawMessage) (string, error) {
 	return preset, nil
 }
 
-func deepSeekHarnessEventTurn(raw json.RawMessage) (int64, error) {
+func deepSeekHarnessEventTurn(raw jsontext.Value) (int64, error) {
 	fields, err := decodeDeepSeekHarnessObject(raw)
 	if err != nil {
 		return 0, errors.New("turn data is not an object")
@@ -668,7 +776,7 @@ func deepSeekHarnessEventTurn(raw json.RawMessage) (int64, error) {
 	return deepSeekHarnessRequiredSafeInt(fields, "turn", true)
 }
 
-func deepSeekHarnessEventTurnStep(raw json.RawMessage) (deepSeekHarnessTurnStep, error) {
+func deepSeekHarnessEventTurnStep(raw jsontext.Value) (deepSeekHarnessTurnStep, error) {
 	fields, err := decodeDeepSeekHarnessObject(raw)
 	if err != nil {
 		return deepSeekHarnessTurnStep{}, errors.New("step data is not an object")
@@ -685,7 +793,7 @@ func deepSeekHarnessEventTurnStep(raw json.RawMessage) (deepSeekHarnessTurnStep,
 }
 
 func deepSeekHarnessToolCallData(
-	raw json.RawMessage,
+	raw jsontext.Value,
 ) (deepSeekHarnessTurnStep, string, error) {
 	fields, err := decodeDeepSeekHarnessObject(raw)
 	if err != nil {
@@ -704,7 +812,7 @@ func deepSeekHarnessToolCallData(
 	return key, callID, nil
 }
 
-func deepSeekHarnessTurnEndKind(raw json.RawMessage) (string, error) {
+func deepSeekHarnessTurnEndKind(raw jsontext.Value) (string, error) {
 	fields, err := decodeDeepSeekHarnessObject(raw)
 	if err != nil {
 		return "", errors.New("turn end data is not an object")
@@ -726,7 +834,7 @@ func deepSeekHarnessTurnEndKind(raw json.RawMessage) (string, error) {
 	return kind, nil
 }
 
-func deepSeekHarnessRequestModel(raw json.RawMessage) (string, error) {
+func deepSeekHarnessRequestModel(raw jsontext.Value) (string, error) {
 	fields, err := decodeDeepSeekHarnessObject(raw)
 	if err != nil {
 		return "", errors.New("request header data is not an object")
@@ -749,8 +857,8 @@ func deepSeekHarnessRequestModel(raw json.RawMessage) (string, error) {
 	return model, nil
 }
 
-func deepSeekHarnessChunkData(raw json.RawMessage) (
-	deepSeekHarnessTurnStep, json.RawMessage, error,
+func deepSeekHarnessChunkData(raw jsontext.Value) (
+	deepSeekHarnessTurnStep, jsontext.Value, error,
 ) {
 	fields, err := decodeDeepSeekHarnessObject(raw)
 	if err != nil {
@@ -767,8 +875,8 @@ func deepSeekHarnessChunkData(raw json.RawMessage) (
 	return key, chunk, nil
 }
 
-func deepSeekHarnessAssistantData(raw json.RawMessage) (
-	deepSeekHarnessTurnStep, json.RawMessage, *deepSeekHarnessUsage, error,
+func deepSeekHarnessAssistantData(raw jsontext.Value) (
+	deepSeekHarnessTurnStep, jsontext.Value, *deepSeekHarnessUsage, error,
 ) {
 	fields, err := decodeDeepSeekHarnessObject(raw)
 	if err != nil {
@@ -793,12 +901,79 @@ func deepSeekHarnessAssistantData(raw json.RawMessage) (
 	return key, message, usage, nil
 }
 
+// deepSeekHarnessEmbeddedAssistantStream reads the generation-2+ assistant
+// message stream envelope for settlement facts Agentsview renders: the usage
+// fallback when the outer data omits it, and the terminal finish reason.
+func deepSeekHarnessEmbeddedAssistantStream(raw jsontext.Value) (
+	*deepSeekHarnessUsage, string, error,
+) {
+	fields, err := decodeDeepSeekHarnessObject(raw)
+	if err != nil {
+		return nil, "", errors.New("assistant data is not an object")
+	}
+	rawStream, ok := fields["stream"]
+	if !ok {
+		return nil, "", nil
+	}
+	var stream []jsontext.Value
+	if err := json.Unmarshal(rawStream, &stream); err != nil {
+		return nil, "", errors.New("assistant stream is not an array")
+	}
+	var usage *deepSeekHarnessUsage
+	stopReason := ""
+	for _, rawItem := range stream {
+		item, err := decodeDeepSeekHarnessObject(rawItem)
+		if err != nil {
+			return nil, "", errors.New("assistant stream item is not an object")
+		}
+		rawChunk, ok := item["chunk"]
+		if !ok {
+			continue
+		}
+		chunk, err := decodeDeepSeekHarnessObject(rawChunk)
+		if err != nil {
+			return nil, "", errors.New("assistant stream chunk is not an object")
+		}
+		chunkType, err := deepSeekHarnessRequiredString(chunk, "type")
+		if err != nil {
+			return nil, "", err
+		}
+		switch chunkType {
+		case "usage":
+			rawUsage, ok := chunk["usage"]
+			if !ok {
+				return nil, "", errors.New("assistant stream usage has no usage")
+			}
+			parsed, err := parseDeepSeekHarnessUsage(rawUsage)
+			if err != nil {
+				return nil, "", err
+			}
+			usage = &parsed
+		case "finish":
+			rawReason, ok := chunk["reason"]
+			if !ok {
+				return nil, "", errors.New("assistant stream finish has no reason")
+			}
+			reason, err := decodeDeepSeekHarnessObject(rawReason)
+			if err != nil {
+				return nil, "", errors.New("assistant stream finish reason is not an object")
+			}
+			kind, err := deepSeekHarnessRequiredString(reason, "kind")
+			if err != nil || kind == "" {
+				return nil, "", errors.New("assistant stream finish reason has no kind")
+			}
+			stopReason = kind
+		}
+	}
+	return usage, stopReason, nil
+}
+
 func deepSeekHarnessUserMessage(event deepSeekHarnessEvent) (ParsedMessage, error) {
 	message, source, _, err := deepSeekHarnessMessageEnvelope(event.Data, "user")
 	if err != nil {
 		return ParsedMessage{}, err
 	}
-	parsed, err := parseDeepSeekHarnessContent(message, event.Time)
+	parsed, err := parseDeepSeekHarnessContent(message, event.Time, false)
 	if err != nil {
 		return ParsedMessage{}, err
 	}
@@ -808,8 +983,35 @@ func deepSeekHarnessUserMessage(event deepSeekHarnessEvent) (ParsedMessage, erro
 	return parsed, nil
 }
 
+func deepSeekHarnessSystemMessage(event deepSeekHarnessEvent) (ParsedMessage, error) {
+	fields, err := decodeDeepSeekHarnessObject(event.Data)
+	if err != nil {
+		return ParsedMessage{}, errors.New("system message data is not an object")
+	}
+	rawMessage, ok := fields["message"]
+	if !ok {
+		return ParsedMessage{}, errors.New("system message data has no message")
+	}
+	role := "system"
+	if event.Type == "developer/message" {
+		role = "developer"
+	}
+	content, source, _, err := deepSeekHarnessMessageEnvelope(rawMessage, role)
+	if err != nil {
+		return ParsedMessage{}, err
+	}
+	parsed, err := parseDeepSeekHarnessContent(content, event.Time, role == "developer")
+	if err != nil {
+		return ParsedMessage{}, err
+	}
+	parsed.Role = RoleSystem
+	parsed.IsSystem = true
+	parsed.SourceType = source
+	return parsed, nil
+}
+
 func deepSeekHarnessAssistantMessage(
-	raw json.RawMessage, eventTime int64,
+	raw jsontext.Value, eventTime int64,
 ) (ParsedMessage, string, error) {
 	message, source, model, err := deepSeekHarnessMessageEnvelope(raw, "assistant")
 	if err != nil {
@@ -818,7 +1020,7 @@ func deepSeekHarnessAssistantMessage(
 	if source != "model" {
 		return ParsedMessage{}, "", errors.New("assistant source is not model")
 	}
-	parsed, err := parseDeepSeekHarnessContent(message, eventTime)
+	parsed, err := parseDeepSeekHarnessContent(message, eventTime, false)
 	if err != nil {
 		return ParsedMessage{}, "", err
 	}
@@ -828,8 +1030,8 @@ func deepSeekHarnessAssistantMessage(
 }
 
 func deepSeekHarnessMessageEnvelope(
-	raw json.RawMessage, wantRole string,
-) (content json.RawMessage, sourceKind, model string, err error) {
+	raw jsontext.Value, wantRole string,
+) (content jsontext.Value, sourceKind, model string, err error) {
 	fields, err := decodeDeepSeekHarnessObject(raw)
 	if err != nil {
 		return nil, "", "", errors.New("message is not an object")
@@ -867,9 +1069,9 @@ func deepSeekHarnessMessageEnvelope(
 }
 
 func parseDeepSeekHarnessContent(
-	raw json.RawMessage, eventTime int64,
+	raw jsontext.Value, eventTime int64, allowToolChanges bool,
 ) (ParsedMessage, error) {
-	var blocks []json.RawMessage
+	var blocks []jsontext.Value
 	if err := json.Unmarshal(raw, &blocks); err != nil {
 		return ParsedMessage{}, errors.New("message content is not an array")
 	}
@@ -892,17 +1094,32 @@ func parseDeepSeekHarnessContent(
 				return ParsedMessage{}, err
 			}
 			visible = append(visible, text)
+		case "tool-addition", "tool-removal":
+			if !allowToolChanges {
+				return ParsedMessage{}, deepSeekHarnessUnsupportedError{message: fmt.Sprintf(
+					"unsupported content block type %q", blockType,
+				)}
+			}
+			name, err := deepSeekHarnessRequiredString(fields, "toolName")
+			if err != nil || name == "" {
+				return ParsedMessage{}, errors.New("developer tool change has invalid toolName")
+			}
+			text := "Tool added: " + name
+			if blockType == "tool-removal" {
+				text = "Tool removed: " + name
+			}
+			visible = append(visible, text)
 		case "reasoning":
 			text, err := deepSeekHarnessRequiredString(fields, "text")
 			if err != nil {
 				return ParsedMessage{}, err
 			}
 			thinking = append(thinking, text)
-		case "image":
+		case "image", "file":
 			if _, ok := fields["attachment"]; !ok {
-				return ParsedMessage{}, errors.New("image block has no attachment")
+				return ParsedMessage{}, fmt.Errorf("%s block has no attachment", blockType)
 			}
-			visible = append(visible, "[image]")
+			visible = append(visible, "["+blockType+"]")
 		case "tool-call":
 			id, idErr := deepSeekHarnessRequiredString(fields, "id")
 			name, nameErr := deepSeekHarnessRequiredString(fields, "name")
@@ -948,8 +1165,8 @@ func parseDeepSeekHarnessContent(
 	return parsed, nil
 }
 
-func deepSeekHarnessContentText(raw json.RawMessage) (string, error) {
-	parsed, err := parseDeepSeekHarnessContent(raw, 0)
+func deepSeekHarnessContentText(raw jsontext.Value) (string, error) {
+	parsed, err := parseDeepSeekHarnessContent(raw, 0, false)
 	if err != nil {
 		return "", err
 	}
@@ -958,13 +1175,13 @@ func deepSeekHarnessContentText(raw json.RawMessage) (string, error) {
 }
 
 func normalizeDeepSeekHarnessContentImages(
-	raw json.RawMessage,
-) (json.RawMessage, error) {
-	var blocks []json.RawMessage
+	raw jsontext.Value,
+) (jsontext.Value, error) {
+	var blocks []jsontext.Value
 	if err := json.Unmarshal(raw, &blocks); err != nil {
 		return nil, errors.New("message content is not an array")
 	}
-	normalized := make([]json.RawMessage, 0, len(blocks))
+	normalized := make([]jsontext.Value, 0, len(blocks))
 	for _, block := range blocks {
 		fields, err := decodeDeepSeekHarnessObject(block)
 		if err != nil {
@@ -975,13 +1192,13 @@ func normalizeDeepSeekHarnessContentImages(
 			return nil, err
 		}
 		switch blockType {
-		case "image":
+		case "image", "file":
 			if _, ok := fields["attachment"]; !ok {
-				return nil, errors.New("image block has no attachment")
+				return nil, fmt.Errorf("%s block has no attachment", blockType)
 			}
 			block, _ = json.Marshal(map[string]any{
-				"type": "text", "text": "[image]",
-			})
+				"type": "text", "text": "[" + blockType + "]",
+			}, json.Deterministic(true))
 		case "tool-result":
 			content, ok := fields["content"]
 			if !ok {
@@ -992,7 +1209,7 @@ func normalizeDeepSeekHarnessContentImages(
 				return nil, err
 			}
 			fields["content"] = nested
-			block, _ = json.Marshal(fields)
+			block, _ = json.Marshal(fields, json.Deterministic(true))
 		}
 		normalized = append(normalized, block)
 	}
@@ -1021,7 +1238,19 @@ func deepSeekHarnessToolResultData(
 		return deepSeekHarnessTurnStep{}, ParsedMessage{}, false, "",
 			errors.New("tool result data has no message")
 	}
-	content, source, _, err := deepSeekHarnessMessageEnvelope(rawMessage, "user")
+	messageFields, err := decodeDeepSeekHarnessObject(rawMessage)
+	if err != nil {
+		return deepSeekHarnessTurnStep{}, ParsedMessage{}, false, "", err
+	}
+	role := "user"
+	messageRole, err := deepSeekHarnessRequiredString(messageFields, "role")
+	if err != nil {
+		return deepSeekHarnessTurnStep{}, ParsedMessage{}, false, "", err
+	}
+	if messageRole == "tool" {
+		role = "tool"
+	}
+	content, source, _, err := deepSeekHarnessMessageEnvelope(rawMessage, role)
 	if err != nil {
 		return deepSeekHarnessTurnStep{}, ParsedMessage{}, false, "", err
 	}
@@ -1029,7 +1258,6 @@ func deepSeekHarnessToolResultData(
 		return deepSeekHarnessTurnStep{}, ParsedMessage{}, false, "",
 			errors.New("tool result message source is not tool")
 	}
-	messageFields, _ := decodeDeepSeekHarnessObject(rawMessage)
 	sourceFields, err := decodeDeepSeekHarnessObject(messageFields["source"])
 	if err != nil {
 		return deepSeekHarnessTurnStep{}, ParsedMessage{}, false, "",
@@ -1040,7 +1268,14 @@ func deepSeekHarnessToolResultData(
 		return deepSeekHarnessTurnStep{}, ParsedMessage{}, false, "",
 			errors.New("tool result source has invalid callId")
 	}
-	var rawBlocks []json.RawMessage
+	if role == "tool" {
+		block := map[string]any{"type": "tool-result", "toolCallId": messageFields["toolCallId"], "content": content}
+		if rawIsError, ok := messageFields["isError"]; ok {
+			block["isError"] = rawIsError
+		}
+		content, _ = json.Marshal([]any{block})
+	}
+	var rawBlocks []jsontext.Value
 	if err := json.Unmarshal(content, &rawBlocks); err != nil || len(rawBlocks) != 1 {
 		return deepSeekHarnessTurnStep{}, ParsedMessage{}, false, "",
 			errors.New("tool result content must contain exactly one block")
@@ -1052,7 +1287,7 @@ func deepSeekHarnessToolResultData(
 	}
 	isError := false
 	if rawIsError, ok := blockFields["isError"]; ok {
-		if err := json.Unmarshal(rawIsError, &isError); err != nil {
+		if err := json.Unmarshal(rawIsError, &isError); err != nil || (role == "tool" && string(rawIsError) == "null") {
 			return deepSeekHarnessTurnStep{}, ParsedMessage{}, false, "",
 				errors.New("tool result isError is not a boolean")
 		}
@@ -1072,7 +1307,7 @@ func deepSeekHarnessToolResultData(
 		}
 		errorCode = code
 	}
-	parsed, err := parseDeepSeekHarnessContent(content, event.Time)
+	parsed, err := parseDeepSeekHarnessContent(content, event.Time, false)
 	if err != nil {
 		return deepSeekHarnessTurnStep{}, ParsedMessage{}, false, "", err
 	}
@@ -1093,7 +1328,7 @@ func deepSeekHarnessMessageVisible(message ParsedMessage) bool {
 		len(message.ToolCalls) > 0 || len(message.ToolResults) > 0
 }
 
-func parseDeepSeekHarnessUsage(raw json.RawMessage) (deepSeekHarnessUsage, error) {
+func parseDeepSeekHarnessUsage(raw jsontext.Value) (deepSeekHarnessUsage, error) {
 	fields, err := decodeDeepSeekHarnessObject(raw)
 	if err != nil {
 		return deepSeekHarnessUsage{}, errors.New("token usage is not an object")
@@ -1131,7 +1366,7 @@ func parseDeepSeekHarnessUsage(raw json.RawMessage) (deepSeekHarnessUsage, error
 }
 
 func deepSeekHarnessCompactionUsage(
-	raw json.RawMessage,
+	raw jsontext.Value,
 ) (string, *deepSeekHarnessUsage, error) {
 	fields, err := decodeDeepSeekHarnessObject(raw)
 	if err != nil {
@@ -1151,7 +1386,7 @@ func deepSeekHarnessCompactionUsage(
 	}
 	if summary, ok := fields["summary"]; !ok {
 		return "", nil, errors.New("compaction summary has no summary content")
-	} else if _, err := parseDeepSeekHarnessContent(summary, 0); err != nil {
+	} else if _, err := parseDeepSeekHarnessContent(summary, 0, false); err != nil {
 		return "", nil, fmt.Errorf("compaction summary content: %w", err)
 	}
 	rangeFields, err := decodeDeepSeekHarnessObject(fields["shadowedRange"])
@@ -1176,7 +1411,7 @@ func deepSeekHarnessCompactionUsage(
 	}
 	rawOutput, hasRawOutput := fields["rawOutput"]
 	if hasRawOutput {
-		if _, err := parseDeepSeekHarnessContent(rawOutput, 0); err != nil {
+		if _, err := parseDeepSeekHarnessContent(rawOutput, 0, false); err != nil {
 			return "", nil, fmt.Errorf("compaction summary raw output: %w", err)
 		}
 	}
@@ -1190,7 +1425,7 @@ func deepSeekHarnessCompactionUsage(
 	}
 	if rawMaxTokens, ok := fields["maxTokens"]; ok {
 		if _, err := deepSeekHarnessRequiredSafeInt(
-			map[string]json.RawMessage{"maxTokens": rawMaxTokens}, "maxTokens", true,
+			map[string]jsontext.Value{"maxTokens": rawMaxTokens}, "maxTokens", true,
 		); err != nil {
 			return "", nil, fmt.Errorf("compaction summary: %w", err)
 		}
@@ -1219,7 +1454,7 @@ func deepSeekHarnessApplyUsage(
 }
 
 func applyDeepSeekHarnessChunk(
-	response *deepSeekHarnessResponse, raw json.RawMessage, eventTime int64,
+	response *deepSeekHarnessResponse, raw jsontext.Value, eventTime int64,
 ) error {
 	fields, err := decodeDeepSeekHarnessObject(raw)
 	if err != nil {
@@ -1302,10 +1537,10 @@ func applyDeepSeekHarnessChunk(
 		if !ok {
 			return errors.New("block-end has no block")
 		}
-		if _, err := parseDeepSeekHarnessContent(json.RawMessage("["+string(completed)+"]"), eventTime); err != nil {
+		if _, err := parseDeepSeekHarnessContent(jsontext.Value("["+string(completed)+"]"), eventTime, false); err != nil {
 			return err
 		}
-		blockFor(index).CompletedBlock = append(json.RawMessage(nil), completed...)
+		blockFor(index).CompletedBlock = append(jsontext.Value(nil), completed...)
 	case "usage":
 		rawUsage, ok := fields["usage"]
 		if !ok {
@@ -1346,7 +1581,7 @@ func buildDeepSeekHarnessPartialMessage(
 		indexes = append(indexes, index)
 	}
 	slices.Sort(indexes)
-	blocks := make([]json.RawMessage, 0, len(indexes))
+	blocks := make([]jsontext.Value, 0, len(indexes))
 	for _, index := range indexes {
 		block := response.Blocks[index]
 		if block == nil {
@@ -1377,7 +1612,7 @@ func buildDeepSeekHarnessPartialMessage(
 		blocks = append(blocks, encoded)
 	}
 	encoded, _ := json.Marshal(blocks)
-	message, err := parseDeepSeekHarnessContent(encoded, response.FirstChunkTime)
+	message, err := parseDeepSeekHarnessContent(encoded, response.FirstChunkTime, false)
 	if err != nil {
 		return ParsedMessage{}, err
 	}

@@ -2,6 +2,7 @@ package remotesync
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"maps"
 	"path/filepath"
@@ -38,6 +39,7 @@ func (outcome JournalOutcome) Valid() bool {
 }
 
 type DeltaImportRequest struct {
+	ScopedProviders          []parser.AgentType
 	Journal                  MirrorChangeJournal
 	FullReason               FullImportReason
 	ForceParse               bool
@@ -74,7 +76,7 @@ type PreparedDeltaImport struct {
 	requiredDataVersion int
 	progress            syncpkg.ProgressFunc
 	save                func(*db.DB, *syncpkg.Engine, remotePathMap) error
-	apply               func(string, []string, map[string]int64) error
+	apply               func(context.Context, string, []string, map[string]int64) error
 }
 
 func (im Importer) PreparePending(
@@ -121,6 +123,8 @@ func (im Importer) PreparePending(
 	if err != nil {
 		return nil, err
 	}
+	config.ArchiveContent = im.DB.ArchiveContent()
+	config.CompleteSourceMirror = im.completeSourceMirror
 
 	physicalPaths := make([]string, 0, len(request.Journal.Entries))
 	for _, entry := range request.Journal.Entries {
@@ -133,21 +137,29 @@ func (im Importer) PreparePending(
 		physicalPaths = append(physicalPaths, path)
 	}
 	planningStart := time.Now()
-	planningEngine := syncpkg.NewEngine(im.DB, config)
+	planningEngine := syncpkg.NewEngine(ctx, im.DB, config)
 	plan, err := planningEngine.PlanChangedPathsContext(ctx, physicalPaths)
 	planningEngine.Close()
 	stats.PlanningDuration = time.Since(planningStart)
 	if err != nil {
 		return nil, err
 	}
+	for _, agent := range request.ScopedProviders {
+		if len(layout.engineDirs[agent]) > 0 {
+			plan.FallbackProviders = append(plan.FallbackProviders, agent)
+		}
+	}
 	stats.ExactSources = len(plan.Files)
 	stats.FallbackProviders = len(plan.FallbackProviders)
 	forceScope := plan.PruneScope(forceFullParseJournalPhysicalPaths(
 		layout, request.Journal,
 	))
+	forceScope.FallbackProviders = append(
+		forceScope.FallbackProviders, request.ScopedProviders...,
+	)
 
 	full := request.Journal.FullImport || request.FullReason != "" || im.Full
-	ensureVisualStudioCopilotRemoteSkipMigration(im.DB, im.Host)
+	ensureVisualStudioCopilotRemoteSkipMigration(ctx, im.DB, im.Host)
 	remoteCache, err := loadPlannedRemoteSkipCache(
 		ctx, im.DB, im.Host, layout, plan, request.Journal, full,
 	)
@@ -155,10 +167,14 @@ func (im Importer) PreparePending(
 		return nil, fmt.Errorf("load skip cache: %w", err)
 	}
 	pruningStart := time.Now()
-	pruned, pruneStats := pruneRemoteSkipCache(
-		remoteCache, layout, plan, request.Journal,
-	)
+	var invalidateProviders []parser.AgentType
 	if request.ResetAttemptCache {
+		invalidateProviders = request.ScopedProviders
+	}
+	pruned, pruneStats := pruneRemoteSkipCache(
+		remoteCache, layout, plan, request.Journal, invalidateProviders...,
+	)
+	if request.ResetAttemptCache && len(request.ScopedProviders) == 0 {
 		pruned = make(map[string]int64)
 		pruneStats = CachePruneStats{
 			HostWideScope: true,
@@ -184,10 +200,11 @@ func (im Importer) PreparePending(
 	deleted := removedRemoteSkipCacheKeys(remoteCache, pruned)
 	var persistErr error
 	if len(deleted) > 0 {
-		if request.Journal.InvalidateAll || request.ResetAttemptCache {
-			persistErr = replace(im.Host, pruned)
+		if request.Journal.InvalidateAll ||
+			request.ResetAttemptCache && len(request.ScopedProviders) == 0 {
+			persistErr = replace(ctx, im.Host, pruned)
 		} else {
-			persistErr = apply(im.Host, deleted, nil)
+			persistErr = apply(ctx, im.Host, deleted, nil)
 		}
 	}
 	if persistErr != nil {
@@ -231,14 +248,25 @@ func journalForcesFullParse(journal MirrorChangeJournal) bool {
 	return false
 }
 
+func shouldPersistImportDataVersion(stats syncpkg.SyncStats) bool {
+	return stats.ProcessingComplete()
+}
+
+func deltaImportOutcome(stats syncpkg.SyncStats) JournalOutcome {
+	if shouldPersistImportDataVersion(stats) {
+		return JournalRetired
+	}
+	return JournalProcessingFailures
+}
+
 func (pending *PreparedDeltaImport) Execute(
 	ctx context.Context,
 ) (SyncStats, error) {
 	if pending == nil {
-		return SyncStats{}, fmt.Errorf("execute nil pending delta import")
+		return SyncStats{}, errors.New("execute nil pending delta import")
 	}
 	stats := pending.Stats
-	engine := syncpkg.NewEngine(pending.database, pending.config)
+	engine := syncpkg.NewEngine(ctx, pending.database, pending.config)
 	defer engine.Close()
 	engine.InjectSkipCache(pending.cache)
 	processingStart := time.Now()
@@ -273,11 +301,16 @@ func (pending *PreparedDeltaImport) Execute(
 	stats.SessionsTotal = engineStats.TotalSessions
 	stats.Skipped = engineStats.Skipped
 	stats.Failed = engineStats.Failed
+	stats.Deferred = engineStats.Deferred
+	stats.incomplete = !engineStats.ProcessingComplete()
 
 	cachePersistStart := time.Now()
-	if err := pending.persistSkipCache(pending.database, engine); err != nil {
+	if err := pending.persistSkipCache(ctx, pending.database, engine); err != nil {
 		stats.CachePersistDuration += time.Since(cachePersistStart)
 		stats.JournalOutcome = JournalCachePersistFailed
+		if errors.Is(err, context.Canceled) || errors.Is(err, context.DeadlineExceeded) {
+			stats.JournalOutcome = JournalCancelled
+		}
 		pending.Stats = stats
 		return stats, err
 	}
@@ -286,12 +319,14 @@ func (pending *PreparedDeltaImport) Execute(
 	case ctx.Err() != nil:
 		stats.JournalOutcome = JournalCancelled
 		processErr = ctx.Err()
-	case processErr != nil || engineStats.Aborted || engineStats.Failed > 0:
+	case processErr != nil:
 		stats.JournalOutcome = JournalProcessingFailures
+	case deltaImportOutcome(engineStats) != JournalRetired:
+		stats.JournalOutcome = deltaImportOutcome(engineStats)
 		if processErr == nil {
 			processErr = fmt.Errorf(
-				"remote import processing incomplete: aborted=%t failed=%d",
-				engineStats.Aborted, engineStats.Failed,
+				"remote import processing incomplete: aborted=%t failed=%d deferred=%d",
+				engineStats.Aborted, engineStats.Failed, engineStats.Deferred,
 			)
 		}
 	default:
@@ -335,7 +370,7 @@ func (pending *PreparedDeltaImport) persistImportDataVersion(
 	return nil
 }
 
-func (pending *PreparedDeltaImport) persistSkipCache(
+func (pending *PreparedDeltaImport) persistSkipCache(ctx context.Context,
 	database *db.DB,
 	engine *syncpkg.Engine,
 ) error {
@@ -343,12 +378,12 @@ func (pending *PreparedDeltaImport) persistSkipCache(
 		return pending.save(database, engine, pending.layout.paths)
 	}
 	if pending.full {
-		return saveEngineSkipCache(database, engine, pending.layout.paths)
+		return saveEngineSkipCache(ctx, database, engine, pending.layout.paths)
 	}
 	current := remoteEngineSkipCache(engine, pending.layout.paths)
 	deletes, upserts := diffRemoteSkipCache(pending.remoteCache, current)
 	if database != pending.database {
-		merged, err := pending.database.LoadRemoteSkippedFiles(
+		merged, err := pending.database.LoadRemoteSkippedFiles(ctx,
 			pending.layout.paths.host,
 		)
 		if err != nil {
@@ -358,14 +393,14 @@ func (pending *PreparedDeltaImport) persistSkipCache(
 			delete(merged, key)
 		}
 		maps.Copy(merged, upserts)
-		if err := database.ReplaceRemoteSkippedFiles(
+		if err := database.ReplaceRemoteSkippedFiles(ctx,
 			pending.layout.paths.host, merged,
 		); err != nil {
 			return fmt.Errorf("save rebuilt skip cache: %w", err)
 		}
 		return nil
 	}
-	if err := pending.apply(
+	if err := pending.apply(ctx,
 		pending.layout.paths.host, deletes, upserts,
 	); err != nil {
 		return fmt.Errorf("save scoped skip cache: %w", err)
@@ -373,12 +408,12 @@ func (pending *PreparedDeltaImport) persistSkipCache(
 	return nil
 }
 
-func (pending *PreparedDeltaImport) persistRetrySafeSkipCache(
+func (pending *PreparedDeltaImport) persistRetrySafeSkipCache(ctx context.Context,
 	database *db.DB,
 	engine *syncpkg.Engine,
 ) error {
 	remoteCache := remoteRetrySafeEngineSkipCache(engine, pending.layout.paths)
-	if err := database.ReplaceRemoteSkippedFiles(
+	if err := database.ReplaceRemoteSkippedFiles(ctx,
 		pending.layout.paths.host, remoteCache,
 	); err != nil {
 		return fmt.Errorf("save retry-safe skip cache: %w", err)
@@ -401,7 +436,7 @@ func loadPlannedRemoteSkipCache(
 	full bool,
 ) (map[string]int64, error) {
 	if full {
-		return database.LoadRemoteSkippedFiles(host)
+		return database.LoadRemoteSkippedFiles(ctx, host)
 	}
 	scope := plannedRemoteSkipScope(layout, plan, journal)
 	exactPaths := make([]string, 0, len(scope.exact))
@@ -432,7 +467,7 @@ func loadPlannedRemoteSkipCache(
 			}
 		}
 		for fallbackAgent, roots := range scope.fallback {
-			if agent != "" && agent != fallbackAgent {
+			if agent != "" && !slices.Contains(parser.ProviderStoredAgents(fallbackAgent), agent) {
 				continue
 			}
 			if remotePathWithinAnyRoot(path, roots) {
@@ -526,6 +561,7 @@ func pruneRemoteSkipCache(
 	layout importLayout,
 	plan syncpkg.ChangedPathPlan,
 	journal MirrorChangeJournal,
+	providers ...parser.AgentType,
 ) (map[string]int64, CachePruneStats) {
 	stats := CachePruneStats{}
 	if journal.InvalidateAll {
@@ -537,6 +573,7 @@ func pruneRemoteSkipCache(
 	maps.Copy(pruned, cache)
 	armed := cacheInvalidationJournalPhysicalPaths(layout, journal)
 	scope := plan.PruneScope(armed)
+	scope.FallbackProviders = append(scope.FallbackProviders, providers...)
 	stats.ExactScopes = len(scope.Files)
 	stats.ProviderScopes = len(scope.FallbackProviders)
 	exact := make(map[string]map[parser.AgentType]struct{}, len(scope.Files))
@@ -575,7 +612,7 @@ func pruneRemoteSkipCache(
 			}
 		}
 		for fallbackAgent, roots := range fallback {
-			if agent != "" && agent != fallbackAgent {
+			if agent != "" && !slices.Contains(parser.ProviderStoredAgents(fallbackAgent), agent) {
 				continue
 			}
 			if remotePathWithinAnyRoot(path, roots) {
@@ -632,7 +669,7 @@ func remoteCacheFamily(key string) (string, parser.AgentType) {
 	if suffix == "" {
 		return path, ""
 	}
-	agent := strings.TrimPrefix(suffix, "?agent=")
+	agent := strings.TrimPrefix(suffix, db.ProviderAgentSkipMarker)
 	if before, _, ok := strings.Cut(agent, "?"); ok {
 		agent = before
 	}

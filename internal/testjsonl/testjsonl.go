@@ -4,7 +4,9 @@
 package testjsonl
 
 import (
-	"encoding/json"
+	"encoding/json/jsontext"
+	"encoding/json/v2"
+	"maps"
 	"strings"
 )
 
@@ -148,6 +150,25 @@ func CodexSessionMetaJSON(
 	return mustMarshal(m)
 }
 
+// CodexSessionMetaWithFieldsJSON returns a Codex session_meta message whose
+// payload carries the given extra fields alongside the standard ones. Used for
+// meta shapes that only some rollouts carry, such as paginated history.
+func CodexSessionMetaWithFieldsJSON(
+	id, cwd, originator, timestamp string, extra map[string]any,
+) string {
+	payload := map[string]any{
+		"id":         id,
+		"cwd":        cwd,
+		"originator": originator,
+	}
+	maps.Copy(payload, extra)
+	return mustMarshal(map[string]any{
+		"type":      "session_meta",
+		"timestamp": timestamp,
+		"payload":   payload,
+	})
+}
+
 // CodexSubagentSessionMetaJSON returns the session_meta shape written by
 // current Codex multi-agent rollouts.
 func CodexSubagentSessionMetaJSON(
@@ -178,6 +199,34 @@ func CodexSubagentSessionMetaJSON(
 		},
 	}
 	return mustMarshal(m)
+}
+
+// CodexSubagentSessionMetaVariantJSON returns a configurable subagent source.
+func CodexSubagentSessionMetaVariantJSON(
+	threadSource string,
+	subagentSource any,
+	id, parentID, cwd, originator, timestamp string,
+) string {
+	payload := map[string]any{
+		"id":               id,
+		"cwd":              cwd,
+		"originator":       originator,
+		"agent_nickname":   "worker",
+		"agent_path":       "/root/worker",
+		"parent_thread_id": parentID,
+		"session_id":       parentID,
+		"source": map[string]any{
+			"subagent": subagentSource,
+		},
+	}
+	if threadSource != "" {
+		payload["thread_source"] = threadSource
+	}
+	return mustMarshal(map[string]any{
+		"type":      "session_meta",
+		"timestamp": timestamp,
+		"payload":   payload,
+	})
 }
 
 // CodexAgentMessageJSON returns a current Codex inter-agent message. Codex
@@ -422,6 +471,31 @@ func CodexTokenCountJSON(
 	return mustMarshal(m)
 }
 
+// CodexTokenCountWithCacheWriteJSON returns a Codex token_count event whose
+// last_token_usage includes cache_write_input_tokens inside input_tokens.
+func CodexTokenCountWithCacheWriteJSON(
+	timestamp string,
+	inputTokens, outputTokens, cachedInputTokens, cacheWriteInputTokens int,
+) string {
+	m := map[string]any{
+		"type":      "event_msg",
+		"timestamp": timestamp,
+		"payload": map[string]any{
+			"type": "token_count",
+			"info": map[string]any{
+				"last_token_usage": map[string]any{
+					"input_tokens":             inputTokens,
+					"output_tokens":            outputTokens,
+					"cached_input_tokens":      cachedInputTokens,
+					"cache_write_input_tokens": cacheWriteInputTokens,
+					"total_tokens":             inputTokens + outputTokens,
+				},
+			},
+		},
+	}
+	return mustMarshal(m)
+}
+
 // ClaudeEntryJSON returns a Claude JSONL entry with uuid and
 // parentUuid fields.
 func ClaudeEntryJSON(
@@ -538,6 +612,42 @@ func (b *SessionBuilder) AddClaudeAssistant(
 		[]map[string]string{{"type": "text", "text": text}},
 		timestamp,
 	))
+	return b
+}
+
+// ClaudeAssistantUsage carries the token-usage identity fields for
+// AddClaudeAssistantUsage.
+type ClaudeAssistantUsage struct {
+	MessageID    string
+	RequestID    string
+	Model        string
+	InputTokens  int
+	OutputTokens int
+}
+
+// AddClaudeAssistantUsage appends a Claude assistant message line
+// carrying model, message/request identity, and token usage, the
+// shape billed API turns take in real Claude Code transcripts.
+func (b *SessionBuilder) AddClaudeAssistantUsage(
+	timestamp, text string, usage ClaudeAssistantUsage,
+) *SessionBuilder {
+	m := map[string]any{
+		"type":      "assistant",
+		"timestamp": timestamp,
+		"requestId": usage.RequestID,
+		"message": map[string]any{
+			"id":    usage.MessageID,
+			"model": usage.Model,
+			"content": []map[string]string{
+				{"type": "text", "text": text},
+			},
+			"usage": map[string]any{
+				"input_tokens":  usage.InputTokens,
+				"output_tokens": usage.OutputTokens,
+			},
+		},
+	}
+	b.lines = append(b.lines, mustMarshal(m))
 	return b
 }
 
@@ -688,7 +798,7 @@ func GeminiSessionJSON(
 		"lastUpdated": lastUpdated,
 		"messages":    messages,
 	}
-	b, err := json.MarshalIndent(session, "", "  ")
+	b, err := json.Marshal(session, jsontext.WithIndent("  "))
 	if err != nil {
 		panic(err)
 	}

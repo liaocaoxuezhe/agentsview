@@ -2,6 +2,7 @@ package server
 
 import (
 	"context"
+	"encoding/csv"
 	"errors"
 	"fmt"
 	"log"
@@ -10,6 +11,7 @@ import (
 	"os"
 	"os/exec"
 	"path/filepath"
+	"reflect"
 	"runtime"
 	"strings"
 	"time"
@@ -17,42 +19,54 @@ import (
 	"github.com/danielgtaylor/huma/v2"
 	"go.kenn.io/agentsview/internal/db"
 	"go.kenn.io/agentsview/internal/export"
+	"go.kenn.io/agentsview/internal/ingest"
 	"go.kenn.io/agentsview/internal/money"
 	"go.kenn.io/agentsview/internal/parser"
 	"go.kenn.io/agentsview/internal/service"
 	"go.kenn.io/agentsview/internal/sessionwatch"
+	"go.kenn.io/agentsview/internal/signals"
+	"go.kenn.io/agentsview/internal/stringutil"
 )
 
 func (s *Server) registerSessionRoutes() {
-	group := newRouteGroup(s.api, "/api/v1", "Sessions")
+	group := huma.NewGroup(s.api, "/api/v1")
+	configureRouteGroup(group, "Sessions")
 
-	get(s, group, "/sessions", "List sessions", s.humaListSessions)
-	get(s, group, "/sessions/sidebar-index", "List sidebar sessions", s.humaSidebarSessionIndex)
-	get(s, group, "/session-ids/resolve", "Resolve session IDs", s.humaResolveSessionIDs)
-	get(s, group, "/sessions/{id}", "Get session", s.humaGetSession)
-	get(s, group, "/sessions/{id}/messages", "List session messages", s.humaGetMessages)
-	get(s, group, "/sessions/{id}/tool-calls", "List session tool calls", s.humaToolCalls)
-	get(s, group, "/sessions/{id}/children", "List child sessions", s.humaGetChildSessions)
-	get(s, group, "/sessions/{id}/activity", "Get session activity", s.humaGetSessionActivity)
-	get(s, group, "/sessions/{id}/timing", "Get session timing", s.humaSessionTiming)
-	get(s, group, "/sessions/{id}/usage", "Get session usage", s.humaSessionUsage)
-	stream(s, group, http.MethodGet, "/sessions/{id}/watch", "Watch session events", s.humaWatchSession)
-	stream(s, group, http.MethodGet, "/events", "Watch server events", s.humaEvents)
-	raw(s, group, http.MethodGet, "/sessions/{id}/export", "Export session as HTML", s.humaExportSession)
-	raw(s, group, http.MethodGet, "/sessions/{id}/md", "Export session as Markdown", s.humaMarkdownSession)
-	post(s, group, "/sessions/{id}/publish", "Publish session", s.humaPublishSession)
-	post(s, group, "/sessions/{id}/resume", "Resume session", s.humaResumeSession)
-	get(s, group, "/sessions/{id}/directory", "Get session directory", s.humaGetSessionDir)
-	get(s, group, "/sessions/{id}/search", "Search within a session", s.humaSearchSession)
-	post(s, group, "/sessions/{id}/open", "Open session directory", s.humaOpenSession)
-	post(s, group, "/sessions/upload", "Upload a session export", s.humaUploadSession)
-	patch(s, group, "/sessions/{id}/rename", "Rename session", s.humaRenameSession)
-	post(s, group, "/sessions/batch-delete", "Batch delete sessions", s.humaBatchDeleteSessions)
-	deleteRoute(s, group, "/sessions/{id}", "Delete session", s.humaDeleteSession)
-	post(s, group, "/sessions/{id}/restore", "Restore session", s.humaRestoreSession)
-	deleteRoute(s, group, "/sessions/{id}/permanent", "Permanently delete session", s.humaPermanentDeleteSession)
-	get(s, group, "/trash", "List trash", s.humaListTrash)
-	deleteRoute(s, group, "/trash", "Empty trash", s.humaEmptyTrash)
+	s.get(group, "/sessions", "List sessions", s.humaListSessions)
+	s.get(group, "/sessions/sidebar-index", "List sidebar sessions", s.humaSidebarSessionIndex)
+	s.get(group, "/session-ids/resolve", "Resolve session IDs", s.humaResolveSessionIDs)
+	s.get(group, "/sessions/{id}", "Get session", s.humaGetSession)
+	s.get(group, "/sessions/{id}/messages", "List session messages", s.humaGetMessages)
+	s.get(group, "/sessions/{id}/tool-calls", "List session tool calls", s.humaToolCalls)
+	s.get(group, "/sessions/{id}/tool-sequences", "Get session tool sequences", s.humaToolSequences)
+	s.get(group, "/sessions/{id}/children", "List child sessions", s.humaGetChildSessions)
+	s.get(group, "/sessions/{id}/activity", "Get session activity", s.humaGetSessionActivity)
+	s.get(group, "/sessions/{id}/timing", "Get session timing", s.humaSessionTiming)
+	// Huma does not infer nullability for pointers to object schemas.
+	registry := s.api.OpenAPI().Components.Schemas
+	timing := registry.Schema(reflect.TypeFor[db.SessionTiming](), false, "")
+	timing.Properties["slowest_call"] = &huma.Schema{
+		AnyOf: []*huma.Schema{registry.Schema(reflect.TypeFor[db.CallTiming](), true, ""), {Type: "null"}},
+	}
+
+	s.get(group, "/sessions/{id}/usage", "Get session usage", s.humaSessionUsage)
+	s.stream(group, http.MethodGet, "/sessions/{id}/watch", "Watch session events", s.humaWatchSession)
+	s.stream(group, http.MethodGet, "/events", "Watch server events", s.humaEvents)
+	s.raw(group, http.MethodGet, "/sessions/{id}/export", "Export session as HTML", "text/html", s.humaExportSession)
+	s.raw(group, http.MethodGet, "/sessions/{id}/md", "Export session as Markdown", "text/markdown", s.humaMarkdownSession)
+	s.post(group, "/sessions/{id}/publish", "Publish session", s.humaPublishSession)
+	s.post(group, "/sessions/{id}/resume", "Resume session", s.humaResumeSession)
+	s.get(group, "/sessions/{id}/directory", "Get session directory", s.humaGetSessionDir)
+	s.get(group, "/sessions/{id}/search", "Search within a session", s.humaSearchSession)
+	s.post(group, "/sessions/{id}/open", "Open session directory", s.humaOpenSession)
+	s.post(group, "/sessions/upload", "Upload a session export", s.humaUploadSession)
+	s.patch(group, "/sessions/{id}/rename", "Rename session", s.humaRenameSession)
+	s.post(group, "/sessions/batch-delete", "Batch delete sessions", s.humaBatchDeleteSessions)
+	s.deleteRoute(group, "/sessions/{id}", "Delete session", s.humaDeleteSession)
+	s.post(group, "/sessions/{id}/restore", "Restore session", s.humaRestoreSession)
+	s.deleteRoute(group, "/sessions/{id}/permanent", "Permanently delete session", s.humaPermanentDeleteSession)
+	s.get(group, "/trash", "List trash", s.humaListTrash)
+	s.deleteRoute(group, "/trash", "Empty trash", s.humaEmptyTrash)
 }
 
 type messageDirection string
@@ -73,9 +87,10 @@ type sessionFilterInput struct {
 	MinMessages      int               `query:"min_messages" minimum:"0" doc:"Minimum total message count"`
 	MaxMessages      int               `query:"max_messages" minimum:"0" doc:"Maximum total message count"`
 	MinUserMessages  int               `query:"min_user_messages" minimum:"0" doc:"Minimum user message count"`
-	IncludeOneShot   bool              `query:"include_one_shot" doc:"Include one-shot sessions"`
-	IncludeAutomated bool              `query:"include_automated" doc:"Include automated sessions"`
+	IncludeOneShot   optionalBoolParam `query:"include_one_shot" doc:"Include one-shot sessions"`
+	IncludeAutomated optionalBoolParam `query:"include_automated" doc:"Include automated sessions"`
 	IncludeChildren  bool              `query:"include_children" doc:"Include child sessions"`
+	IncludeSource    bool              `query:"include_source" doc:"Include available source file path, size, and archive-row update time on /sessions; accepted but ignored by /sessions/sidebar-index"`
 	Outcome          string            `query:"outcome" doc:"Filter by detected outcome"`
 	HealthGrade      string            `query:"health_grade" doc:"Filter by health grade"`
 	Cursor           string            `query:"cursor" doc:"Opaque pagination cursor"`
@@ -84,19 +99,72 @@ type sessionFilterInput struct {
 	MinToolFailures  optionalIntParam  `query:"min_tool_failures" minimum:"0" doc:"Minimum tool failure count"`
 	HasSecret        bool              `query:"has_secret" doc:"Filter sessions with secret findings"`
 	Starred          bool              `query:"starred" doc:"Filter sessions by starred status"`
+	Label            []string          `query:"label,explode" doc:"Keep sessions carrying this exact label; repeat to require several"`
+	PR               string            `query:"pr" doc:"Keep sessions linked to a pull request: owner/repo, owner/repo#123, or github.com::owner/repo#123"`
 	OrderBy          string            `query:"order_by" default:"recent" doc:"Sort order: a comma-separated list of keys, each optionally suffixed :asc or :desc (e.g. messages:desc,started:asc). A key with no suffix uses the descending param, then its natural direction. Valid keys: recent, started, messages, user-messages, output-tokens, peak-context, failures, retries, edit-churn, compactions, context-pressure, health, secrets, id."`
 	Descending       optionalBoolParam `query:"descending" doc:"Default sort direction for keys in order_by that carry no explicit :asc/:desc suffix"`
 }
 
+// SessionListFilters exposes the shared filters to Huma's embedded-field walk,
+// which skips unexported anonymous fields.
+type SessionListFilters = sessionFilterInput
+
+// Batch selection belongs only to the session list, not sidebar discovery.
+type listSessionsInput struct {
+	SessionListFilters
+	IDs    string `query:"ids" doc:"Comma-separated list of 1 to 100 session IDs. Quote IDs containing commas or line breaks with RFC 4180 CSV quoting; IDs containing CRLF are rejected. Raw IDs include host copies; tilde-qualified IDs match exactly. Explicit filters intersect the selection; discovery exclusions do not apply."`
+	IDsSet bool
+}
+
+func (in *listSessionsInput) Resolve(ctx huma.Context) []error {
+	// Huma treats an empty query value as omitted. Presence must be checked
+	// separately so ?ids= fails closed instead of listing the archive.
+	requestURL := ctx.URL()
+	in.IDsSet = requestURL.Query().Has("ids")
+	return nil
+}
+
+func parseSessionIDs(raw string) ([]string, error) {
+	if strings.Contains(raw, "\r\n") {
+		return nil, apiError(http.StatusBadRequest, "ids cannot contain CRLF")
+	}
+	members := strings.Split(raw, ",")
+	reader := csv.NewReader(strings.NewReader(raw))
+	reader.FieldsPerRecord = -1
+	reader.TrimLeadingSpace = true
+	if records, err := reader.ReadAll(); err == nil && len(records) == 1 &&
+		service.SessionIDsRequireCSVEncoding(records[0]) {
+		members = records[0]
+	}
+	if len(members) > 100 {
+		return nil, apiError(http.StatusBadRequest, "ids must contain 1 to 100 non-empty session IDs")
+	}
+	ids := make([]string, 0, len(members))
+	seen := make(map[string]bool, len(members))
+	for _, member := range members {
+		id := strings.TrimSpace(member)
+		if id == "" {
+			return nil, apiError(http.StatusBadRequest, "ids must contain 1 to 100 non-empty session IDs")
+		}
+		if !seen[id] {
+			ids = append(ids, id)
+			seen[id] = true
+		}
+	}
+	return ids, nil
+}
+
 type messageListInput struct {
-	ID        string           `path:"id" required:"true" doc:"Session ID"`
-	Limit     int              `query:"limit" minimum:"0" doc:"Maximum number of messages"`
-	Direction messageDirection `query:"direction" enum:"asc,desc" doc:"Message ordering direction"`
-	From      optionalIntParam `query:"from" minimum:"0" doc:"Starting message ordinal"`
-	Around    optionalIntParam `query:"around" minimum:"0" doc:"Center a symmetric window on this ordinal (mutually exclusive with from/direction)"`
-	Before    optionalIntParam `query:"before" minimum:"0" doc:"Messages before the around anchor (default 5)"`
-	After     optionalIntParam `query:"after" minimum:"0" doc:"Messages after the around anchor (default 5)"`
-	Roles     string           `query:"roles" doc:"Comma-separated roles to include, e.g. user,assistant"`
+	ID               string           `path:"id" required:"true" doc:"Session ID"`
+	Limit            int              `query:"limit" minimum:"0" doc:"Maximum number of messages"`
+	Direction        messageDirection `query:"direction" enum:"asc,desc" doc:"Message ordering direction"`
+	From             optionalIntParam `query:"from" minimum:"0" doc:"Starting message ordinal"`
+	Around           optionalIntParam `query:"around" minimum:"0" doc:"Center a symmetric window on this ordinal (mutually exclusive with from/direction)"`
+	Before           optionalIntParam `query:"before" minimum:"0" doc:"Messages before the around anchor (default 5)"`
+	After            optionalIntParam `query:"after" minimum:"0" doc:"Messages after the around anchor (default 5)"`
+	Roles            string           `query:"roles" doc:"Comma-separated roles to include, e.g. user,assistant"`
+	ExpectedRevision string           `query:"expected_revision" doc:"Reject the read when the transcript revision no longer matches"`
+	EvidenceSource   string           `query:"evidence_source" doc:"Opaque archive binding returned by an earlier evidence read"`
 }
 
 type searchSessionInput struct {
@@ -105,12 +173,14 @@ type searchSessionInput struct {
 }
 
 type resolveSessionIDsInput struct {
-	Partial string `query:"partial" required:"true" doc:"Session ID substring"`
-	Limit   int    `query:"limit" minimum:"0" maximum:"1000" doc:"Maximum number of matching IDs"`
+	Partial   string `query:"partial" required:"true" doc:"Session ID substring or raw suffix"`
+	Limit     int    `query:"limit" minimum:"0" maximum:"1000" doc:"Maximum number of matching IDs"`
+	RawSuffix bool   `query:"raw_suffix" doc:"Use literal exact, colon-suffix, or host-tilde-suffix matching"`
 }
 
 type resolveSessionIDsResponse struct {
-	IDs []string `json:"ids"`
+	IDs       []string `json:"ids"`
+	RawSuffix bool     `json:"raw_suffix,omitempty"`
 }
 
 func (in *sessionFilterInput) listFilter() (service.ListFilter, error) {
@@ -126,31 +196,36 @@ func (in *sessionFilterInput) listFilter() (service.ListFilter, error) {
 	}
 	limit := clampLimit(in.Limit, db.DefaultSessionLimit, db.MaxSessionLimit)
 	filter := service.ListFilter{
-		Project:          in.Project,
-		ExcludeProject:   in.ExcludeProject,
-		Machine:          in.Machine,
-		GitBranch:        in.GitBranch,
-		Agent:            in.Agent,
-		Date:             in.Date,
-		DateFrom:         in.DateFrom,
-		DateTo:           in.DateTo,
-		Timezone:         timezone,
-		ActiveSince:      in.ActiveSince,
-		MinMessages:      in.MinMessages,
-		MaxMessages:      in.MaxMessages,
-		MinUserMessages:  in.MinUserMessages,
-		IncludeOneShot:   in.IncludeOneShot,
-		IncludeAutomated: in.IncludeAutomated,
-		IncludeChildren:  in.IncludeChildren,
-		Outcome:          in.Outcome,
-		HealthGrade:      in.HealthGrade,
-		Cursor:           in.Cursor,
-		Limit:            limit,
-		Termination:      in.Termination,
-		HasSecret:        in.HasSecret,
-		Starred:          in.Starred,
-		OrderBy:          in.OrderBy,
-		Descending:       optionalBoolValue(in.Descending),
+		Project:            in.Project,
+		ExcludeProject:     in.ExcludeProject,
+		Machine:            in.Machine,
+		GitBranch:          in.GitBranch,
+		Agent:              in.Agent,
+		Date:               in.Date,
+		DateFrom:           in.DateFrom,
+		DateTo:             in.DateTo,
+		Timezone:           timezone,
+		ActiveSince:        in.ActiveSince,
+		MinMessages:        in.MinMessages,
+		MaxMessages:        in.MaxMessages,
+		MinUserMessages:    in.MinUserMessages,
+		IncludeOneShot:     in.IncludeOneShot.Value,
+		OneShotFilterSet:   in.IncludeOneShot.IsSet,
+		IncludeAutomated:   in.IncludeAutomated.Value,
+		AutomatedFilterSet: in.IncludeAutomated.IsSet,
+		IncludeChildren:    in.IncludeChildren,
+		IncludeSource:      in.IncludeSource,
+		Outcome:            in.Outcome,
+		HealthGrade:        in.HealthGrade,
+		Cursor:             in.Cursor,
+		Limit:              limit,
+		Termination:        in.Termination,
+		HasSecret:          in.HasSecret,
+		Starred:            in.Starred,
+		Labels:             in.Label,
+		PR:                 in.PR,
+		OrderBy:            in.OrderBy,
+		Descending:         optionalBoolValue(in.Descending),
 	}
 	if in.MinToolFailures.IsSet {
 		filter.MinToolFailures = &in.MinToolFailures.Value
@@ -176,42 +251,63 @@ func (in *sessionFilterInput) dbFilter(includeChildren bool) (db.SessionFilter, 
 	if in.Limit > 0 {
 		limit = clampLimit(in.Limit, db.DefaultSessionLimit, db.MaxSessionLimit)
 	}
+	pr, err := db.ParsePRFilter(in.PR)
+	if err != nil {
+		return db.SessionFilter{}, apiError(http.StatusBadRequest, err.Error())
+	}
+	labels, err := db.LabelFilterValues(in.Label)
+	if err != nil {
+		return db.SessionFilter{}, apiError(http.StatusBadRequest, err.Error())
+	}
 	return db.SessionFilter{
-		Project:          in.Project,
-		ExcludeProject:   in.ExcludeProject,
-		Machine:          in.Machine,
-		GitBranch:        in.GitBranch,
-		Agent:            in.Agent,
-		Date:             in.Date,
-		DateFrom:         in.DateFrom,
-		DateTo:           in.DateTo,
-		Timezone:         timezone,
-		ActiveSince:      in.ActiveSince,
-		MinMessages:      in.MinMessages,
-		MaxMessages:      in.MaxMessages,
-		MinUserMessages:  in.MinUserMessages,
-		ExcludeOneShot:   !in.IncludeOneShot,
-		ExcludeAutomated: !in.IncludeAutomated,
-		IncludeChildren:  includeChildren,
-		Cursor:           in.Cursor,
-		Limit:            limit,
-		Termination:      in.Termination,
-		Starred:          in.Starred,
+		Project:            in.Project,
+		ExcludeProject:     in.ExcludeProject,
+		Machine:            in.Machine,
+		GitBranch:          in.GitBranch,
+		Agent:              in.Agent,
+		Date:               in.Date,
+		DateFrom:           in.DateFrom,
+		DateTo:             in.DateTo,
+		Timezone:           timezone,
+		ActiveSince:        in.ActiveSince,
+		MinMessages:        in.MinMessages,
+		MaxMessages:        in.MaxMessages,
+		MinUserMessages:    in.MinUserMessages,
+		ExcludeOneShot:     !in.IncludeOneShot.Value,
+		OneShotFilterSet:   in.IncludeOneShot.IsSet,
+		ExcludeAutomated:   !in.IncludeAutomated.Value,
+		AutomatedFilterSet: in.IncludeAutomated.IsSet,
+		IncludeChildren:    includeChildren,
+		Cursor:             in.Cursor,
+		Limit:              limit,
+		Termination:        in.Termination,
+		Starred:            in.Starred,
+		Labels:             labels,
+		PR:                 pr,
 	}, nil
 }
 
 func (s *Server) humaListSessions(
 	ctx context.Context,
-	in *sessionFilterInput,
+	in *listSessionsInput,
 ) (*jsonOutput[*service.SessionList], error) {
 	filter, err := in.listFilter()
 	if err != nil {
 		return nil, err
 	}
+	if in.IDsSet {
+		filter.IDs, err = parseSessionIDs(in.IDs)
+		if err != nil {
+			return nil, err
+		}
+	}
 	page, err := s.sessions.List(ctx, filter)
 	if err != nil {
 		if errors.Is(err, db.ErrInvalidCursor) {
 			return nil, apiError(http.StatusBadRequest, "invalid cursor")
+		}
+		if errors.Is(err, db.ErrInvalidPRFilter) || errors.Is(err, db.ErrSessionLabelsInvalid) {
+			return nil, apiError(http.StatusBadRequest, err.Error())
 		}
 		return nil, serverError(err)
 	}
@@ -225,6 +321,10 @@ func (s *Server) humaSidebarSessionIndex(
 	filter, err := in.dbFilter(true)
 	if err != nil {
 		return nil, err
+	}
+	filter.Machine, err = db.ResolveMachineFilter(ctx, s.db, filter.Machine)
+	if err != nil {
+		return nil, serverError(err)
 	}
 	index, err := s.db.GetSidebarSessionIndex(ctx, filter)
 	if err != nil {
@@ -240,7 +340,13 @@ func (s *Server) humaResolveSessionIDs(
 	ctx context.Context,
 	in *resolveSessionIDsInput,
 ) (*jsonOutput[resolveSessionIDsResponse], error) {
-	ids, err := s.sessions.FindSessionIDsByPartial(ctx, in.Partial, in.Limit)
+	var ids []string
+	var err error
+	if in.RawSuffix {
+		ids, err = s.sessions.FindSessionIDsByRawSuffix(ctx, in.Partial, in.Limit)
+	} else {
+		ids, err = s.sessions.FindSessionIDsByPartial(ctx, in.Partial, in.Limit)
+	}
 	if err != nil {
 		if handled := handleHumaContextError(err); handled != nil {
 			return nil, handled
@@ -251,7 +357,7 @@ func (s *Server) humaResolveSessionIDs(
 		return nil, serverError(err)
 	}
 	return &jsonOutput[resolveSessionIDsResponse]{
-		Body: resolveSessionIDsResponse{IDs: ids},
+		Body: resolveSessionIDsResponse{IDs: ids, RawSuffix: in.RawSuffix},
 	}, nil
 }
 
@@ -289,8 +395,10 @@ func (s *Server) humaGetMessages(
 ) (*jsonOutput[*service.MessageList], error) {
 	limit := clampLimit(in.Limit, db.DefaultMessageLimit, db.MaxMessageLimit)
 	filter := service.MessageFilter{
-		Limit:     limit,
-		Direction: string(in.Direction),
+		Limit:            limit,
+		Direction:        string(in.Direction),
+		ExpectedRevision: in.ExpectedRevision,
+		EvidenceSource:   in.EvidenceSource,
 	}
 	if in.From.IsSet {
 		filter.From = &in.From.Value
@@ -309,6 +417,12 @@ func (s *Server) humaGetMessages(
 	}
 	list, err := s.sessions.Messages(ctx, in.ID, filter)
 	if err != nil {
+		if errors.Is(err, service.ErrSourceChanged) {
+			return nil, apiErrorWithCode(http.StatusConflict, "source_changed", err.Error())
+		}
+		if errors.Is(err, service.ErrRevisionBoundReadUnavailable) {
+			return nil, apiError(http.StatusNotImplemented, err.Error())
+		}
 		if errors.Is(err, service.ErrAroundMutuallyExclusive) ||
 			errors.Is(err, service.ErrBeforeAfterRequireAround) {
 			return nil, apiError(http.StatusBadRequest, err.Error())
@@ -342,6 +456,167 @@ func (s *Server) humaToolCalls(
 		return nil, serverError(err)
 	}
 	return &jsonOutput[*service.ToolCallList]{Body: list}, nil
+}
+
+const (
+	maxSessionToolSequences      = 20
+	maxSessionToolSequenceCalls  = 10
+	maxToolSequenceInputPreview  = 512
+	maxToolSequenceResultPreview = 1024
+)
+
+type sessionToolSequencesResponse struct {
+	SessionID          string                `json:"session_id"`
+	TranscriptRevision string                `json:"transcript_revision"`
+	TotalToolCalls     int                   `json:"total_tool_calls"`
+	TotalSequences     int                   `json:"total_sequences"`
+	OmittedSequences   int                   `json:"omitted_sequences"`
+	TotalSequenceCalls int                   `json:"total_sequence_calls"`
+	OmittedCalls       int                   `json:"omitted_calls"`
+	Sequences          []sessionToolSequence `json:"sequences"`
+}
+
+type sessionToolSequence struct {
+	Ending        string                    `json:"ending" enum:"recovered,abandoned,open,unknown"`
+	Identical     bool                      `json:"identical"`
+	NearIdentical bool                      `json:"near_identical"`
+	ToolChanged   bool                      `json:"tool_changed"`
+	TotalCalls    int                       `json:"total_calls"`
+	OmittedCalls  int                       `json:"omitted_calls"`
+	Calls         []sessionToolSequenceCall `json:"calls"`
+}
+
+type sessionToolSequenceCall struct {
+	Ordinal              int    `json:"ordinal"`
+	CallIndex            int    `json:"call_index"`
+	ToolUseID            string `json:"tool_use_id"`
+	CallFingerprint      string `json:"call_fingerprint" doc:"Tool name and input fingerprint a jump checks, since some agents derive tool IDs from position"`
+	ToolName             string `json:"tool_name"`
+	Outcome              string `json:"outcome" enum:"errored,empty,content,unknown"`
+	Repeat               string `json:"repeat" enum:"none,identical,near_identical"`
+	ToolChanged          bool   `json:"tool_changed"`
+	InputPreview         string `json:"input_preview"`
+	InputBytes           int    `json:"input_bytes"`
+	InputOmittedBytes    int    `json:"input_omitted_bytes"`
+	ResultPreview        string `json:"result_preview"`
+	ResultBytes          *int   `json:"result_bytes"`
+	ResultOmittedBytes   *int   `json:"result_omitted_bytes"`
+	ResultContentUnknown bool   `json:"result_content_unknown"`
+}
+
+func (s *Server) humaToolSequences(
+	ctx context.Context,
+	in *idPathInput,
+) (*jsonOutput[sessionToolSequencesResponse], error) {
+	response, err := collectSessionToolSequences(ctx, s.db, in.ID)
+	if err != nil {
+		if errors.Is(err, db.ErrSessionChanged) {
+			return nil, apiErrorWithCode(http.StatusConflict, "source_changed", err.Error())
+		}
+		if errors.Is(err, db.ErrSessionRevisionUnavailable) {
+			return nil, apiErrorWithCode(http.StatusNotImplemented, "revision_unavailable", err.Error())
+		}
+		return nil, serverError(err)
+	}
+	if response == nil {
+		return nil, apiError(http.StatusNotFound, "session not found")
+	}
+	return &jsonOutput[sessionToolSequencesResponse]{Body: *response}, nil
+}
+
+func collectSessionToolSequences(ctx context.Context, store db.Store, id string) (*sessionToolSequencesResponse, error) {
+	var messages []db.Message
+	session, err := db.ReadSessionChecked(ctx, store, id, func(*db.Session) error {
+		var err error
+		messages, err = store.GetAllMessages(ctx, id)
+		return err
+	})
+	if err != nil || session == nil {
+		return nil, err
+	}
+	response := buildSessionToolSequences(session, ingest.ExtractToolCallRows(messages))
+	// The checked read guarantees a revision; returning it lets the client tell these sequences from the transcript it shows.
+	response.TranscriptRevision = *session.TranscriptRevision
+	return &response, nil
+}
+
+func buildSessionToolSequences(
+	session *db.Session,
+	rows []signals.ToolCallRow,
+) sessionToolSequencesResponse {
+	extracted := signals.ExtractToolSequences(rows, parser.TerminationComplete(session.TerminationStatus))
+	response := sessionToolSequencesResponse{
+		SessionID:      session.ID,
+		TotalToolCalls: len(extracted.Calls),
+		TotalSequences: len(extracted.Sequences),
+		Sequences:      make([]sessionToolSequence, 0, min(len(extracted.Sequences), maxSessionToolSequences)),
+	}
+	response.OmittedSequences = response.TotalSequences - min(response.TotalSequences, maxSessionToolSequences)
+	for _, sequence := range extracted.Sequences {
+		response.TotalSequenceCalls += sequence.End - sequence.Start
+	}
+	for _, sequence := range extracted.Sequences[:min(len(extracted.Sequences), maxSessionToolSequences)] {
+		count := sequence.End - sequence.Start
+		// A long sequence keeps its first calls and its last, so the panel still shows how it ended.
+		indexes := make([]int, 0, min(count, maxSessionToolSequenceCalls))
+		for i := sequence.Start; i < sequence.End && len(indexes) < maxSessionToolSequenceCalls-1; i++ {
+			indexes = append(indexes, i)
+		}
+		if count > len(indexes) {
+			indexes = append(indexes, sequence.End-1)
+		}
+		projected := sessionToolSequence{
+			Ending:        string(sequence.Ending),
+			Identical:     sequence.Identical,
+			NearIdentical: sequence.NearIdentical,
+			ToolChanged:   sequence.ToolChanged,
+			TotalCalls:    count,
+			OmittedCalls:  count - len(indexes),
+			Calls:         make([]sessionToolSequenceCall, 0, len(indexes)),
+		}
+		for _, index := range indexes {
+			projected.Calls = append(projected.Calls, projectSessionToolSequenceCall(rows[index], extracted.Calls[index]))
+		}
+		response.Sequences = append(response.Sequences, projected)
+	}
+	response.OmittedCalls = response.TotalSequenceCalls
+	for _, sequence := range response.Sequences {
+		response.OmittedCalls -= len(sequence.Calls)
+	}
+	return response
+}
+
+func projectSessionToolSequenceCall(
+	row signals.ToolCallRow,
+	outcome signals.ToolCallOutcome,
+) sessionToolSequenceCall {
+	inputPreview := strings.Clone(stringutil.SafeTruncate(row.InputJSON, maxToolSequenceInputPreview))
+	resultPreview := strings.Clone(stringutil.SafeTruncate(row.ResultContent, maxToolSequenceResultPreview))
+	call := sessionToolSequenceCall{
+		Ordinal:              outcome.MessageOrdinal,
+		CallIndex:            outcome.CallIndex,
+		ToolUseID:            outcome.ToolUseID,
+		CallFingerprint:      row.Fingerprint(),
+		ToolName:             outcome.ToolName,
+		Outcome:              string(outcome.Outcome),
+		Repeat:               string(outcome.Repeat),
+		ToolChanged:          outcome.ToolChanged,
+		InputPreview:         inputPreview,
+		InputBytes:           len(row.InputJSON),
+		InputOmittedBytes:    len(row.InputJSON) - len(inputPreview),
+		ResultPreview:        resultPreview,
+		ResultContentUnknown: row.ResultContentUnknown,
+	}
+	resultLength := db.ResolveResultContentLength(row.ResultContent, row.ResultContentLength)
+	knownEmpty := !row.ResultContentUnknown &&
+		(signals.IsCompletedToolStatus(row.EventStatus) ||
+			(row.EventStatus != "" && signals.IsFailure(row)))
+	if resultLength > 0 || knownEmpty {
+		call.ResultBytes = &resultLength
+		omitted := resultLength - len(resultPreview)
+		call.ResultOmittedBytes = &omitted
+	}
+	return call
 }
 
 func (s *Server) humaGetSessionActivity(
@@ -382,11 +657,11 @@ type sessionUsageResponse struct {
 	// Cost.Microdollars/1e6; see db.SessionUsage.CostUSD.
 	CostUSD             *float64                        `json:"cost_usd,omitempty"`
 	CostSource          export.CostSource               `json:"cost_source,omitempty"`
-	AICredits           float64                         `json:"ai_credits,omitempty"`
+	AICredits           float64                         `json:"ai_credits,omitzero"`
 	Models              []string                        `json:"models"`
 	UnpricedModels      []string                        `json:"unpriced_models"`
 	BreakdownCount      int                             `json:"breakdown_count"`
-	SubagentCount       int                             `json:"subagent_count,omitempty"`
+	SubagentCount       int                             `json:"subagent_count,omitzero"`
 	Breakdown           []sessionUsageBreakdownResponse `json:"breakdown"`
 	ServerRunning       bool                            `json:"server_running"`
 	RollupCost          *money.Money                    `json:"rollup_cost,omitempty"`
@@ -414,7 +689,7 @@ type sessionUsageBreakdownResponse struct {
 	OutputTokens             int         `json:"output_tokens"`
 	CacheCreationInputTokens int         `json:"cache_creation_input_tokens"`
 	CacheReadInputTokens     int         `json:"cache_read_input_tokens"`
-	WebSearchRequests        int         `json:"web_search_requests,omitempty"`
+	WebSearchRequests        int         `json:"web_search_requests,omitzero"`
 	Cost                     money.Money `json:"cost"`
 	HasCost                  bool        `json:"has_cost"`
 }
@@ -624,7 +899,7 @@ func (s *Server) humaGetSessionDir(
 		return nil, apiError(http.StatusNotFound, "session not found")
 	}
 	return &jsonOutput[sessionDirectoryResponse]{
-		Body: sessionDirectoryResponse{Path: resolveSessionDir(session)},
+		Body: sessionDirectoryResponse{Path: resolveSessionPath(session, filepath.IsAbs)},
 	}, nil
 }
 
@@ -658,7 +933,7 @@ func (s *Server) humaOpenSession(
 		return nil, apiError(http.StatusBadRequest,
 			fmt.Sprintf("opener %q not found", in.Body.OpenerID))
 	}
-	if err := launchOpener(*opener, projectDir); err != nil {
+	if err := launchOpener(ctx, *opener, projectDir); err != nil {
 		return nil, apiError(http.StatusInternalServerError, "failed to launch")
 	}
 	return &jsonOutput[openSessionResponse]{
@@ -686,7 +961,7 @@ func (s *Server) humaPublishSession(
 	filename := session.Project + "-" + formatDateShort(session.StartedAt) + ".html"
 	first := ""
 	if session.FirstMessage != nil {
-		first = truncateStr(*session.FirstMessage, 100)
+		first = stringutil.TruncateRunes(*session.FirstMessage, 100, "...")
 	}
 	description := fmt.Sprintf("Agent session: %s - %s", session.Project, first)
 	gist, err := createGist(ctx, token, filename, description, htmlContent, !in.Secret)
@@ -730,7 +1005,7 @@ func (s *Server) humaRenameSession(
 	if displayName != nil && *displayName == "" {
 		displayName = nil
 	}
-	if err := s.db.RenameSession(in.ID, displayName); err != nil {
+	if err := s.db.RenameSession(ctx, in.ID, displayName); err != nil {
 		if handled := handleHumaReadOnly(err); handled != nil {
 			return nil, handled
 		}
@@ -758,7 +1033,7 @@ func (s *Server) humaDeleteSession(
 	if session == nil {
 		return nil, apiError(http.StatusNotFound, "session not found")
 	}
-	if err := s.db.SoftDeleteSession(in.ID); err != nil {
+	if err := s.db.SoftDeleteSession(ctx, in.ID); err != nil {
 		if handled := handleHumaReadOnly(err); handled != nil {
 			return nil, handled
 		}
@@ -770,7 +1045,7 @@ func (s *Server) humaDeleteSession(
 
 type batchDeleteInput struct {
 	Body struct {
-		SessionIDs []string `json:"session_ids" required:"true" nullable:"false" doc:"Session IDs to soft-delete"`
+		SessionIDs []string `json:"session_ids" required:"true" doc:"Session IDs to soft-delete"`
 	}
 }
 
@@ -782,14 +1057,13 @@ func (s *Server) notifySessionMutation() {
 	}
 }
 
-func (s *Server) humaBatchDeleteSessions(
-	_ context.Context,
+func (s *Server) humaBatchDeleteSessions(ctx context.Context,
 	in *batchDeleteInput,
 ) (*noContentOutput, error) {
 	if len(in.Body.SessionIDs) == 0 {
 		return &noContentOutput{Status: http.StatusNoContent}, nil
 	}
-	if _, err := s.db.SoftDeleteSessions(in.Body.SessionIDs); err != nil {
+	if _, err := s.db.SoftDeleteSessions(ctx, in.Body.SessionIDs); err != nil {
 		if handled := handleHumaReadOnly(err); handled != nil {
 			return nil, handled
 		}
@@ -799,11 +1073,10 @@ func (s *Server) humaBatchDeleteSessions(
 	return &noContentOutput{Status: http.StatusNoContent}, nil
 }
 
-func (s *Server) humaRestoreSession(
-	_ context.Context,
+func (s *Server) humaRestoreSession(ctx context.Context,
 	in *idPathInput,
 ) (*noContentOutput, error) {
-	n, err := s.db.RestoreSession(in.ID)
+	n, err := s.db.RestoreSession(ctx, in.ID)
 	if err != nil {
 		if handled := handleHumaReadOnly(err); handled != nil {
 			return nil, handled
@@ -817,11 +1090,10 @@ func (s *Server) humaRestoreSession(
 	return &noContentOutput{Status: http.StatusNoContent}, nil
 }
 
-func (s *Server) humaPermanentDeleteSession(
-	_ context.Context,
+func (s *Server) humaPermanentDeleteSession(ctx context.Context,
 	in *idPathInput,
 ) (*noContentOutput, error) {
-	n, err := s.db.DeleteSessionIfTrashed(in.ID)
+	n, err := s.db.DeleteSessionIfTrashed(ctx, in.ID)
 	if err != nil {
 		if handled := handleHumaReadOnly(err); handled != nil {
 			return nil, handled
@@ -846,11 +1118,10 @@ func (s *Server) humaListTrash(
 	return &jsonOutput[trashResponse]{Body: trashResponse{Sessions: sessions}}, nil
 }
 
-func (s *Server) humaEmptyTrash(
-	_ context.Context,
+func (s *Server) humaEmptyTrash(ctx context.Context,
 	_ *emptyInput,
 ) (*jsonOutput[emptyTrashResponse], error) {
-	count, err := s.db.EmptyTrash()
+	count, err := s.db.EmptyTrash(ctx)
 	if err != nil {
 		if handled := handleHumaReadOnly(err); handled != nil {
 			return nil, handled
@@ -862,9 +1133,10 @@ func (s *Server) humaEmptyTrash(
 }
 
 type uploadSessionInput struct {
-	Project string `query:"project" required:"true" doc:"Project for imported session"`
-	Machine string `query:"machine" default:"remote" doc:"Machine name for imported session"`
-	RawBody huma.MultipartFormFiles[uploadSessionForm]
+	Project      string `query:"project" required:"true" doc:"Project for imported session"`
+	Machine      string `query:"machine" default:"remote" doc:"Machine name for imported session"`
+	AllowShorter bool   `query:"allow_shorter" doc:"Permit replacing an existing session with fewer messages"`
+	RawBody      huma.MultipartFormFiles[uploadSessionForm]
 }
 
 type uploadSessionForm struct {
@@ -955,7 +1227,7 @@ func (s *Server) humaWatchSession(
 		stream, ok := newHumaSSEStream(hctx)
 		if !ok {
 			writeHumaJSON(hctx, http.StatusInternalServerError,
-				apiErrorResponse{Message: "streaming not supported"})
+				apiResponseError{Message: "streaming not supported"})
 			return
 		}
 		streamCtx := hctx.Context()
@@ -976,6 +1248,17 @@ func (s *Server) humaWatchSession(
 			case _, ok := <-updates:
 				if !ok {
 					return
+				}
+				if identity, ok := s.db.(db.SessionWatchStateStore); ok {
+					state, e := identity.GetSessionWatchState(in.ID)
+					if e != nil {
+						return
+					}
+					if state.State != db.SessionWatchResolved {
+						stream.SendJSON("session.identity", state)
+						return
+					}
+					stream.SendJSON("session.identity", state)
 				}
 				stream.Send("session_updated", in.ID)
 				if t, err := s.db.GetSessionTiming(streamCtx, in.ID); err != nil {
@@ -1004,7 +1287,7 @@ func (s *Server) humaEvents(
 		stream, ok := newHumaSSEStream(hctx)
 		if !ok {
 			writeHumaJSON(hctx, http.StatusInternalServerError,
-				apiErrorResponse{Message: "streaming not supported"})
+				apiResponseError{Message: "streaming not supported"})
 			return
 		}
 		sub, unsub := s.broadcaster.Subscribe()
@@ -1036,6 +1319,9 @@ func (s *Server) humaUploadSession(
 	if s.db.ReadOnly() {
 		return nil, apiError(http.StatusNotImplemented,
 			"uploads are not available in read-only mode")
+	}
+	if err := s.requireSourceSync(ctx); err != nil {
+		return nil, err
 	}
 	project := strings.TrimSpace(in.Project)
 	if project == "" {
@@ -1089,16 +1375,21 @@ func (s *Server) humaUploadSession(
 	if len(results) == 0 {
 		return nil, apiError(http.StatusBadRequest, "no sessions parsed from upload")
 	}
+	stem := strings.TrimSuffix(safeName, ".jsonl")
+	if results[0].Session.ID != stem && parser.IsValidSessionID(results[0].Session.ID) {
+		upload.finalPath = filepath.Join(filepath.Dir(upload.finalPath), results[0].Session.ID+".jsonl")
+	}
 	for i := range results {
 		results[i].Session.File.Path = upload.finalPath
 	}
 	writes := make([]db.SessionBatchWrite, len(results))
 	for i, pr := range results {
 		writes[i] = sessionBatchWriteFromParsed(pr.Session, pr.Messages)
+		writes[i].RejectMessageCountDecrease = !in.AllowShorter
 	}
 	var commitErr error
 	var uploadCommit committedUpload
-	_, err = s.db.WriteSessionBatchAtomic(writes, func() error {
+	_, err = s.db.WriteSessionBatchAtomic(ctx, writes, func() error {
 		uploadCommit, commitErr = commitUpload(upload)
 		return commitErr
 	})
@@ -1116,6 +1407,13 @@ func (s *Server) humaUploadSession(
 		}
 		if handled := handleHumaReadOnly(err); handled != nil {
 			return nil, handled
+		}
+		if shorter, ok := errors.AsType[*db.SessionWouldShortenError](err); ok {
+			return nil, apiError(http.StatusConflict, fmt.Sprintf(
+				"session upload rejected: session %s has %d messages, upload has %d; retry with allow_shorter=true",
+				shorter.SessionID, shorter.ExistingMessages,
+				shorter.IncomingMessages,
+			))
 		}
 		if errors.Is(err, db.ErrSessionExcluded) ||
 			errors.Is(err, db.ErrSessionTrashed) {
@@ -1155,17 +1453,18 @@ func (s *Server) humaResumeSession(
 	if session == nil || session.DeletedAt != nil {
 		return nil, apiError(http.StatusNotFound, "session not found")
 	}
-	if host, _ := parser.StripHostPrefix(in.ID); host != "" {
+	req := in.Body
+	host, rawID := parser.StripHostPrefix(in.ID)
+	if host != "" && (!req.CommandOnly || req.FromOrdinal != nil) {
 		return nil, apiError(http.StatusBadRequest, "cannot resume remote session")
 	}
-	tmpl, ok := resumeAgents[string(session.Agent)]
+	tmpl, ok := resumeAgents[session.Agent]
 	if !ok {
 		return nil, apiError(http.StatusBadRequest,
 			fmt.Sprintf("agent %q does not support resume", session.Agent))
 	}
-	req := in.Body
 	if req.FromOrdinal != nil {
-		if string(session.Agent) != "claude" {
+		if session.Agent != "claude" {
 			return nil, apiError(http.StatusBadRequest,
 				"message-point fork is only available for Claude sessions")
 		}
@@ -1236,7 +1535,7 @@ func (s *Server) humaResumeSession(
 		detectCwd := launchDir
 		if termCfg.Mode == string(terminalModeAuto) {
 			detectCwd = resumeLaunchCwd(
-				string(session.Agent), "auto", runtime.GOOS, launchDir,
+				session.Agent, "auto", runtime.GOOS, launchDir,
 			)
 		}
 		termBin, termArgs, termName, termErr := detectTerminal(
@@ -1253,7 +1552,11 @@ func (s *Server) humaResumeSession(
 				},
 			}, nil
 		}
-		proc := exec.Command(termBin, termArgs...)
+		if err := ctx.Err(); err != nil {
+			return nil, err
+		}
+		// A resumed terminal belongs to the user and outlives this request.
+		proc := exec.CommandContext(context.WithoutCancel(ctx), termBin, termArgs...)
 		proc.Stdout = nil
 		proc.Stderr = nil
 		proc.Stdin = nil
@@ -1281,22 +1584,36 @@ func (s *Server) humaResumeSession(
 			},
 		}, nil
 	}
-	prefix := string(session.Agent) + ":"
-	rawID := strings.TrimPrefix(in.ID, prefix)
+	prefix := session.Agent + ":"
+	rawID = strings.TrimPrefix(rawID, prefix)
+	if provider, ok := s.db.(db.ProviderResumeIdentityStore); ok {
+		rawID, err = provider.GetProviderResumeID(ctx, in.ID)
+		if err != nil {
+			return nil, internalError("resume identity", err)
+		}
+	}
 	if s.db.ReadOnly() && !req.CommandOnly {
 		return nil, apiError(http.StatusNotImplemented,
 			"session launch not available in remote mode")
 	}
 	model := ""
-	if resumeAgentNeedsModel(string(session.Agent)) {
+	if resumeAgentNeedsModel(session.Agent) {
 		counts, err := s.db.GetResumeModelCounts(ctx, session.ID)
 		if err != nil {
 			return nil, internalError("resume: model lookup failed", err)
 		}
 		model = primaryResumeModel(counts)
 	}
-	cmd := resumeCommand(string(session.Agent), tmpl, rawID, model)
-	if string(session.Agent) == "claude" {
+	resumeTarget := rawID
+	if session.Agent == string(parser.AgentPi) && session.FilePath != nil &&
+		*session.FilePath != "" {
+		resumeTarget = *session.FilePath
+		if host != "" {
+			resumeTarget = strings.TrimPrefix(resumeTarget, host+":")
+		}
+	}
+	cmd := resumeCommand(session.Agent, tmpl, resumeTarget, model)
+	if session.Agent == "claude" {
 		if req.SkipPermissions {
 			cmd += " --dangerously-skip-permissions"
 		}
@@ -1304,14 +1621,23 @@ func (s *Server) humaResumeSession(
 			cmd += " --fork-session"
 		}
 	}
-	launchDir, workspaceDir := resolveResumePaths(session)
-	if string(session.Agent) == "cursor" && workspaceDir != "" {
+	var launchDir, workspaceDir string
+	if host != "" {
+		launchDir = session.Cwd
+	} else {
+		launchDir, workspaceDir = resolveResumePaths(session)
+	}
+	if session.Agent == "cursor" && workspaceDir != "" {
 		cmd += " --workspace " + shellQuote(workspaceDir)
 	}
 	responseCmd := cmd
-	switch string(session.Agent) {
-	case "claude", "kiro":
-		responseCmd = commandWithCwd(cmd, launchDir)
+	switch session.Agent {
+	case "claude", "kiro", "pi":
+		if host != "" {
+			responseCmd = commandWithDir(cmd, launchDir)
+		} else {
+			responseCmd = commandWithCwd(cmd, launchDir)
+		}
 	}
 	if req.CommandOnly {
 		return &jsonOutput[resumeResponse]{
@@ -1323,7 +1649,7 @@ func (s *Server) humaResumeSession(
 		}, nil
 	}
 	if req.OpenerID != "" {
-		return s.humaResumeWithOpener(session, rawID, cmd, responseCmd, launchDir, req.OpenerID)
+		return s.humaResumeWithOpener(ctx, session, rawID, cmd, responseCmd, launchDir, req.OpenerID)
 	}
 	s.mu.RLock()
 	termCfg := s.cfg.Terminal
@@ -1340,7 +1666,7 @@ func (s *Server) humaResumeSession(
 	detectCwd := launchDir
 	if termCfg.Mode == string(terminalModeAuto) {
 		detectCwd = resumeLaunchCwd(
-			string(session.Agent), "auto", runtime.GOOS, launchDir,
+			session.Agent, "auto", runtime.GOOS, launchDir,
 		)
 	}
 	termBin, termArgs, termName, termErr := detectTerminal(cmd, detectCwd, termCfg)
@@ -1355,7 +1681,11 @@ func (s *Server) humaResumeSession(
 			},
 		}, nil
 	}
-	proc := exec.Command(termBin, termArgs...)
+	if err := ctx.Err(); err != nil {
+		return nil, err
+	}
+	// A resumed terminal belongs to the user and outlives this request.
+	proc := exec.CommandContext(context.WithoutCancel(ctx), termBin, termArgs...)
 	proc.Stdout = nil
 	proc.Stderr = nil
 	proc.Stdin = nil
@@ -1384,7 +1714,7 @@ func (s *Server) humaResumeSession(
 	}, nil
 }
 
-func (s *Server) humaResumeWithOpener(
+func (s *Server) humaResumeWithOpener(ctx context.Context,
 	session *db.Session,
 	rawID string,
 	cmd string,
@@ -1405,11 +1735,14 @@ func (s *Server) humaResumeWithOpener(
 			fmt.Sprintf("opener %q not found", openerID))
 	}
 	if opener.ID == "claude-desktop" {
-		if string(session.Agent) != "claude" {
+		if session.Agent != "claude" {
 			return nil, apiError(http.StatusBadRequest,
 				"Claude Desktop resume only supports Claude sessions")
 		}
-		proc := launchClaudeDesktop(rawID, launchDir)
+		if err := ctx.Err(); err != nil {
+			return nil, err
+		}
+		proc := launchClaudeDesktop(context.WithoutCancel(ctx), rawID, launchDir)
 		if err := proc.Start(); err != nil {
 			log.Printf("resume: Claude Desktop launch failed: %v", err)
 			return &jsonOutput[resumeResponse]{
@@ -1432,9 +1765,12 @@ func (s *Server) humaResumeWithOpener(
 		}, nil
 	}
 	openerCwd := resumeLaunchCwd(
-		string(session.Agent), opener.ID, runtime.GOOS, launchDir,
+		session.Agent, opener.ID, runtime.GOOS, launchDir,
 	)
-	proc := launchResumeInOpener(*opener, cmd, openerCwd)
+	if err := ctx.Err(); err != nil {
+		return nil, err
+	}
+	proc := launchResumeInOpener(context.WithoutCancel(ctx), *opener, cmd, openerCwd)
 	if proc == nil {
 		return &jsonOutput[resumeResponse]{
 			Body: resumeResponse{

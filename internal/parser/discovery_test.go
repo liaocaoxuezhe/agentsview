@@ -1,7 +1,6 @@
 package parser
 
 import (
-	"context"
 	"os"
 	"path/filepath"
 	"strings"
@@ -41,7 +40,7 @@ func assertDiscoveredFiles(t *testing.T, got []DiscoveredFile, wantFilenames []s
 		assert.Equalf(t, wantAgent, f.Agent, "file %q: agent", base)
 	}
 
-	assert.Equal(t, len(want), len(got), "files total")
+	assert.Len(t, got, len(want), "files total")
 
 	for file := range want {
 		assert.Truef(t, gotMap[file], "missing expected file: %q", file)
@@ -68,7 +67,7 @@ func assertSourceRefs(t *testing.T, got []SourceRef, wantFilenames []string, wan
 		assert.Equalf(t, wantAgent, f.Provider, "file %q: provider", base)
 	}
 
-	assert.Equal(t, len(want), len(got), "files total")
+	assert.Len(t, got, len(want), "files total")
 
 	for file := range want {
 		assert.Truef(t, gotMap[file], "missing expected file: %q", file)
@@ -237,7 +236,7 @@ func TestAmpProviderDiscoversSessions(t *testing.T) {
 				Machine: "local",
 			})
 			require.True(t, ok)
-			files, err := provider.Discover(context.Background())
+			files, err := provider.Discover(t.Context())
 			require.NoError(t, err)
 			assertSourceRefs(t, files, tt.wantFiles, AgentAmp)
 		})
@@ -250,7 +249,7 @@ func TestAmpProviderDiscoversSessions(t *testing.T) {
 			Machine: "local",
 		})
 		require.True(t, ok)
-		files, err := provider.Discover(context.Background())
+		files, err := provider.Discover(t.Context())
 		require.NoError(t, err)
 		assert.Empty(t, files, "expected empty")
 	})
@@ -335,7 +334,7 @@ func TestAmpProviderFindsSourceFile(t *testing.T) {
 		})
 		require.True(t, ok)
 		got, ok, err := provider.FindSource(
-			context.Background(),
+			t.Context(),
 			FindSourceRequest{
 				RawSessionID: "T-019ca26f-aaaa-bbbb-cccc-dddddddddddd",
 			},
@@ -354,7 +353,7 @@ func TestAmpProviderFindsSourceFile(t *testing.T) {
 		})
 		require.True(t, ok)
 		_, ok, err := provider.FindSource(
-			context.Background(),
+			t.Context(),
 			FindSourceRequest{
 				RawSessionID: "T-019ca26f-aaaa-bbbb-cccc-dddddddddddd",
 			},
@@ -379,7 +378,7 @@ func TestAmpProviderFindsSourceFile(t *testing.T) {
 		}
 		for _, id := range tests {
 			_, ok, err := provider.FindSource(
-				context.Background(),
+				t.Context(),
 				FindSourceRequest{RawSessionID: id},
 			)
 			require.NoError(t, err)
@@ -470,12 +469,48 @@ func TestExtractUUIDFromRollout(t *testing.T) {
 			"rollout-20240115-abc12345-1234-5678-9abc-def012345678-suffix.jsonl",
 			"",
 		},
+		{
+			// A thread/revert page keys on <thread>_<rollout>.
+			"rollout-2026-09-01T11-00-00-11111111-1111-4111-8111-111111111111_22222222-2222-4222-8222-222222222222.jsonl",
+			"11111111-1111-4111-8111-111111111111_22222222-2222-4222-8222-222222222222",
+		},
+		{
+			"rollout-20240115-ABC12345-1234-5678-9ABC-DEF012345678.jsonl",
+			"ABC12345-1234-5678-9ABC-DEF012345678",
+		},
+		{
+			"rollout-20240115-abc12345-1234-5678-9abc-def012345678_notauuid.jsonl",
+			"",
+		},
 	}
 
 	for _, tt := range tests {
 		t.Run(tt.filename, func(t *testing.T) {
 			got := extractUUIDFromRollout(tt.filename)
 			assert.Equalf(t, tt.want, got, "extractUUID(%q)", tt.filename)
+		})
+	}
+}
+
+func TestCodexThreadIDFromSessionKey(t *testing.T) {
+	const (
+		thread  = "11111111-1111-4111-8111-111111111111"
+		rollout = "22222222-2222-4222-8222-222222222222"
+	)
+	tests := []struct {
+		name string
+		key  string
+		want string
+	}{
+		{"revert page", thread + "_" + rollout, thread},
+		{"plain thread", thread, thread},
+		{"underscore id", "run_1", "run_1"},
+		{"empty", "", ""},
+		{"thread with non-uuid suffix", thread + "_x", thread + "_x"},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			assert.Equal(t, tt.want, CodexThreadIDFromSessionKey(tt.key))
 		})
 	}
 }
@@ -1206,13 +1241,13 @@ func TestDiscoverCursorSessions_NestedLayout(t *testing.T) {
 			wantCount: 1,
 		},
 		{
-			name: "NestedWithSubagentsIgnored",
+			name: "NestedWithSubagentsDiscovered",
 			files: map[string]string{
 				filepath.Join(cursorTranscripts, "ccc", "ccc.jsonl"):               `{"role":"user"}`,
 				filepath.Join(cursorTranscripts, "ccc", "subagents", "sub1.jsonl"): `{"role":"user"}`,
 				filepath.Join(cursorTranscripts, "ccc", "subagents", "sub2.jsonl"): `{"role":"user"}`,
 			},
-			wantCount: 1,
+			wantCount: 3,
 		},
 		{
 			name: "NestedDedupPrefersJsonl",
@@ -1269,6 +1304,8 @@ func TestDiscoverCursorSessions_DedupPrefersJsonl(t *testing.T) {
 }
 
 func TestParseCursorTranscriptRelPath(t *testing.T) {
+	// Layout coverage lives in TestParseCursorTranscriptRel; this pins the
+	// exported wrapper's contract of returning only the project directory.
 	tests := []struct {
 		name        string
 		rel         string
@@ -1276,47 +1313,20 @@ func TestParseCursorTranscriptRelPath(t *testing.T) {
 		wantOK      bool
 	}{
 		{
-			name:        "flat txt",
-			rel:         filepath.Join("proj-dir", "agent-transcripts", "sess.txt"),
-			wantProject: "proj-dir",
-			wantOK:      true,
-		},
-		{
-			name:        "flat jsonl",
+			name:        "flat",
 			rel:         filepath.Join("proj-dir", "agent-transcripts", "sess.jsonl"),
 			wantProject: "proj-dir",
 			wantOK:      true,
 		},
 		{
-			name:        "nested jsonl",
-			rel:         filepath.Join("proj-dir", "agent-transcripts", "sess", "sess.jsonl"),
+			name:        "subagent file",
+			rel:         filepath.Join("proj-dir", "agent-transcripts", "sess", "subagents", "child.jsonl"),
 			wantProject: "proj-dir",
 			wantOK:      true,
 		},
 		{
-			name:        "nested txt",
-			rel:         filepath.Join("proj-dir", "agent-transcripts", "sess", "sess.txt"),
-			wantProject: "proj-dir",
-			wantOK:      true,
-		},
-		{
-			name:   "nested mismatched filename",
-			rel:    filepath.Join("proj-dir", "agent-transcripts", "sess", "other.jsonl"),
-			wantOK: false,
-		},
-		{
-			name:   "nested auxiliary file",
-			rel:    filepath.Join("proj-dir", "agent-transcripts", "sess", "notes.txt"),
-			wantOK: false,
-		},
-		{
-			name:   "subagent file ignored",
-			rel:    filepath.Join("proj-dir", "agent-transcripts", "sess", "subagents", "child.jsonl"),
-			wantOK: false,
-		},
-		{
-			name:   "wrong extension",
-			rel:    filepath.Join("proj-dir", "agent-transcripts", "sess.json"),
+			name:   "escapes root",
+			rel:    filepath.Join("..", "agent-transcripts", "sess.jsonl"),
 			wantOK: false,
 		},
 	}

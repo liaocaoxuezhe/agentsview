@@ -1,22 +1,352 @@
+import { EventSource, type EventSourceInit } from "eventsource";
 import { describe, it, expect, vi, beforeEach, afterEach } from "vite-plus/test";
 import {
   triggerSync,
   watchEvents,
   WATCH_EVENTS_MAX_CONSECUTIVE_ERRORS,
   watchSession,
+  syncClaudeAI,
+  connectClaudeAI,
   WATCH_SESSION_MAX_CONSECUTIVE_ERRORS,
 } from "./client.js";
 import type { SyncHandle } from "./client.js";
 import { ApiError } from "./runtime.js";
-import type { SyncProgress } from "./types.js";
+import type { SyncProgress } from "./generated/index.js";
+import * as telemetry from "../utils/telemetry.js";
+import type { BrowserHost } from "./browserHost.js";
+
+vi.mock("../utils/telemetry.js", () => ({ reportTelemetry: vi.fn() }));
+
+describe("syncClaudeAI browser relay", () => {
+  afterEach(() => vi.unstubAllGlobals());
+
+  it("uses the native host query and receives only counts without posting results", async () => {
+    const fetch = vi
+      .fn()
+      .mockResolvedValue(
+        new Response(
+          'event: progress\ndata: {"imported":1,"updated":0,"skipped":0,"errors":0}\n\nevent: done\ndata: {"imported":1,"updated":0,"skipped":0,"errors":0}\n\n',
+          { headers: { "Content-Type": "text/event-stream" } },
+        ),
+      );
+    vi.stubGlobal("fetch", fetch);
+    await expect(syncClaudeAI(undefined)).resolves.toMatchObject({ imported: 1 });
+    expect(fetch).toHaveBeenCalledExactlyOnceWith(
+      "/api/v1/import/claude-ai/sync?browser=chrome",
+      expect.objectContaining({ method: "POST" }),
+    );
+  });
+
+  it.each(["claude_ai_auth_required"])("preserves recovery code %s", async (code) => {
+    const host = { close: vi.fn().mockResolvedValue(undefined) } as unknown as BrowserHost;
+    vi.stubGlobal(
+      "fetch",
+      vi
+        .fn()
+        .mockResolvedValue(
+          new Response(
+            `event: error\ndata: ${JSON.stringify({ error: "English recovery instruction", code })}\n\n`,
+            { headers: { "Content-Type": "text/event-stream" } },
+          ),
+        ),
+    );
+    await expect(syncClaudeAI(host)).rejects.toMatchObject({
+      message: "English recovery instruction",
+      code,
+    });
+    expect(host.close).toHaveBeenCalledOnce();
+  });
+
+  it.each(["done", "error"])("preserves sync %s when closing the browser fails", async (event) => {
+    const host = {
+      close: vi.fn().mockRejectedValue(new Error("Close failed")),
+    } as unknown as BrowserHost;
+    const data =
+      event === "done"
+        ? { imported: 1, updated: 0, skipped: 0, errors: 0 }
+        : { error: "Sign in required", code: "claude_ai_auth_required" };
+    vi.stubGlobal(
+      "fetch",
+      vi.fn().mockResolvedValue(
+        new Response(`event: ${event}\ndata: ${JSON.stringify(data)}\n\n`, {
+          headers: { "Content-Type": "text/event-stream" },
+        }),
+      ),
+    );
+    if (event === "done") {
+      await expect(syncClaudeAI(host)).resolves.toEqual({
+        imported: 1,
+        updated: 0,
+        skipped: 0,
+        errors: 0,
+      });
+    } else {
+      await expect(syncClaudeAI(host)).rejects.toMatchObject({
+        message: "Sign in required",
+        code: "claude_ai_auth_required",
+      });
+    }
+    expect(host.close).toHaveBeenCalledOnce();
+  });
+
+  it("returns completed sync while browser cleanup is pending", async () => {
+    let close!: () => void;
+    const host = {
+      close: vi.fn(
+        () =>
+          new Promise<void>((resolve) => {
+            close = resolve;
+          }),
+      ),
+    } as unknown as BrowserHost;
+    vi.stubGlobal(
+      "fetch",
+      vi.fn().mockResolvedValue(
+        new Response('event: done\ndata: {"imported":1,"updated":0,"skipped":0,"errors":0}\n\n', {
+          headers: { "Content-Type": "text/event-stream" },
+        }),
+      ),
+    );
+    await expect(syncClaudeAI(host)).resolves.toEqual({
+      imported: 1,
+      updated: 0,
+      skipped: 0,
+      errors: 0,
+    });
+    expect(host.close).toHaveBeenCalledOnce();
+    close();
+  });
+
+  it("signs in only after the previous browser close finishes", async () => {
+    let close!: () => void;
+    const host = {
+      connect: vi.fn().mockResolvedValue(undefined),
+      close: vi.fn(
+        () =>
+          new Promise<void>((resolve) => {
+            close = resolve;
+          }),
+      ),
+    } as unknown as BrowserHost;
+    vi.stubGlobal(
+      "fetch",
+      vi.fn(
+        async () =>
+          new Response('event: done\ndata: {"imported":0,"updated":0,"skipped":0,"errors":0}\n\n', {
+            headers: { "Content-Type": "text/event-stream" },
+          }),
+      ),
+    );
+    await syncClaudeAI(host);
+    const connecting = connectClaudeAI(host);
+    await new Promise((resolve) => setTimeout(resolve, 0));
+    expect(host.connect).not.toHaveBeenCalled();
+    close();
+    await connecting;
+    expect(host.connect).toHaveBeenCalledOnce();
+  });
+
+  it("starts a new sync only after the previous browser close finishes", async () => {
+    let close!: () => void;
+    const host = {
+      close: vi.fn(
+        () =>
+          new Promise<void>((resolve) => {
+            close = resolve;
+          }),
+      ),
+    } as unknown as BrowserHost;
+    const fetch = vi.fn(
+      async () =>
+        new Response('event: done\ndata: {"imported":0,"updated":0,"skipped":0,"errors":0}\n\n', {
+          headers: { "Content-Type": "text/event-stream" },
+        }),
+    );
+    vi.stubGlobal("fetch", fetch);
+    await syncClaudeAI(host);
+    const next = syncClaudeAI(host);
+    await new Promise((resolve) => setTimeout(resolve, 0));
+    expect(fetch).toHaveBeenCalledOnce();
+    close();
+    await next;
+    expect(fetch).toHaveBeenCalledTimes(2);
+    close();
+  });
+
+  it("answers fetch events with browser status", async () => {
+    const status = 429;
+    let stream: ReadableStreamDefaultController<Uint8Array>;
+    const encoder = new TextEncoder();
+    const response = new Response(
+      new ReadableStream<Uint8Array>({
+        start(controller) {
+          stream = controller;
+        },
+      }),
+      { headers: { "Content-Type": "text/event-stream" } },
+    );
+    const host: BrowserHost = {
+      connect: vi.fn(),
+      close: vi.fn().mockResolvedValue(undefined),
+      fetch: vi.fn().mockResolvedValue({ status, body: "browser response", retryAfter: "12" }),
+    };
+    const fetch = vi.fn(async (url: string, options: RequestInit) => {
+      if (url === "/api/v1/import/claude-ai/sync") {
+        expect(options.body).toBeUndefined();
+        stream.enqueue(
+          encoder.encode(
+            'event: fetch\ndata: {"id":"request-1","path":"/api/organizations/org/chat_conversations_v2?limit=50&offset=0"}\n\n',
+          ),
+        );
+        return response;
+      }
+      expect(url).toBe("/api/v1/import/claude-ai/sync/results/request-1");
+      expect(JSON.parse(options.body as string)).toEqual({
+        status: 429,
+        body: "browser response",
+        retry_after: "12",
+      });
+      expect(new Headers(options.headers).get("Content-Type")).toBe("application/json");
+      stream.enqueue(
+        encoder.encode(
+          'event: progress\ndata: {"imported":1,"updated":0,"skipped":0,"errors":0}\n\nevent: done\ndata: {"imported":1,"updated":0,"skipped":0,"errors":0}\n\n',
+        ),
+      );
+      stream.close();
+      return new Response(null, { status: 204 });
+    });
+    vi.stubGlobal("fetch", fetch);
+    const progress = vi.fn();
+    expect(await syncClaudeAI(host, { onProgress: progress })).toEqual({
+      imported: 1,
+      updated: 0,
+      skipped: 0,
+      errors: 0,
+    });
+    expect(host.fetch).toHaveBeenCalledWith(
+      "/api/organizations/org/chat_conversations_v2?limit=50&offset=0",
+    );
+    expect(fetch).toHaveBeenCalledTimes(2);
+    expect(progress).toHaveBeenCalledWith({ imported: 1, updated: 0, skipped: 0, errors: 0 });
+    expect(host.close).toHaveBeenCalledOnce();
+  });
+
+  it.each(["returned", "thrown"])("relays %s browser errors to the user", async (kind) => {
+    let stream: ReadableStreamDefaultController<Uint8Array>;
+    const encoder = new TextEncoder();
+    const message = "TypeError: Failed to fetch";
+    const host = {
+      close: vi.fn().mockResolvedValue(undefined),
+      fetch:
+        kind === "returned"
+          ? vi.fn().mockResolvedValue({ status: 0, body: "", error: message })
+          : vi.fn().mockRejectedValue(new Error(message)),
+    } as unknown as BrowserHost;
+    const expected = kind === "returned" ? message : "Error: " + message;
+    vi.stubGlobal(
+      "fetch",
+      vi.fn(async (url: string, options: RequestInit) => {
+        if (url === "/api/v1/import/claude-ai/sync") {
+          return new Response(
+            new ReadableStream<Uint8Array>({
+              start(controller) {
+                stream = controller;
+                stream.enqueue(
+                  encoder.encode(
+                    'event: fetch\ndata: {"id":"failed","path":"/api/organizations/org/chat_conversations_v2"}\n\n',
+                  ),
+                );
+              },
+            }),
+            { headers: { "Content-Type": "text/event-stream" } },
+          );
+        }
+        expect(url).toBe("/api/v1/import/claude-ai/sync/results/failed");
+        expect(JSON.parse(options.body as string)).toEqual({
+          status: 0,
+          body: "",
+          error: expected,
+        });
+        stream.enqueue(
+          encoder.encode(`event: error\ndata: ${JSON.stringify({ error: expected })}\n\n`),
+        );
+        stream.close();
+        return new Response(null, { status: 204 });
+      }),
+    );
+    await expect(syncClaudeAI(host)).rejects.toThrow(expected);
+    expect(host.fetch).toHaveBeenCalledWith("/api/organizations/org/chat_conversations_v2");
+    expect(host.close).toHaveBeenCalledOnce();
+  });
+
+  it("ends the stream when posting a result fails", async () => {
+    let signal!: AbortSignal;
+    const host = {
+      close: vi.fn().mockResolvedValue(undefined),
+      fetch: vi.fn().mockResolvedValue({ status: 200, body: "{}" }),
+    } as unknown as BrowserHost;
+    vi.stubGlobal(
+      "fetch",
+      vi
+        .fn()
+        .mockImplementationOnce(async (_url, options) => {
+          signal = options.signal;
+          return new Response(
+            new ReadableStream({
+              start(controller) {
+                signal.addEventListener(
+                  "abort",
+                  () => controller.error(new DOMException("Aborted", "AbortError")),
+                  { once: true },
+                );
+                controller.enqueue(
+                  new TextEncoder().encode(
+                    'event: fetch\ndata: {"id":"expired","path":"/api/organizations/org/chat_conversations_v2"}\n\n',
+                  ),
+                );
+              },
+            }),
+            { headers: { "Content-Type": "text/event-stream" } },
+          );
+        })
+        .mockResolvedValueOnce(new Response("expired", { status: 404 })),
+    );
+    await expect(syncClaudeAI(host)).rejects.toThrow("expired");
+    expect(signal.aborted).toBe(true);
+    expect(host.close).toHaveBeenCalledOnce();
+  });
+
+  it("closes the browser when Sync is cancelled", async () => {
+    const controller = new AbortController();
+    const host = { close: vi.fn().mockResolvedValue(undefined) } as unknown as BrowserHost;
+    vi.stubGlobal(
+      "fetch",
+      vi.fn(async (_url, options: RequestInit) => {
+        return new Response(
+          new ReadableStream({
+            start(stream) {
+              options.signal!.addEventListener(
+                "abort",
+                () => stream.error(new DOMException("Aborted", "AbortError")),
+                { once: true },
+              );
+              controller.abort();
+            },
+          }),
+          { headers: { "Content-Type": "text/event-stream" } },
+        );
+      }),
+    );
+    await expect(syncClaudeAI(host, undefined, controller.signal)).rejects.toThrow("Aborted");
+    expect(host.close).toHaveBeenCalledOnce();
+  });
+});
 
 /**
  * Create a ReadableStream that yields the given chunks as
  * Uint8Array values, then closes.
  */
-function makeSSEStream(
-  chunks: string[],
-): ReadableStream<Uint8Array> {
+function makeSSEStream(chunks: string[]): ReadableStream<Uint8Array> {
   const encoder = new TextEncoder();
   let i = 0;
   return new ReadableStream({
@@ -31,14 +361,15 @@ function makeSSEStream(
   });
 }
 
-function mockFetchWithStream(
-  chunks: string[],
-): void {
+function mockFetchWithStream(chunks: string[]): void {
   const stream = makeSSEStream(chunks);
-  vi.stubGlobal("fetch", vi.fn().mockResolvedValue({
-    ok: true,
-    body: stream,
-  }));
+  vi.stubGlobal(
+    "fetch",
+    vi.fn().mockResolvedValue({
+      ok: true,
+      body: stream,
+    }),
+  );
 }
 
 describe("triggerSync SSE parsing", () => {
@@ -54,9 +385,7 @@ describe("triggerSync SSE parsing", () => {
     activeHandles = [];
   });
 
-  function startSync(
-    chunks: string[],
-  ): { handle: SyncHandle; progress: SyncProgress[] } {
+  function startSync(chunks: string[]): { handle: SyncHandle; progress: SyncProgress[] } {
     mockFetchWithStream(chunks);
     const progress: SyncProgress[] = [];
     const handle = triggerSync((p) => progress.push(p));
@@ -66,8 +395,8 @@ describe("triggerSync SSE parsing", () => {
 
   it("should parse CRLF-terminated SSE frames", async () => {
     const { handle, progress } = startSync([
-      "event: progress\r\ndata: {\"phase\":\"scanning\",\"projects_total\":1,\"projects_done\":0,\"sessions_total\":0,\"sessions_done\":0,\"messages_indexed\":0}\r\n\r\n",
-      "event: done\r\ndata: {\"total_sessions\":5,\"synced\":3,\"skipped\":2,\"failed\":0}\r\n\r\n",
+      'event: progress\r\ndata: {"phase":"scanning","projects_total":1,"projects_done":0,"sessions_total":0,"sessions_done":0,"messages_indexed":0}\r\n\r\n',
+      'event: done\r\ndata: {"total_sessions":5,"synced":3,"skipped":2,"failed":0}\r\n\r\n',
     ]);
 
     const stats = await handle.done;
@@ -132,17 +461,11 @@ describe("triggerSync SSE parsing", () => {
       'event: error\ndata: {"error":"sync worker pass reported failed"}\n\n',
     ]);
 
-    await expect(handle.done).rejects.toThrow(
-      "sync worker pass reported failed",
-    );
+    await expect(handle.done).rejects.toThrow("sync worker pass reported failed");
   });
 
   it("should reject for non-ok responses", async () => {
-    vi.stubGlobal("fetch", vi.fn().mockResolvedValue({
-      ok: false,
-      status: 500,
-      body: null,
-    }));
+    vi.stubGlobal("fetch", vi.fn().mockResolvedValue(new Response(null, { status: 500 })));
 
     const handle = triggerSync();
     activeHandles.push(handle);
@@ -221,9 +544,7 @@ describe("generateInsight SSE parsing", () => {
   });
 
   it("throws on error event", async () => {
-    mockStream([
-      `event: error\ndata: {"message":"CLI not found"}\n\n`,
-    ]);
+    mockStream([`event: error\ndata: {"message":"CLI not found"}\n\n`]);
 
     const { generateInsight } = await import("./client.js");
     const handle = generateInsight({
@@ -233,15 +554,11 @@ describe("generateInsight SSE parsing", () => {
     });
     activeHandles.push(handle);
 
-    await expect(handle.done).rejects.toThrow(
-      "CLI not found",
-    );
+    await expect(handle.done).rejects.toThrow("CLI not found");
   });
 
   it("throws when stream ends without done", async () => {
-    mockStream([
-      `event: status\ndata: {"phase":"generating"}\n\n`,
-    ]);
+    mockStream([`event: status\ndata: {"phase":"generating"}\n\n`]);
 
     const { generateInsight } = await import("./client.js");
     const handle = generateInsight({
@@ -251,9 +568,7 @@ describe("generateInsight SSE parsing", () => {
     });
     activeHandles.push(handle);
 
-    await expect(handle.done).rejects.toThrow(
-      "without done event",
-    );
+    await expect(handle.done).rejects.toThrow("without done event");
   });
 
   it("dispatches log events", async () => {
@@ -285,7 +600,7 @@ describe("generateInsight SSE parsing", () => {
 
     await handle.done;
     expect(logs).toEqual([
-      { stream: "stdout", line: "{\"type\":\"system\"}" },
+      { stream: "stdout", line: '{"type":"system"}' },
       { stream: "stderr", line: "rate limited" },
     ]);
   });
@@ -322,15 +637,7 @@ describe("generateInsight SSE parsing", () => {
   });
 
   it("rejects for non-ok response", async () => {
-    vi.stubGlobal(
-      "fetch",
-      vi.fn().mockResolvedValue({
-        ok: false,
-        status: 500,
-        body: null,
-        text: () => Promise.resolve(""),
-      }),
-    );
+    vi.stubGlobal("fetch", vi.fn().mockResolvedValue(new Response(null, { status: 500 })));
 
     const { generateInsight } = await import("./client.js");
     const handle = generateInsight({
@@ -352,8 +659,7 @@ describe("generateInsight SSE parsing", () => {
         text: () =>
           Promise.resolve(
             JSON.stringify({
-              error:
-                "insight generation is not available in read-only mode",
+              error: "insight generation is not available in read-only mode",
             }),
           ),
       }),
@@ -380,6 +686,8 @@ describe("generateInsight SSE parsing", () => {
   });
 });
 
+vi.mock("eventsource", () => ({ EventSource: vi.fn() }));
+
 describe("watchEvents", () => {
   class FakeEventSource {
     static instances: FakeEventSource[] = [];
@@ -389,8 +697,11 @@ describe("watchEvents", () => {
     public onerror: ((ev: Event) => void) | null = null;
     public closed = false;
 
-    constructor(url: string) {
-      this.url = url;
+    constructor(
+      url: URL,
+      public options: EventSourceInit,
+    ) {
+      this.url = url.toString();
       FakeEventSource.instances.push(this);
     }
 
@@ -425,7 +736,9 @@ describe("watchEvents", () => {
 
   beforeEach(() => {
     FakeEventSource.reset();
-    vi.stubGlobal("EventSource", FakeEventSource);
+    vi.mocked(EventSource).mockImplementation(function (url, options) {
+      return new FakeEventSource(new URL(url), options!) as unknown as EventSource;
+    });
     localStorage.clear();
   });
 
@@ -437,34 +750,45 @@ describe("watchEvents", () => {
   it("opens /api/v1/events locally without a token", () => {
     watchEvents(() => {});
     expect(FakeEventSource.instances).toHaveLength(1);
-    expect(FakeEventSource.instances[0]!.url).toBe("/api/v1/events");
+    expect(FakeEventSource.instances[0]!.url).toBe(`${window.location.origin}/api/v1/events`);
   });
 
-  it("appends ?token= when an auth token is set", () => {
+  it("sends authentication through the generated request", async () => {
     localStorage.setItem("agentsview-auth-token", "secret");
     watchEvents(() => {});
-    expect(FakeEventSource.instances[0]!.url).toBe(
-      "/api/v1/events?token=secret",
+    const source = FakeEventSource.instances[0]!;
+    expect(source.url).toBe(`${window.location.origin}/api/v1/events`);
+    const fetchMock = vi
+      .fn()
+      .mockResolvedValue(new Response(null, { headers: { "Content-Type": "text/event-stream" } }));
+    vi.stubGlobal("fetch", fetchMock);
+    await source.options.fetch!(source.url, {
+      signal: new AbortController().signal,
+      headers: { Accept: "text/event-stream" },
+      mode: "cors",
+      cache: "no-store",
+      redirect: "follow",
+    });
+    expect(fetchMock).toHaveBeenCalledWith(
+      "/api/v1/events",
+      expect.objectContaining({ method: "GET" }),
+    );
+    expect(new Headers(fetchMock.mock.calls[0]![1].headers).get("Authorization")).toBe(
+      "Bearer secret",
     );
   });
 
   it("invokes onEvent with parsed scope for valid data_changed frames", () => {
     const received: string[] = [];
     watchEvents((e) => received.push(e.scope));
-    FakeEventSource.instances[0]!.fireRaw(
-      "data_changed",
-      JSON.stringify({ scope: "messages" }),
-    );
+    FakeEventSource.instances[0]!.fireRaw("data_changed", JSON.stringify({ scope: "messages" }));
     expect(received).toEqual(["messages"]);
   });
 
   it("falls back to { scope: 'sync' } for malformed payloads", () => {
     const received: string[] = [];
     watchEvents((e) => received.push(e.scope));
-    FakeEventSource.instances[0]!.fireRaw(
-      "data_changed",
-      "not valid json",
-    );
+    FakeEventSource.instances[0]!.fireRaw("data_changed", "not valid json");
     expect(received).toEqual(["sync"]);
   });
 
@@ -488,18 +812,14 @@ describe("watchEvents", () => {
     localStorage.setItem("agentsview-server-url", server);
     localStorage.setItem(`agentsview-auth-token::${server}`, "remote-token");
     watchEvents(() => {});
-    expect(FakeEventSource.instances[0]!.url).toBe(
-      `${server}/api/v1/events?token=remote-token`,
-    );
+    expect(FakeEventSource.instances[0]!.url).toBe(`${server}/api/v1/events`);
   });
 
-  it("URL-encodes reserved characters in the token query parameter", () => {
+  it("keeps token characters out of the stream URL", () => {
     const rawToken = "a b&c?d=e/f+g";
     localStorage.setItem("agentsview-auth-token", rawToken);
     watchEvents(() => {});
-    expect(FakeEventSource.instances[0]!.url).toBe(
-      `/api/v1/events?token=${encodeURIComponent(rawToken)}`,
-    );
+    expect(FakeEventSource.instances[0]!.url).toBe(`${window.location.origin}/api/v1/events`);
   });
 
   it("closes the EventSource after N consecutive errors without a successful event", () => {
@@ -556,8 +876,11 @@ describe("watchSession", () => {
     public onerror: ((ev: Event) => void) | null = null;
     public closed = false;
 
-    constructor(url: string) {
-      this.url = url;
+    constructor(
+      url: URL,
+      public options: EventSourceInit,
+    ) {
+      this.url = url.toString();
       FakeEventSource.instances.push(this);
     }
 
@@ -574,9 +897,7 @@ describe("watchSession", () => {
     }
 
     fireOpen() {
-      (this.listeners["open"] || []).forEach((cb) =>
-        cb(new Event("open") as MessageEvent),
-      );
+      (this.listeners["open"] || []).forEach((cb) => cb(new Event("open") as MessageEvent));
     }
 
     fireUpdate() {
@@ -592,7 +913,9 @@ describe("watchSession", () => {
 
   beforeEach(() => {
     FakeEventSource.reset();
-    vi.stubGlobal("EventSource", FakeEventSource);
+    vi.mocked(EventSource).mockImplementation(function (url, options) {
+      return new FakeEventSource(new URL(url), options!) as unknown as EventSource;
+    });
     localStorage.clear();
   });
 
@@ -640,7 +963,57 @@ describe("watchSession", () => {
     watchSession("deepseek-harness:child%7E/%25?#", () => {});
 
     expect(FakeEventSource.instances[0]?.url).toBe(
-      "/api/v1/sessions/deepseek-harness%3Achild%257E%2F%2525%3F%23/watch",
+      `${window.location.origin}/api/v1/sessions/deepseek-harness%3Achild%257E%2F%2525%3F%23/watch`,
     );
+  });
+});
+
+describe("core action telemetry", () => {
+  beforeEach(() => {
+    vi.mocked(telemetry.reportTelemetry).mockClear();
+  });
+
+  afterEach(() => {
+    vi.unstubAllGlobals();
+    vi.restoreAllMocks();
+  });
+
+  it.each([
+    ["downloadExport", "html"],
+    ["downloadInsightExport", "insight_html"],
+  ] as const)("%s reports export_run %s", async (fn, format) => {
+    vi.spyOn(window, "open").mockReturnValue(null);
+    const client = await import("./client.js");
+
+    await (fn === "downloadExport"
+      ? client.downloadExport("session-1")
+      : client.downloadInsightExport(7));
+
+    expect(telemetry.reportTelemetry).toHaveBeenCalledExactlyOnceWith("export_run", { format });
+  });
+
+  it("generateInsight reports insight_generated only after the insight is done", async () => {
+    const req = {
+      type: "llm_canned",
+      kind: "prompt_maturity_review",
+      date_from: "2025-01-15",
+      date_to: "2025-01-15",
+    } as const;
+    mockFetchWithStream(['event: error\ndata: {"message":"boom"}\n\n']);
+    const { generateInsight } = await import("./client.js");
+    await expect(generateInsight(req).done).rejects.toThrow("boom");
+    expect(telemetry.reportTelemetry).not.toHaveBeenCalled();
+
+    mockFetchWithStream([`event: done\ndata: ${JSON.stringify({ id: 1 })}\n\n`]);
+    await generateInsight(req).done;
+    expect(telemetry.reportTelemetry).toHaveBeenCalledExactlyOnceWith("insight_generated", {
+      kind: "prompt_maturity_review",
+    });
+
+    mockFetchWithStream([
+      `event: done\ndata: ${JSON.stringify({ id: 1, cache_status: "hit" })}\n\n`,
+    ]);
+    await generateInsight(req).done;
+    expect(telemetry.reportTelemetry).toHaveBeenCalledTimes(1);
   });
 });

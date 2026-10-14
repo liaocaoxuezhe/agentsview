@@ -2,6 +2,7 @@ package parser
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"os"
 	"path/filepath"
@@ -29,11 +30,9 @@ func (f positronProviderFactory) Capabilities() Capabilities {
 func (f positronProviderFactory) NewProvider(cfg ProviderConfig) Provider {
 	cfg = cfg.Clone()
 	return &positronProvider{
-		ProviderBase: ProviderBase{
-			Def:    cloneAgentDef(f.def),
-			Caps:   positronProviderCapabilities(),
-			Config: cfg,
-		},
+		Def:     cloneAgentDef(f.def),
+		Caps:    positronProviderCapabilities(),
+		Config:  cfg,
 		sources: newPositronSourceSet(cfg.Roots),
 	}
 }
@@ -86,7 +85,7 @@ func (p *positronProvider) Parse(
 	}
 	path, project, ok := p.sources.pathFromSource(req.Source)
 	if !ok {
-		return ParseOutcome{}, fmt.Errorf("positron source path unavailable")
+		return ParseOutcome{}, errors.New("positron source path unavailable")
 	}
 	if req.Source.ProjectHint != "" {
 		project = req.Source.ProjectHint
@@ -384,7 +383,7 @@ func (s positronSourceSet) Fingerprint(
 	}
 	path, _, ok := s.pathFromSource(source)
 	if !ok {
-		return SourceFingerprint{}, fmt.Errorf("positron source path unavailable")
+		return SourceFingerprint{}, errors.New("positron source path unavailable")
 	}
 	info, err := os.Stat(path)
 	if err != nil {
@@ -597,6 +596,9 @@ func positronWorkspaceProject(root, hash string) string {
 
 func positronProviderCapabilities() Capabilities {
 	return Capabilities{
+		Sync: ProviderSyncSemantics{
+			FingerprintHashRequiredForFreshness: true,
+		},
 		Source: SourceCapabilities{
 			DiscoverSources:      CapabilitySupported,
 			StreamingDiscovery:   CapabilitySupported,
@@ -612,6 +614,7 @@ func positronProviderCapabilities() Capabilities {
 		},
 		Content: ContentCapabilities{
 			FirstMessage:         CapabilitySupported,
+			SessionName:          CapabilitySupported,
 			ToolCalls:            CapabilitySupported,
 			ToolResults:          CapabilitySupported,
 			Thinking:             CapabilitySupported,

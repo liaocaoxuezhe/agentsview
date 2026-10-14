@@ -3,6 +3,7 @@ package parser
 import (
 	"context"
 	"crypto/sha256"
+	"encoding/hex"
 	"fmt"
 	"os"
 	"path/filepath"
@@ -70,10 +71,17 @@ func grokWatchRoots(roots []string) []WatchRoot {
 	out := make([]WatchRoot, 0, len(roots))
 	for _, root := range roots {
 		out = append(out, WatchRoot{
-			Path:         root,
-			Recursive:    true,
-			IncludeGlobs: []string{"summary.json", "signals.json", "chat_history.jsonl", "updates.jsonl"},
-			DebounceKey:  string(AgentGrok) + ":sessions:" + root,
+			Path:      root,
+			Recursive: true,
+			IncludeGlobs: []string{
+				"summary.json",
+				"signals.json",
+				"chat_history.jsonl",
+				"updates.jsonl",
+				"prompt_context.json",
+				"meta.json",
+			},
+			DebounceKey: string(AgentGrok) + ":sessions:" + root,
 		})
 	}
 	return out
@@ -89,6 +97,9 @@ func grokClassifyPath(
 		return singleFileMatch{}, false
 	}
 	parts := strings.Split(rel, string(filepath.Separator))
+	if match, ok := grokClassifySubagentMeta(root, path, parts, allowMissing); ok {
+		return match, true
+	}
 	if len(parts) != 3 || !IsValidSessionID(parts[1]) ||
 		!grokTrackedFileName(parts[2]) {
 		return singleFileMatch{}, false
@@ -147,11 +158,41 @@ func grokStrictMatch(root, path string) (singleFileMatch, bool) {
 
 func grokTrackedFileName(name string) bool {
 	switch name {
-	case "summary.json", "signals.json", "chat_history.jsonl", "updates.jsonl":
+	case "summary.json", "signals.json", "chat_history.jsonl", "updates.jsonl",
+		"prompt_context.json":
 		return true
 	default:
 		return false
 	}
+}
+
+func grokClassifySubagentMeta(
+	root, path string, parts []string, allowMissing bool,
+) (singleFileMatch, bool) {
+	if len(parts) != 5 || parts[2] != "subagents" || parts[4] != "meta.json" {
+		return singleFileMatch{}, false
+	}
+	if !IsValidSessionID(parts[1]) || !IsValidSessionID(parts[3]) {
+		return singleFileMatch{}, false
+	}
+	childID := parts[3]
+	if _, child, ok := readGrokSubagentMeta(path); ok && child != "" {
+		childID = child
+	}
+	summaryPath := filepath.Join(root, parts[0], childID, "summary.json")
+	if match, ok := grokStrictMatch(root, summaryPath); ok {
+		return match, true
+	}
+	if match, ok := grokFindFile(root, childID); ok {
+		return match, true
+	}
+	if allowMissing {
+		return singleFileMatch{
+			Path:        summaryPath,
+			ProjectHint: parts[0],
+		}, true
+	}
+	return singleFileMatch{}, false
 }
 
 func grokFingerprintSource(src singleFileSource) (SourceFingerprint, error) {
@@ -197,19 +238,37 @@ func grokFingerprintSource(src singleFileSource) (SourceFingerprint, error) {
 			return SourceFingerprint{}, err
 		}
 	}
+	if metaPath := grokParentSubagentMetaPath(src.Path); metaPath != "" {
+		metaInfo, err := siblingMetadataFileInfo(metaPath)
+		if err != nil {
+			return SourceFingerprint{}, err
+		}
+		if metaInfo != nil {
+			size += metaInfo.Size()
+			if ts := metaInfo.ModTime().UnixNano(); ts > mtime {
+				mtime = ts
+			}
+			if err := addSiblingMetadataFingerprintPart(
+				h, "subagent_parent_meta", metaPath, metaInfo,
+			); err != nil {
+				return SourceFingerprint{}, err
+			}
+		}
+	}
 	return SourceFingerprint{
 		Size:    size,
 		MTimeNS: mtime,
-		Hash:    fmt.Sprintf("%x", h.Sum(nil)),
+		Hash:    hex.EncodeToString(h.Sum(nil)),
 	}, nil
 }
 
 func grokCompanionFiles(summaryPath string) map[string]string {
 	dir := filepath.Dir(summaryPath)
 	return map[string]string{
-		"signals":      filepath.Join(dir, "signals.json"),
-		"chat_history": filepath.Join(dir, "chat_history.jsonl"),
-		"updates":      filepath.Join(dir, "updates.jsonl"),
+		"signals":        filepath.Join(dir, "signals.json"),
+		"chat_history":   filepath.Join(dir, "chat_history.jsonl"),
+		"updates":        filepath.Join(dir, "updates.jsonl"),
+		"prompt_context": filepath.Join(dir, "prompt_context.json"),
 	}
 }
 
@@ -235,9 +294,14 @@ func grokParseFile(
 func grokProviderCapabilities() Capabilities {
 	return Capabilities{
 		Source: jsonlFileProviderSourceCapabilities(),
+		Sync: ProviderSyncSemantics{
+			FingerprintHashInCacheKey:           true,
+			FingerprintHashRequiredForFreshness: true,
+		},
 		Content: ContentCapabilities{
 			FirstMessage:         CapabilitySupported,
 			SessionName:          CapabilitySupported,
+			ToolResultEvents:     CapabilitySupported,
 			TerminationStatus:    CapabilityNotApplicable,
 			MalformedLineCount:   CapabilityNotApplicable,
 			AggregateUsageEvents: CapabilitySupported,

@@ -2,7 +2,6 @@ package service_test
 
 import (
 	"context"
-	"errors"
 	"fmt"
 	"net/http"
 	"net/http/httptest"
@@ -13,8 +12,74 @@ import (
 
 	"go.kenn.io/agentsview/internal/db"
 	"go.kenn.io/agentsview/internal/dbtest"
+	"go.kenn.io/agentsview/internal/export"
 	"go.kenn.io/agentsview/internal/service"
+	"go.kenn.io/agentsview/internal/servicehttp"
 )
+
+type usageCatalogStore struct {
+	db.Store
+	labelReads, catalogReads int
+}
+
+func (s *usageCatalogStore) GetActiveProjectLabels(ctx context.Context) ([]string, error) {
+	s.labelReads++
+	return s.Store.GetActiveProjectLabels(ctx)
+}
+
+func (s *usageCatalogStore) BuildProjectIdentityMap(ctx context.Context, labels []string) (map[string]export.ProjectMapEntry, error) {
+	s.catalogReads++
+	return s.Store.BuildProjectIdentityMap(ctx, labels)
+}
+
+func TestResolveUsageProjectKeysSharesCatalog(t *testing.T) {
+	d := dbtest.OpenTestDB(t)
+	dbtest.SeedSession(t, d, "included", "project-a")
+	dbtest.SeedSession(t, d, "excluded", "project-b")
+	catalog, err := d.BuildProjectIdentityMap(t.Context(), []string{"project-a", "project-b"})
+	require.NoError(t, err)
+	store := &usageCatalogStore{Store: d}
+	resolved, err := service.ResolveUsageProjectKeys(t.Context(), store, service.UsageRequest{
+		ProjectKey: catalog["project-a"].ProjectKey, ExcludeProjectKey: catalog["project-b"].ProjectKey,
+	})
+	require.NoError(t, err)
+	assert.Equal(t, []string{"project-a"}, resolved.ProjectLabels)
+	assert.Equal(t, []string{"project-b"}, resolved.ExcludeProjectLabels)
+	assert.Equal(t, 1, store.labelReads)
+	assert.Equal(t, 1, store.catalogReads)
+	resolved, err = service.ResolveUsageProjectKeys(t.Context(), store, service.UsageRequest{
+		Project: "unrelated-page-filter", ProjectKey: catalog["project-a"].ProjectKey,
+	})
+	require.NoError(t, err)
+	assert.Empty(t, resolved.Project)
+	assert.Equal(t, []string{"project-a"}, resolved.ProjectLabels)
+	assert.Equal(t, []string{"project-a"}, resolved.ExcludeProjectLabels)
+	resolved, err = service.ResolveUsageProjectKeys(t.Context(), store, service.UsageRequest{
+		Project: "project-b,project-a", ProjectKey: catalog["project-a"].ProjectKey,
+	})
+	require.NoError(t, err)
+	assert.Empty(t, resolved.Project)
+	assert.Equal(t, []string{"project-a"}, resolved.ProjectLabels)
+	assert.Empty(t, resolved.ExcludeProjectLabels)
+	for _, keys := range []string{"", " ", ",", " ,  ", "unknown-key"} {
+		for _, exclude := range []bool{false, true} {
+			req := service.UsageRequest{ProjectKey: keys}
+			if exclude {
+				req = service.UsageRequest{ExcludeProjectKey: keys}
+			}
+			resolved, err := service.ResolveUsageProjectKeys(t.Context(), store, req)
+			if keys == "unknown-key" || (!exclude && keys != "") {
+				var inputErr *service.UsageInputError
+				require.ErrorAs(t, err, &inputErr)
+				assert.Equal(t, service.UsageErrorCodeUnknownProjectKey, inputErr.Code)
+				continue
+			}
+			require.NoError(t, err)
+			assert.Empty(t, resolved.ProjectLabels)
+			assert.Empty(t, resolved.ExcludeProjectLabels)
+		}
+	}
+}
 
 func seedPairwiseUsageFixture(t *testing.T, d *db.DB) {
 	t.Helper()
@@ -195,7 +260,7 @@ func TestBuildUsageFilter_Validation(t *testing.T) {
 			_, err := service.BuildUsageFilter(tc.req)
 			require.Error(t, err)
 			var ue *service.UsageInputError
-			assert.True(t, errors.As(err, &ue),
+			assert.ErrorAs(t, err, &ue,
 				"want UsageInputError, got %T", err)
 		})
 	}
@@ -206,26 +271,24 @@ func TestDirectBackend_UsageSummary_InvalidInput(t *testing.T) {
 	d := dbtest.OpenTestDB(t)
 	be := service.NewDirectBackend(d, nil)
 
-	_, err := be.UsageSummary(context.Background(), service.UsageRequest{
+	_, err := be.UsageSummary(t.Context(), service.UsageRequest{
 		Timezone: "Fake/Zone",
 	})
 	require.Error(t, err)
 	var ue *service.UsageInputError
-	assert.True(t, errors.As(err, &ue), "want UsageInputError, got %T", err)
+	assert.ErrorAs(t, err, &ue, "want UsageInputError, got %T", err)
 }
 
-func TestDirectBackend_UsageSummary_UnknownProjectKeyHasStableCode(t *testing.T) {
+func TestDirectBackend_UsageSummary_ResolvesProjectKeys(t *testing.T) {
 	t.Parallel()
 	d := dbtest.OpenTestDB(t)
 	be := service.NewDirectBackend(d, nil)
 
-	_, err := be.UsageSummary(context.Background(), service.UsageRequest{
+	_, err := be.UsageSummary(t.Context(), service.UsageRequest{
 		ExcludeProjectKey: "pl1:sha256:stale",
 	})
-	require.Error(t, err)
 	var inputErr *service.UsageInputError
 	require.ErrorAs(t, err, &inputErr)
-	assert.Equal(t, service.UsageErrorCodeUnknownProjectKey, inputErr.Code)
 }
 
 func TestDirectBackend_UsageSummary_EmptyRange(t *testing.T) {
@@ -233,7 +296,7 @@ func TestDirectBackend_UsageSummary_EmptyRange(t *testing.T) {
 	d := dbtest.OpenTestDB(t)
 	be := service.NewDirectBackend(d, nil)
 
-	res, err := be.UsageSummary(context.Background(), service.UsageRequest{
+	res, err := be.UsageSummary(t.Context(), service.UsageRequest{
 		From: "2024-06-01", To: "2024-06-03",
 	})
 	require.NoError(t, err)
@@ -248,7 +311,7 @@ func TestHTTPBackend_UsageSummary_Roundtrip(t *testing.T) {
 	env := newHTTPBackendEnv(t)
 	svc := env.Backend("", false)
 
-	res, err := svc.UsageSummary(context.Background(), service.UsageRequest{
+	res, err := svc.UsageSummary(t.Context(), service.UsageRequest{
 		From: "2024-06-01", To: "2024-06-03",
 	})
 	require.NoError(t, err)
@@ -272,22 +335,25 @@ func TestHTTPBackend_UsageSummary_SendsExplicitIncludeOneShot(t *testing.T) {
 	for _, tc := range cases {
 		t.Run(tc.name, func(t *testing.T) {
 			t.Parallel()
-			var got string
+			var got, projectKey string
 			srv := httptest.NewServer(http.HandlerFunc(
 				func(w http.ResponseWriter, r *http.Request) {
+					assert.Equal(t, "/api/v1/usage/summary", r.URL.Path)
 					got = r.URL.Query().Get("include_one_shot")
+					projectKey = r.URL.Query().Get("project_key")
 					w.Header().Set("Content-Type", "application/json")
 					_, _ = w.Write([]byte(`{"from":"x","to":"y"}`))
 				}))
 			t.Cleanup(srv.Close)
-			svc := service.NewHTTPBackend(srv.URL, "", false)
+			svc := servicehttp.NewHTTPBackend(srv.URL, "", false, "")
 
-			_, err := svc.UsageSummary(context.Background(), service.UsageRequest{
+			_, err := svc.UsageSummary(t.Context(), service.UsageRequest{
 				From: "2024-06-01", To: "2024-06-02",
-				IncludeOneShot: tc.includeOneShot,
+				IncludeOneShot: tc.includeOneShot, ProjectKey: "pl1:sha256:alpha",
 			})
 			require.NoError(t, err)
 			assert.Equal(t, tc.want, got)
+			assert.Equal(t, "pl1:sha256:alpha", projectKey)
 		})
 	}
 }
@@ -301,13 +367,13 @@ func TestHTTPBackend_UsageSummary_ReadOnly(t *testing.T) {
 			w.WriteHeader(http.StatusNotImplemented)
 		}))
 	t.Cleanup(srv.Close)
-	svc := service.NewHTTPBackend(srv.URL, "", true)
+	svc := servicehttp.NewHTTPBackend(srv.URL, "", true, "")
 
-	_, err := svc.UsageSummary(context.Background(), service.UsageRequest{
+	_, err := svc.UsageSummary(t.Context(), service.UsageRequest{
 		From: "2024-06-01", To: "2024-06-02",
 	})
 	require.Error(t, err)
-	assert.True(t, errors.Is(err, db.ErrReadOnly),
+	assert.ErrorIs(t, err, db.ErrReadOnly,
 		"501 should map to db.ErrReadOnly, got %v", err)
 }
 
@@ -316,7 +382,7 @@ func TestBuildUsagePairwiseFilters_Validation(t *testing.T) {
 
 	_, _, _, _, err := service.BuildUsagePairwiseFilters(
 		service.UsagePairwiseComparisonRequest{
-			UsageRequest:   service.UsageRequest{From: "2024-06-01", To: "2024-06-02"},
+			From: "2024-06-01", To: "2024-06-02",
 			LeftDimension:  "model",
 			LeftValue:      "claude-sonnet-4-20250514",
 			RightDimension: "machine",
@@ -325,7 +391,7 @@ func TestBuildUsagePairwiseFilters_Validation(t *testing.T) {
 	)
 	require.Error(t, err)
 	var ue *service.UsageInputError
-	assert.True(t, errors.As(err, &ue))
+	require.ErrorAs(t, err, &ue)
 	assert.Equal(t, "right_dimension must be model or project", ue.Msg)
 }
 
@@ -334,13 +400,11 @@ func TestBuildUsagePairwiseFilters_PreservesNonComparedBaseFilters(t *testing.T)
 
 	left, leftEmpty, right, rightEmpty, err := service.BuildUsagePairwiseFilters(
 		service.UsagePairwiseComparisonRequest{
-			UsageRequest: service.UsageRequest{
-				From:     "2024-06-01",
-				To:       "2024-06-03",
-				Timezone: "UTC",
-				Model:    "model-a,model-b",
-				Project:  "alpha,beta",
-			},
+			From:           "2024-06-01",
+			To:             "2024-06-03",
+			Timezone:       "UTC",
+			Model:          "model-a,model-b",
+			Project:        "alpha,beta",
 			LeftDimension:  "model",
 			LeftValue:      "model-b",
 			RightDimension: "project",
@@ -361,11 +425,9 @@ func TestBuildUsagePairwiseFilters_ConflictingBaseFilterMarksEmptySide(t *testin
 
 	left, leftEmpty, right, rightEmpty, err := service.BuildUsagePairwiseFilters(
 		service.UsagePairwiseComparisonRequest{
-			UsageRequest: service.UsageRequest{
-				From:  "2024-06-01",
-				To:    "2024-06-03",
-				Model: "gpt-4o",
-			},
+			From:           "2024-06-01",
+			To:             "2024-06-03",
+			Model:          "gpt-4o",
 			LeftDimension:  "model",
 			LeftValue:      "claude-sonnet-4-20250514",
 			RightDimension: "model",
@@ -387,14 +449,12 @@ func TestDirectBackend_UsagePairwiseComparison_ModelVsModel(t *testing.T) {
 	be := service.NewDirectBackend(d, nil)
 
 	res, err := be.UsagePairwiseComparison(
-		context.Background(),
+		t.Context(),
 		service.UsagePairwiseComparisonRequest{
-			UsageRequest: service.UsageRequest{
-				From:           "2024-06-01",
-				To:             "2024-06-01",
-				Timezone:       "UTC",
-				IncludeOneShot: true,
-			},
+			From:           "2024-06-01",
+			To:             "2024-06-01",
+			Timezone:       "UTC",
+			IncludeOneShot: true,
 			LeftDimension:  "model",
 			LeftValue:      "claude-sonnet-4-20250514",
 			RightDimension: "model",
@@ -418,7 +478,7 @@ func TestDirectBackend_UsagePairwiseComparison_ProjectVsModel(t *testing.T) {
 	d := dbtest.OpenTestDB(t)
 	seedPairwiseUsageFixture(t, d)
 	be := service.NewDirectBackend(d, nil)
-	summary, err := be.UsageSummary(context.Background(), service.UsageRequest{
+	summary, err := be.UsageSummary(t.Context(), service.UsageRequest{
 		From: "2024-06-01", To: "2024-06-01", Timezone: "UTC",
 		IncludeOneShot: true,
 	})
@@ -432,14 +492,12 @@ func TestDirectBackend_UsagePairwiseComparison_ProjectVsModel(t *testing.T) {
 	require.NotEmpty(t, betaKey)
 
 	res, err := be.UsagePairwiseComparison(
-		context.Background(),
+		t.Context(),
 		service.UsagePairwiseComparisonRequest{
-			UsageRequest: service.UsageRequest{
-				From:           "2024-06-01",
-				To:             "2024-06-01",
-				Timezone:       "UTC",
-				IncludeOneShot: true,
-			},
+			From:           "2024-06-01",
+			To:             "2024-06-01",
+			Timezone:       "UTC",
+			IncludeOneShot: true,
 			LeftDimension:  "project",
 			LeftValue:      betaKey,
 			RightDimension: "model",
@@ -466,7 +524,7 @@ func TestDirectBackend_UsagePairwiseComparison_PreservesCommaProjectLabel(
 		From: "2024-06-01", To: "2024-06-01", Timezone: "UTC",
 		IncludeOneShot: true,
 	}
-	summary, err := be.UsageSummary(context.Background(), base)
+	summary, err := be.UsageSummary(t.Context(), base)
 	require.NoError(t, err)
 	keys := make(map[string]string)
 	for _, project := range summary.ProjectTotals {
@@ -476,7 +534,7 @@ func TestDirectBackend_UsagePairwiseComparison_PreservesCommaProjectLabel(
 	require.NotEmpty(t, keys["other"])
 
 	comparison, err := be.UsagePairwiseComparison(
-		context.Background(),
+		t.Context(),
 		service.UsagePairwiseComparisonRequest{
 			UsageRequest:   base,
 			LeftDimension:  "project",
@@ -503,7 +561,7 @@ func TestDirectBackend_UsageSummary_ExcludesOpaqueProjectKey(t *testing.T) {
 		From: "2024-06-01", To: "2024-06-01", Timezone: "UTC",
 		IncludeOneShot: true,
 	}
-	summary, err := be.UsageSummary(context.Background(), base)
+	summary, err := be.UsageSummary(t.Context(), base)
 	require.NoError(t, err)
 	var betaKey string
 	for _, project := range summary.ProjectTotals {
@@ -514,7 +572,7 @@ func TestDirectBackend_UsageSummary_ExcludesOpaqueProjectKey(t *testing.T) {
 	require.NotEmpty(t, betaKey)
 
 	base.ExcludeProjectKey = betaKey
-	filtered, err := be.UsageSummary(context.Background(), base)
+	filtered, err := be.UsageSummary(t.Context(), base)
 	require.NoError(t, err)
 	require.Len(t, filtered.ProjectTotals, 1)
 	assert.Equal(t, "alpha", filtered.ProjectTotals[0].Project)
@@ -552,14 +610,14 @@ func TestDirectBackend_UsageSummary_ExcludesSubagentOnlyProjectKey(t *testing.T)
 		IncludeOneShot: true,
 	}
 
-	summary, err := be.UsageSummary(context.Background(), base)
+	summary, err := be.UsageSummary(t.Context(), base)
 	require.NoError(t, err)
 	require.Len(t, summary.ProjectTotals, 1)
 	require.NotEmpty(t, summary.ProjectTotals[0].ProjectKey)
 	assert.Equal(t, "subagent-only", summary.ProjectTotals[0].Project)
 
 	base.ExcludeProjectKey = summary.ProjectTotals[0].ProjectKey
-	filtered, err := be.UsageSummary(context.Background(), base)
+	filtered, err := be.UsageSummary(t.Context(), base)
 	require.NoError(t, err)
 	assert.Empty(t, filtered.ProjectTotals)
 	assert.Zero(t, filtered.Totals.InputTokens)
@@ -577,7 +635,7 @@ func TestDirectBackend_UsageSummary_ExcludesCommaProjectByOpaqueKey(
 		From: "2024-06-01", To: "2024-06-01", Timezone: "UTC",
 		IncludeOneShot: true,
 	}
-	summary, err := be.UsageSummary(context.Background(), base)
+	summary, err := be.UsageSummary(t.Context(), base)
 	require.NoError(t, err)
 	var commaKey string
 	for _, project := range summary.ProjectTotals {
@@ -588,7 +646,7 @@ func TestDirectBackend_UsageSummary_ExcludesCommaProjectByOpaqueKey(
 	require.NotEmpty(t, commaKey)
 
 	base.ExcludeProjectKey = commaKey
-	filtered, err := be.UsageSummary(context.Background(), base)
+	filtered, err := be.UsageSummary(t.Context(), base)
 	require.NoError(t, err)
 	require.Len(t, filtered.ProjectTotals, 1)
 	assert.Equal(t, "other", filtered.ProjectTotals[0].Project)
@@ -603,14 +661,12 @@ func TestDirectBackend_UsagePairwiseComparison_ZeroDataSide(t *testing.T) {
 	be := service.NewDirectBackend(d, nil)
 
 	res, err := be.UsagePairwiseComparison(
-		context.Background(),
+		t.Context(),
 		service.UsagePairwiseComparisonRequest{
-			UsageRequest: service.UsageRequest{
-				From:           "2024-06-01",
-				To:             "2024-06-01",
-				Timezone:       "UTC",
-				IncludeOneShot: true,
-			},
+			From:           "2024-06-01",
+			To:             "2024-06-01",
+			Timezone:       "UTC",
+			IncludeOneShot: true,
 			LeftDimension:  "project",
 			LeftValue:      "missing-project",
 			RightDimension: "model",
@@ -633,15 +689,13 @@ func TestDirectBackend_UsagePairwiseComparison_ConflictingBaseFilterReturnsZeroD
 	be := service.NewDirectBackend(d, nil)
 
 	res, err := be.UsagePairwiseComparison(
-		context.Background(),
+		t.Context(),
 		service.UsagePairwiseComparisonRequest{
-			UsageRequest: service.UsageRequest{
-				From:           "2024-06-01",
-				To:             "2024-06-01",
-				Timezone:       "UTC",
-				Model:          "gpt-4o",
-				IncludeOneShot: true,
-			},
+			From:           "2024-06-01",
+			To:             "2024-06-01",
+			Timezone:       "UTC",
+			Model:          "gpt-4o",
+			IncludeOneShot: true,
 			LeftDimension:  "model",
 			LeftValue:      "claude-sonnet-4-20250514",
 			RightDimension: "model",
@@ -699,15 +753,13 @@ func TestDirectBackend_UsagePairwiseComparison_DoesNotUseSentinelFilterValues(t 
 	be := service.NewDirectBackend(d, nil)
 
 	res, err := be.UsagePairwiseComparison(
-		context.Background(),
+		t.Context(),
 		service.UsagePairwiseComparisonRequest{
-			UsageRequest: service.UsageRequest{
-				From:           "2024-06-01",
-				To:             "2024-06-01",
-				Timezone:       "UTC",
-				Model:          "gpt-4o",
-				IncludeOneShot: true,
-			},
+			From:           "2024-06-01",
+			To:             "2024-06-01",
+			Timezone:       "UTC",
+			Model:          "gpt-4o",
+			IncludeOneShot: true,
 			LeftDimension:  "model",
 			LeftValue:      "claude-sonnet-4-20250514",
 			RightDimension: "model",
@@ -730,14 +782,12 @@ func TestHTTPBackend_UsagePairwiseComparison_Roundtrip(t *testing.T) {
 	svc := env.Backend("", false)
 
 	res, err := svc.UsagePairwiseComparison(
-		context.Background(),
+		t.Context(),
 		service.UsagePairwiseComparisonRequest{
-			UsageRequest: service.UsageRequest{
-				From:           "2024-06-01",
-				To:             "2024-06-01",
-				Timezone:       "UTC",
-				IncludeOneShot: true,
-			},
+			From:           "2024-06-01",
+			To:             "2024-06-01",
+			Timezone:       "UTC",
+			IncludeOneShot: true,
 			LeftDimension:  "model",
 			LeftValue:      "claude-sonnet-4-20250514",
 			RightDimension: "model",
@@ -757,11 +807,20 @@ func TestHTTPBackend_UsagePairwiseComparison_SerializesRequest(t *testing.T) {
 	srv := httptest.NewServer(http.HandlerFunc(
 		func(w http.ResponseWriter, r *http.Request) {
 			queryValues = map[string]string{
+				"path":                r.URL.Path,
+				"from":                r.URL.Query().Get("from"),
+				"to":                  r.URL.Query().Get("to"),
+				"timezone":            r.URL.Query().Get("timezone"),
+				"model":               r.URL.Query().Get("model"),
+				"min_user_messages":   r.URL.Query().Get("min_user_messages"),
+				"include_one_shot":    r.URL.Query().Get("include_one_shot"),
+				"include_automated":   r.URL.Query().Get("include_automated"),
 				"left_dimension":      r.URL.Query().Get("left_dimension"),
 				"left_value":          r.URL.Query().Get("left_value"),
 				"right_dimension":     r.URL.Query().Get("right_dimension"),
 				"right_value":         r.URL.Query().Get("right_value"),
 				"git_branch":          r.URL.Query().Get("git_branch"),
+				"project_key":         r.URL.Query().Get("project_key"),
 				"exclude_project_key": r.URL.Query().Get("exclude_project_key"),
 			}
 			w.Header().Set("Content-Type", "application/json")
@@ -769,28 +828,42 @@ func TestHTTPBackend_UsagePairwiseComparison_SerializesRequest(t *testing.T) {
 		},
 	))
 	t.Cleanup(srv.Close)
-	svc := service.NewHTTPBackend(srv.URL, "", false)
+	svc := servicehttp.NewHTTPBackend(srv.URL, "", false, "")
 
 	res, err := svc.UsagePairwiseComparison(
-		context.Background(),
+		t.Context(),
 		service.UsagePairwiseComparisonRequest{
-			UsageRequest: service.UsageRequest{
-				GitBranch:         "alpha/main",
-				ExcludeProjectKey: "pl1:sha256:hidden",
-			},
-			LeftDimension:  "project",
-			LeftValue:      "alpha",
-			RightDimension: "model",
-			RightValue:     "gpt-4o",
+			From:              "2024-06-01",
+			To:                "2024-06-07",
+			Timezone:          "UTC",
+			Model:             "gpt-4o",
+			MinUserMessages:   3,
+			IncludeOneShot:    true,
+			ProjectKey:        "pl1:sha256:alpha",
+			GitBranch:         "alpha/main",
+			ExcludeProjectKey: "pl1:sha256:hidden",
+			LeftDimension:     "project",
+			LeftValue:         "alpha",
+			RightDimension:    "model",
+			RightValue:        "gpt-4o",
 		},
 	)
 	require.NoError(t, err)
 	require.NotNil(t, res)
+	assert.Equal(t, "2024-06-01", queryValues["from"])
+	assert.Equal(t, "2024-06-07", queryValues["to"])
+	assert.Equal(t, "UTC", queryValues["timezone"])
+	assert.Equal(t, "gpt-4o", queryValues["model"])
+	assert.Equal(t, "3", queryValues["min_user_messages"])
+	assert.Equal(t, "true", queryValues["include_one_shot"])
+	assert.Equal(t, "false", queryValues["include_automated"])
 	assert.Equal(t, "project", queryValues["left_dimension"])
+	assert.Equal(t, "/api/v1/usage/pairwise-comparison", queryValues["path"])
 	assert.Equal(t, "alpha", queryValues["left_value"])
 	assert.Equal(t, "model", queryValues["right_dimension"])
 	assert.Equal(t, "gpt-4o", queryValues["right_value"])
 	assert.Equal(t, "alpha/main", queryValues["git_branch"])
+	assert.Equal(t, "pl1:sha256:alpha", queryValues["project_key"])
 	assert.Equal(t, "pl1:sha256:hidden", queryValues["exclude_project_key"])
 	assert.Equal(t, 22, res.Deltas.TotalTokensDelta)
 }

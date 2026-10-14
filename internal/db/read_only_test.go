@@ -5,6 +5,7 @@ import (
 	"database/sql"
 	"errors"
 	"os"
+	"os/exec"
 	"path/filepath"
 	"testing"
 
@@ -25,7 +26,7 @@ func createClosedTestDB(
 	seed func(*DB),
 ) string {
 	t.Helper()
-	d, err := openCopiedTestDB(path)
+	d, err := openCopiedTestDB(t, path)
 	require.NoError(t, err)
 	if seed != nil {
 		seed(d)
@@ -57,7 +58,7 @@ func copyTestDBFile(t *testing.T, src, dst string, required bool) {
 
 func openReadOnlyTestDB(t *testing.T, path string) *DB {
 	t.Helper()
-	readonly, err := OpenReadOnly(path)
+	readonly, err := OpenReadOnly(t.Context(), path)
 	require.NoError(t, err)
 	t.Cleanup(func() { require.NoError(t, readonly.Close()) })
 	return readonly
@@ -65,9 +66,10 @@ func openReadOnlyTestDB(t *testing.T, path string) *DB {
 
 func execRawSQLite(t *testing.T, path, query string, args ...any) {
 	t.Helper()
+
 	raw, err := sql.Open("sqlite3", path)
 	require.NoError(t, err)
-	_, err = raw.Exec(query, args...)
+	_, err = raw.ExecContext(t.Context(), query, args...)
 	require.NoError(t, err)
 	require.NoError(t, raw.Close())
 }
@@ -78,7 +80,7 @@ func requireOpenReadOnlyFails(
 	contains string,
 ) {
 	t.Helper()
-	readonly, err := OpenReadOnly(path)
+	readonly, err := OpenReadOnly(t.Context(), path)
 	require.Error(t, err)
 	require.Nil(t, readonly)
 	assert.Contains(t, err.Error(), contains)
@@ -105,7 +107,7 @@ func testModelPricing(pattern string) ModelPricing {
 
 func TestOpenReadOnlyExistingDBDoesNotWrite(t *testing.T) {
 	path := createClosedTestDB(t, tempDBPath(t, "sessions.db"), func(d *DB) {
-		require.NoError(t, d.SetSyncState("read_only_probe", "before"))
+		require.NoError(t, d.SetSyncState(t.Context(), "read_only_probe", "before"))
 	})
 
 	before, err := os.Stat(path)
@@ -114,11 +116,11 @@ func TestOpenReadOnlyExistingDBDoesNotWrite(t *testing.T) {
 	readonly := openReadOnlyTestDB(t, path)
 	assert.True(t, readonly.ReadOnly())
 
-	got, err := readonly.GetSyncState("read_only_probe")
+	got, err := readonly.GetSyncState(t.Context(), "read_only_probe")
 	require.NoError(t, err)
 	assert.Equal(t, "before", got)
 
-	err = readonly.SetSyncState("read_only_probe", "after")
+	err = readonly.SetSyncState(t.Context(), "read_only_probe", "after")
 	require.ErrorIs(t, err, ErrReadOnly)
 
 	after, err := os.Stat(path)
@@ -136,7 +138,7 @@ func TestOpenReadOnlyReaderRefusesWritesAtSQLiteLevel(t *testing.T) {
 	path := createClosedTestDB(t, tempDBPath(t, "sessions.db"), nil)
 	readonly := openReadOnlyTestDB(t, path)
 
-	_, err := readonly.rawReader().Exec(
+	_, err := readonly.rawReader().ExecContext(t.Context(),
 		`INSERT INTO stats (key, value) VALUES ('ro_probe', 1)`)
 	require.Error(t, err,
 		"a read-only reader connection must refuse writes")
@@ -155,10 +157,10 @@ func TestOpenPathWithSpecialCharacters(t *testing.T) {
 	require.NoError(t, os.MkdirAll(dir, 0o755))
 	path := filepath.Join(dir, "sessions.db")
 
-	rw, err := Open(path)
+	rw, err := Open(t.Context(), path)
 	require.NoError(t, err,
 		"writable Open must succeed on a path with %% and space")
-	require.NoError(t, rw.SetSyncState("special_path_probe", "x"))
+	require.NoError(t, rw.SetSyncState(t.Context(), "special_path_probe", "x"))
 	require.NoError(t, rw.Close())
 
 	_, err = os.Stat(path)
@@ -166,11 +168,11 @@ func TestOpenPathWithSpecialCharacters(t *testing.T) {
 		"the database file must exist at the literal path, not a decoded one")
 
 	readonly := openReadOnlyTestDB(t, path)
-	got, err := readonly.GetSyncState("special_path_probe")
+	got, err := readonly.GetSyncState(t.Context(), "special_path_probe")
 	require.NoError(t, err)
 	assert.Equal(t, "x", got)
 
-	_, err = readonly.rawReader().Exec(
+	_, err = readonly.rawReader().ExecContext(t.Context(),
 		`INSERT INTO stats (key, value) VALUES ('ro_probe', 1)`)
 	require.Error(t, err,
 		"a read-only reader connection must refuse writes")
@@ -185,7 +187,7 @@ func TestOpenPathWithSpecialCharacters(t *testing.T) {
 // still refuses writes.
 func TestOpenReadOnlyNonWALJournalMode(t *testing.T) {
 	path := createClosedTestDB(t, tempDBPath(t, "sessions.db"), func(d *DB) {
-		require.NoError(t, d.SetSyncState("journal_probe", "delete-mode"))
+		require.NoError(t, d.SetSyncState(t.Context(), "journal_probe", "delete-mode"))
 	})
 	execRawSQLite(t, path, "PRAGMA journal_mode=DELETE")
 	_, err := os.Stat(path + "-wal")
@@ -195,12 +197,12 @@ func TestOpenReadOnlyNonWALJournalMode(t *testing.T) {
 	readonly := openReadOnlyTestDB(t, path)
 	assert.True(t, readonly.ReadOnly())
 
-	got, err := readonly.GetSyncState("journal_probe")
+	got, err := readonly.GetSyncState(t.Context(), "journal_probe")
 	require.NoError(t, err)
 	assert.Equal(t, "delete-mode", got)
 
-	require.ErrorIs(t, readonly.SetSyncState("journal_probe", "x"), ErrReadOnly)
-	_, err = readonly.rawReader().Exec(
+	require.ErrorIs(t, readonly.SetSyncState(t.Context(), "journal_probe", "x"), ErrReadOnly)
+	_, err = readonly.rawReader().ExecContext(t.Context(),
 		`INSERT INTO stats (key, value) VALUES ('ro_probe', 1)`)
 	require.Error(t, err,
 		"a read-only reader connection must refuse writes")
@@ -216,14 +218,14 @@ func TestOpenReadOnlyWriteMethodsReturnErrReadOnly(t *testing.T) {
 	readonly := openReadOnlyTestDB(t, path)
 
 	requireReadOnlyOp(t, "UpsertSession", func() error {
-		return readonly.UpsertSession(Session{ID: "s", Agent: "codex"})
+		return readonly.UpsertSession(t.Context(), Session{ID: "s", Agent: "codex"})
 	})
 	requireReadOnlyOp(t, "WriteSessionBatch", func() error {
 		_, err := readonly.WriteSessionBatch(nil)
 		return err
 	})
 	requireReadOnlyOp(t, "WriteSessionBatchAtomic", func() error {
-		_, err := readonly.WriteSessionBatchAtomic(nil)
+		_, err := readonly.WriteSessionBatchAtomic(t.Context(), nil)
 		return err
 	})
 	requireReadOnlyOp(t, "UpsertModelPricing nil", func() error {
@@ -233,36 +235,36 @@ func TestOpenReadOnlyWriteMethodsReturnErrReadOnly(t *testing.T) {
 		return readonly.UpsertModelPricing([]ModelPricing{pricing})
 	})
 	requireReadOnlyOp(t, "InsertMessages", func() error {
-		return readonly.InsertMessages(nil)
+		return readonly.InsertMessages(t.Context(), nil)
 	})
 	requireReadOnlyOp(t, "BulkStarSessions", func() error {
-		return readonly.BulkStarSessions(nil)
+		return readonly.BulkStarSessions(t.Context(), nil)
 	})
 	requireReadOnlyOp(t, "DeleteParserExcludedSessions", func() error {
-		_, err := readonly.DeleteParserExcludedSessions(nil)
+		_, err := readonly.DeleteParserExcludedSessions(t.Context(), nil)
 		return err
 	})
 	requireReadOnlyOp(t, "DeleteSessions", func() error {
-		_, err := readonly.DeleteSessions(nil)
+		_, err := readonly.DeleteSessions(t.Context(), nil)
 		return err
 	})
 	requireReadOnlyOp(t, "InsertMissingModelPricing", func() error {
-		return readonly.InsertMissingModelPricing([]ModelPricing{{
+		return readonly.InsertMissingModelPricing(t.Context(), []ModelPricing{{
 			ModelPattern: "x",
 		}})
 	})
 	requireReadOnlyOp(t, "ReplaceSkippedFiles", func() error {
-		return readonly.ReplaceSkippedFiles(map[string]int64{"x": 1})
+		return readonly.ReplaceSkippedFiles(t.Context(), map[string]int64{"x": 1})
 	})
 	requireReadOnlyOp(t, "ClearRemoteSkippedFiles", func() error {
-		return readonly.ClearRemoteSkippedFiles("remote-host")
+		return readonly.ClearRemoteSkippedFiles(t.Context(), "remote-host")
 	})
 	requireReadOnlyOp(t, "UpdateSessionIncremental", func() error {
-		return readonly.UpdateSessionIncremental("s", IncrementalSessionUpdate{})
+		return readonly.UpdateSessionIncremental(t.Context(), "s", IncrementalSessionUpdate{})
 	})
 	requireReadOnlyOp(t, "RecordRecallQueryEvent", func() error {
 		_, err := readonly.RecordRecallQueryEvent(
-			context.Background(), RecallQueryEvent{Surface: "query"},
+			t.Context(), RecallQueryEvent{Surface: "query"},
 		)
 		return err
 	})
@@ -279,6 +281,20 @@ func TestOpenReadOnlyRejectsMissingMigratedColumn(t *testing.T) {
 	// trigger or index exists.
 	execRawSQLite(t, path, "ALTER TABLE sessions DROP COLUMN deletion_cause")
 	requireOpenReadOnlyFails(t, path, "schema missing sessions.deletion_cause")
+}
+
+func TestOpenReadOnlyRejectsMissingUsageCacheIndexes(t *testing.T) {
+	for _, index := range []string{
+		"idx_messages_usage_timestamp",
+		"idx_messages_usage_session_covering",
+		"idx_messages_activity_timestamp",
+	} {
+		t.Run(index, func(t *testing.T) {
+			path := createClosedTestDB(t, tempDBPath(t, "sessions.db"), nil)
+			execRawSQLite(t, path, "DROP INDEX "+index)
+			requireOpenReadOnlyFails(t, path, "schema missing index "+index)
+		})
+	}
 }
 
 func TestReadOnlySchemaCompatibilityRejectsMissingReadColumn(t *testing.T) {
@@ -302,19 +318,23 @@ func TestReadOnlySchemaCompatibilityRejectsMissingReadColumn(t *testing.T) {
 		{"worktree mapping", "worktree_project_mappings", "updated_at"},
 		{"pg sync state", "pg_sync_state", "value"},
 		{"model pricing", "model_pricing", "updated_at"},
+		{"pricing 1h rate", "model_pricing", "cache_creation_1h_microdollars_per_mtok"},
 		{"pricing band", "model_pricing_bands", "input_microdollars_per_mtok"},
+		{"GenAI pricing", "genai_pricing", "data_json"},
 		{"secret finding", "secret_findings", "rules_version"},
 		{"recall entry", "recall_entries", "uncertainty"},
 		{"recall evidence", "recall_evidence", "snippet"},
 		{"extract generation", "recall_extract_generations", "state"},
-		{"extract progress stamp", "recall_extract_progress",
-			"content_stamped_at"},
+		{
+			"extract progress stamp", "recall_extract_progress",
+			"content_stamped_at",
+		},
 	}
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
 			conn := openReadOnlySchemaProbe(t)
-			_, err := conn.Exec(
-				"ALTER TABLE " + tt.table + " DROP COLUMN " + tt.column)
+			_, err := conn.ExecContext(t.Context(),
+				"ALTER TABLE "+tt.table+" DROP COLUMN "+tt.column)
 			require.NoError(t, err)
 			requireReadOnlySchemaCompatibilityFails(t, conn,
 				"schema missing "+tt.table+"."+tt.column)
@@ -331,10 +351,12 @@ func TestOpenReadOnlyRejectsMissingReadTable(t *testing.T) {
 		{"stats", "key"},
 		{"usage_events", "id"},
 		{"pinned_messages", "id"},
+		{"session_project_assignments", "session_id"},
 		{"secret_findings", "id"},
 		{"pg_sync_state", "key"},
 		{"model_pricing", "model_pattern"},
 		{"model_pricing_bands", "model_pattern"},
+		{"genai_pricing", "singleton"},
 		{"recall_query_events", "id"},
 		{"recall_query_exposures", "query_id"},
 		{"recall_extract_generations", "fingerprint"},
@@ -351,13 +373,13 @@ func TestOpenReadOnlyRejectsMissingReadTable(t *testing.T) {
 }
 
 func TestReadOnlyRequiredSchemaDerivedFromSchemaDDL(t *testing.T) {
-	required, err := readOnlyRequiredSchema()
+	required, err := readOnlyRequiredSchema(t.Context())
 	require.NoError(t, err)
 
 	conn, err := sql.Open("sqlite3", ":memory:")
 	require.NoError(t, err)
 	t.Cleanup(func() { require.NoError(t, conn.Close()) })
-	_, err = conn.Exec(schemaSQL)
+	_, err = conn.ExecContext(t.Context(), schemaSQL)
 	require.NoError(t, err)
 
 	want := make(map[string][]string, len(readOnlyRequiredTables))
@@ -374,7 +396,8 @@ func readOnlyTableColumns(
 	table string,
 ) []string {
 	t.Helper()
-	rows, err := conn.Query(
+
+	rows, err := conn.QueryContext(t.Context(),
 		"SELECT name FROM pragma_table_info(?) ORDER BY cid", table,
 	)
 	require.NoError(t, err)
@@ -395,7 +418,7 @@ func openReadOnlySchemaProbe(t *testing.T) *sql.DB {
 	conn, err := sql.Open("sqlite3", ":memory:")
 	require.NoError(t, err)
 	t.Cleanup(func() { require.NoError(t, conn.Close()) })
-	_, err = conn.Exec(schemaSQL)
+	_, err = conn.ExecContext(t.Context(), schemaSQL)
 	require.NoError(t, err)
 	return conn
 }
@@ -406,7 +429,7 @@ func requireReadOnlySchemaCompatibilityFails(
 	contains string,
 ) {
 	t.Helper()
-	err := checkReadOnlySchemaCompatibility(conn)
+	err := checkReadOnlySchemaCompatibility(t.Context(), conn)
 	require.Error(t, err)
 	assert.Contains(t, err.Error(), contains)
 }
@@ -418,11 +441,11 @@ func TestOpenReadOnlyAllowsMissingFTSTable(t *testing.T) {
 	execRawSQLite(t, path, "DROP TRIGGER IF EXISTS messages_ad")
 	execRawSQLite(t, path, "DROP TABLE IF EXISTS messages_fts")
 
-	readonly, err := OpenReadOnly(path)
+	readonly, err := OpenReadOnly(t.Context(), path)
 	require.NoError(t, err)
 	require.NotNil(t, readonly)
 	defer readonly.Close()
-	assert.False(t, readonly.HasFTS())
+	assert.False(t, readonly.HasFTS(t.Context()))
 }
 
 func TestOpenReadOnlyCopyHelpersReturnErrReadOnly(t *testing.T) {
@@ -457,13 +480,19 @@ func TestOpenReadOnlyCopyHelpersReturnErrReadOnly(t *testing.T) {
 	requireReadOnlyOp(t, "CopyWorktreeProjectMappingsFrom", func() error {
 		return readonly.CopyWorktreeProjectMappingsFrom(srcPath)
 	})
+	requireReadOnlyOp(t, "AssignSessionProject", func() error {
+		_, err := readonly.AssignSessionProject(
+			t.Context(), "session", "project",
+		)
+		return err
+	})
 }
 
 func TestOpenReadOnlyMissingDBFailsWithoutCreatingFiles(t *testing.T) {
 	dir := t.TempDir()
 	path := filepath.Join(dir, "missing", "sessions.db")
 
-	readonly, err := OpenReadOnly(path)
+	readonly, err := OpenReadOnly(t.Context(), path)
 	require.Error(t, err)
 	require.Nil(t, readonly)
 
@@ -478,11 +507,31 @@ func TestOpenReadOnlyEmptyDBFailsWithoutMigrating(t *testing.T) {
 	path := filepath.Join(t.TempDir(), "sessions.db")
 	require.NoError(t, os.WriteFile(path, nil, 0o644))
 
-	readonly, err := OpenReadOnly(path)
+	readonly, err := OpenReadOnly(t.Context(), path)
 	require.Error(t, err)
 	require.Nil(t, readonly)
 
 	info, statErr := os.Stat(path)
 	require.NoError(t, statErr)
 	assert.Zero(t, info.Size())
+}
+
+func TestReadOnlySchemaAfterInitialCancellation(t *testing.T) {
+	// A separate process ensures no earlier open has initialized the schema cache.
+	if os.Getenv("AGENTSVIEW_TEST_SCHEMA_CANCELLATION") != "1" {
+		exe, err := os.Executable()
+		require.NoError(t, err)
+		cmd := exec.CommandContext(t.Context(), exe, "-test.run=^TestReadOnlySchemaAfterInitialCancellation$")
+		cmd.Env = append(os.Environ(), "AGENTSVIEW_TEST_SCHEMA_CANCELLATION=1")
+		output, err := cmd.CombinedOutput()
+		require.NoError(t, err, "%s", output)
+		return
+	}
+	ctx, cancel := context.WithCancel(t.Context())
+	cancel()
+	_, err := readOnlyRequiredSchema(ctx)
+	require.ErrorIs(t, err, context.Canceled)
+	required, err := readOnlyRequiredSchema(t.Context())
+	require.NoError(t, err)
+	assert.Contains(t, required["sessions"], "id")
 }

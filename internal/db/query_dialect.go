@@ -3,8 +3,11 @@ package db
 import (
 	"fmt"
 	"regexp"
+	"slices"
+	"strconv"
 	"strings"
 	"time"
+	"unicode/utf8"
 )
 
 type placeholderStyle int
@@ -28,6 +31,7 @@ const (
 // ORM: callers still own SELECTs, JOINs, backend-specific search paths, and
 // table schemas.
 type QueryDialect struct {
+	parentRelation     func(childAlias, parentAlias string) string
 	name               string
 	placeholderStyle   placeholderStyle
 	trueLiteral        string
@@ -46,12 +50,104 @@ type QueryDialect struct {
 	emptyStringIsNull           bool
 	terminationExpr             string
 	terminationKind             timestampKind
+	messageMembership           func(string, string) string
+	signedWindowCounts          bool
+	recentEditTimestamp         func(string) string
 	caseInsensitiveLike         string
 	caseInsensitiveLikeEsc      string
 	regexPredicate              func(string, string) string
 	sidebarChildRelationships   []string
 	canonicalChildRelationships []string
 	nullsLast                   bool
+	// recursiveUnion is the set operator joining the anchor and recursive
+	// members of the IncludeChildren tree CTE. Empty means "UNION"; ClickHouse
+	// accepts only "UNION ALL" inside a recursive CTE.
+	recursiveUnion string
+	// starredPredicate renders the Starred filter for the given session id
+	// expression. Nil renders the correlated EXISTS the row stores use;
+	// ClickHouse needs an uncorrelated IN subquery.
+	starredPredicate func(idExpr string) string
+	// labelPredicate renders "the session carries this label". Nil reads
+	// the SQLite session_labels table; mirrors store labels as an array
+	// column on the session row.
+	labelPredicate func(q func(string) string, ph string) string
+	// prLinkPredicate renders "a stored pull request link matches this
+	// repository, number, and host when their placeholders are non-empty"
+	// over the JSON text column col. Nil renders the SQLite
+	// json_each form.
+	prLinkPredicate func(col, repoPh, numPh, hostPh string) string
+	// orphanPredicate renders the "parent row is missing" test used by
+	// BuildCanonicalRootWhere. Nil uses the configured parent relation.
+	orphanPredicate func(sessionAlias, parentAlias string) string
+}
+
+// SignedAggregate keeps ClickHouse aggregate counts scannable as Go integers.
+func (d QueryDialect) SignedAggregate(expr string) string {
+	if d.signedWindowCounts {
+		return "toInt64(" + expr + ")"
+	}
+	return expr
+}
+
+func (d QueryDialect) TrueLiteral() string {
+	return d.trueLiteral
+}
+
+func (d QueryDialect) FalseLiteral() string {
+	return d.falseLiteral
+}
+
+func (d QueryDialect) recursiveUnionSQL() string {
+	if d.recursiveUnion == "" {
+		return "UNION"
+	}
+	return d.recursiveUnion
+}
+
+func (d QueryDialect) starredPredicateSQL(idExpr string) string {
+	if d.starredPredicate != nil {
+		return d.starredPredicate(idExpr)
+	}
+	return "EXISTS (SELECT 1 FROM starred_sessions ss WHERE ss.session_id = " +
+		idExpr + ")"
+}
+
+func (d QueryDialect) labelPredicateSQL(
+	q func(string) string, ph string,
+) string {
+	if d.labelPredicate != nil {
+		return d.labelPredicate(q, ph)
+	}
+	return "EXISTS (SELECT 1 FROM session_labels sl WHERE sl.session_id = " +
+		q("id") + " AND sl.label = " + ph + ")"
+}
+
+func (d QueryDialect) prLinkPredicateSQL(col, repoPh, numPh, hostPh string) string {
+	if d.prLinkPredicate != nil {
+		return d.prLinkPredicate(col, repoPh, numPh, hostPh)
+	}
+	pred := "EXISTS (SELECT 1 FROM json_each(NULLIF(" + col + ", '')) pl WHERE 1=1"
+	if repoPh != "" {
+		pred += " AND lower(json_extract(pl.value, '$.repository')) = " + repoPh
+	}
+	if numPh != "" {
+		pred += " AND json_extract(pl.value, '$.number') = " + numPh
+	}
+	if hostPh != "" {
+		pred += " AND lower(json_extract(pl.value, '$.host')) = " + hostPh
+	}
+	return pred + ")"
+}
+
+func (d QueryDialect) orphanPredicateSQL(sessionAlias, parentAlias string) string {
+	if d.orphanPredicate != nil {
+		return d.orphanPredicate(sessionAlias, parentAlias)
+	}
+	if d.parentRelation != nil {
+		return "NOT EXISTS (SELECT 1 FROM sessions " + parentAlias + " WHERE " +
+			d.ParentRelation(sessionAlias, parentAlias) + ")"
+	}
+	return SidebarOrphanPredicate(sessionAlias, parentAlias)
 }
 
 func outerSessionID(q func(string) string) string {
@@ -137,6 +233,112 @@ func PostgresQueryDialect() QueryDialect {
 		sidebarChildRelationships:   []string{"subagent", "fork"},
 		canonicalChildRelationships: []string{"subagent", "fork", "continuation"},
 		nullsLast:                   true,
+		labelPredicate: func(q func(string) string, ph string) string {
+			// Containment can use the GIN index on labels.
+			return q("labels") + " @> ARRAY[" + ph + "::text]"
+		},
+		prLinkPredicate: func(col, repoPh, numPh, hostPh string) string {
+			pred := "EXISTS (SELECT 1 FROM jsonb_array_elements(NULLIF(" +
+				col + ", '')::jsonb) pl WHERE TRUE"
+			if repoPh != "" {
+				pred += " AND lower(pl->>'repository') = " + repoPh
+			}
+			if numPh != "" {
+				pred += " AND (pl->>'number')::bigint = " + numPh
+			}
+			if hostPh != "" {
+				pred += " AND lower(pl->>'host') = " + hostPh
+			}
+			return pred + ")"
+		},
+	}
+}
+
+// ClickHouseQueryDialect returns the ClickHouse SQL fragments used by the
+// read-only ClickHouse mirror store. It does not couple to
+// internal/clickhouse. ClickHouse differences from the row stores: recursive
+// CTEs accept only UNION ALL, correlated subqueries are not relied on (the
+// starred and orphan predicates use IN subqueries and the date-end expression
+// reads the push-time last_message_at column), LIKE escapes with a backslash
+// and has no ESCAPE clause, and regex matching goes through match() with an
+// inline case-insensitive flag.
+func ClickHouseQueryDialect() QueryDialect {
+	return QueryDialect{
+		name:             "clickhouse",
+		placeholderStyle: placeholderQuestion,
+		trueLiteral:      "true",
+		falseLiteral:     "false",
+		messageMembership: func(sessionID, pred string) string {
+			return sessionID + " IN (SELECT m.session_id FROM messages m WHERE " + pred + ")"
+		},
+		signedWindowCounts:  true,
+		recentEditTimestamp: recentEditsRFC3339Expr,
+		dateStartExpr: func(q func(string) string) string {
+			return "COALESCE(" + q("started_at") + ", " + q("created_at") + ")"
+		},
+		dateEndExpr: func(q func(string) string) string {
+			return "COALESCE(" + q("ended_at") + ", " + q("last_message_at") +
+				", " + q("started_at") + ", " + q("created_at") + ")"
+		},
+		dateParam:           clickhouseTimestampParam,
+		activityParam:       clickhouseTimestampParam,
+		cursorActivityExpr:  "COALESCE(ended_at, started_at, created_at)",
+		cursorParam:         clickhouseTimestampParam,
+		castCursor:          clickhouseCastCursor,
+		terminationExpr:     "COALESCE(ended_at, started_at, created_at)",
+		terminationKind:     timestampCast,
+		caseInsensitiveLike: "ILIKE",
+		regexPredicate: func(col, ph string) string {
+			return "match(" + col + ", concat('(?i)', " + ph + "))"
+		},
+		sidebarChildRelationships:   []string{"subagent", "fork"},
+		canonicalChildRelationships: []string{"subagent", "fork", "continuation"},
+		nullsLast:                   true,
+		recursiveUnion:              "UNION ALL",
+		starredPredicate: func(idExpr string) string {
+			return idExpr + " IN (SELECT session_id FROM starred_sessions)"
+		},
+		labelPredicate: func(q func(string) string, ph string) string {
+			return "has(" + q("labels") + ", " + ph + ")"
+		},
+		prLinkPredicate: func(col, repoPh, numPh, hostPh string) string {
+			cond := "true"
+			if repoPh != "" {
+				cond += " AND lower(JSONExtractString(pl, 'repository')) = " + repoPh
+			}
+			if numPh != "" {
+				cond += " AND JSONExtractInt(pl, 'number') = " + numPh
+			}
+			if hostPh != "" {
+				cond += " AND lower(JSONExtractString(pl, 'host')) = " + hostPh
+			}
+			return "arrayExists(pl -> " + cond +
+				", JSONExtractArrayRaw(" + col + "))"
+		},
+		orphanPredicate: func(sessionAlias, _ string) string {
+			// NULL NOT IN (...) is unknown in SQL, so a child whose parent
+			// id is NULL would drop out of the sidebar. NOT EXISTS treats
+			// that row as an orphan; the IS NULL arm matches that.
+			return "(" + sessionAlias + ".parent_session_id IS NULL OR " +
+				sessionAlias + ".parent_session_id NOT IN (SELECT id FROM sessions))"
+		},
+	}
+}
+
+func clickhouseTimestampParam(ph string) string {
+	return "parseDateTime64BestEffort(" + ph + ", 6, 'UTC')"
+}
+
+func clickhouseCastCursor(ph string, kind valueKind) string {
+	switch kind {
+	case kindTimestamp:
+		return clickhouseTimestampParam(ph)
+	case kindInt:
+		return "toInt64(" + ph + ")"
+	case kindReal:
+		return "toFloat64(" + ph + ")"
+	default:
+		return ph
 	}
 }
 
@@ -178,6 +380,23 @@ func DuckDBQueryDialect() QueryDialect {
 		sidebarChildRelationships:   []string{"subagent", "fork"},
 		canonicalChildRelationships: []string{"subagent", "fork", "continuation"},
 		nullsLast:                   true,
+		labelPredicate: func(q func(string) string, ph string) string {
+			return "list_contains(" + q("labels") + ", " + ph + ")"
+		},
+		prLinkPredicate: func(col, repoPh, numPh, hostPh string) string {
+			cond := "true"
+			if repoPh != "" {
+				cond += " AND lower(pl->>'repository') = " + repoPh
+			}
+			if numPh != "" {
+				cond += " AND CAST(pl->>'number' AS BIGINT) = " + numPh
+			}
+			if hostPh != "" {
+				cond += " AND lower(pl->>'host') = " + hostPh
+			}
+			return "len(list_filter(CAST(json_extract(NULLIF(" + col +
+				", ''), '$[*]') AS JSON[]), pl -> " + cond + ")) > 0"
+		},
 	}
 }
 
@@ -428,15 +647,24 @@ func BuildSessionFilterSQL(
 func BuildSessionBaseFilterSQL(
 	f SessionFilter, dialect QueryDialect,
 ) (string, []any) {
+	f = f.withAnnotationSelection()
 	b := NewQueryBuilder(dialect, 0)
 	preds := []string{
 		"message_count > 0",
 		"deleted_at IS NULL",
 	}
+	if f.IncludeEmpty {
+		preds = preds[1:]
+	}
 	filterPreds, oneShotPred := sessionFilterPredicates(f, b, func(col string) string { return col })
 	preds = append(preds, filterPreds...)
 	if oneShotPred != "" {
 		preds = append(preds, oneShotPred)
+	}
+	// Callers select roots themselves, so label and pull request filters
+	// keep a root whose tree holds a match.
+	if pred := annotationTreePredicate(f, b, "id"); pred != "" {
+		preds = append(preds, pred)
 	}
 	return strings.Join(preds, " AND "), b.Args()
 }
@@ -469,14 +697,26 @@ func SidebarOrphanPredicate(sessionAlias, parentAlias string) string {
 		)`
 }
 
+func (d QueryDialect) WithParentRelation(relation func(string, string) string) QueryDialect {
+	d.parentRelation = relation
+	return d
+}
+
+func (d QueryDialect) ParentRelation(child, parent string) string {
+	if d.parentRelation != nil {
+		return d.parentRelation(child, parent)
+	}
+	return child + ".parent_session_id = " + parent + ".id"
+}
+
 func BuildCanonicalRootWhere(dialect QueryDialect, sessionAlias string, includeOrphans bool) string {
-	base := `NOT (` + CanonicalChildRelationshipPredicate(dialect, sessionAlias) + `)`
+	base := `(NOT (` + CanonicalChildRelationshipPredicate(dialect, sessionAlias) + `) OR COALESCE(` + sessionAlias + `.parent_session_id, '') = '')`
 	if !includeOrphans {
 		return base
 	}
 	return `(` + base + ` OR (` +
 		CanonicalChildRelationshipPredicate(dialect, sessionAlias) + ` AND ` +
-		SidebarOrphanPredicate(sessionAlias, "parent") + `))`
+		dialect.orphanPredicateSQL(sessionAlias, "parent") + `))`
 }
 
 func buildSessionFilterWithBuilder(
@@ -488,22 +728,59 @@ func buildSessionFilterWithBuilder(
 		}
 		return qualifier + "." + col
 	}
+	f = f.withAnnotationSelection()
+
+	if f.IDs != nil {
+		// Explicit hydration selects the requested rows rather than sidebar
+		// roots and their descendants. Keep caller-supplied row filters.
+		if !f.OneShotFilterSet {
+			f.ExcludeOneShot = false
+		}
+		if !f.AutomatedFilterSet {
+			f.ExcludeAutomated = false
+		}
+		preds, oneShot := sessionFilterPredicates(f, b, q)
+		if oneShot != "" {
+			preds = append(preds, oneShot)
+		}
+		preds = append(preds, annotationPredicates(f, b, q)...)
+		return strings.Join(append([]string{q("deleted_at") + " IS NULL"}, preds...), " AND ")
+	}
 
 	basePreds := []string{
 		q("message_count") + " > 0",
 		q("deleted_at") + " IS NULL",
 	}
-	if !f.IncludeChildren {
+	if f.IncludeEmpty {
+		basePreds = basePreds[1:]
+	}
+	// Opaque project-key callers have already resolved every raw label that
+	// belongs to the identity. Match those labels on each row directly so
+	// child sessions are neither excluded nor pulled in merely because their
+	// parent belongs to the requested project.
+	if f.ProjectLabels != nil {
+		filterPreds, oneShotPred := sessionFilterPredicates(f, b, q)
+		allPreds := slices.Concat(basePreds, filterPreds)
+		if oneShotPred != "" {
+			allPreds = append(allPreds, oneShotPred)
+		}
+		allPreds = append(allPreds, annotationPredicates(f, b, q)...)
+		return strings.Join(allPreds, " AND ")
+	}
+	// A flat list filtered by label or pull request matches each session
+	// directly, so a launched worker appears even though it is a child.
+	if !f.IncludeChildren && !f.HasAnnotationFilter() {
 		basePreds = append(basePreds,
 			q("relationship_type")+" NOT IN ("+b.dialect.SidebarChildRelationshipsSQL()+")")
 	}
 
 	if !f.IncludeChildren {
 		filterPreds, oneShotPred := sessionFilterPredicates(f, b, q)
-		allPreds := append(basePreds, filterPreds...)
+		allPreds := slices.Concat(basePreds, filterPreds)
 		if oneShotPred != "" {
 			allPreds = append(allPreds, oneShotPred)
 		}
+		allPreds = append(allPreds, annotationPredicates(f, b, q)...)
 		return strings.Join(allPreds, " AND ")
 	}
 
@@ -515,42 +792,52 @@ func buildSessionFilterWithBuilder(
 	if oneShotPred != "" {
 		rootMatchParts = append(rootMatchParts, oneShotPred)
 	}
+	if pred := annotationTreePredicate(f, b, "root_session.id"); pred != "" {
+		rootMatchParts = append(rootMatchParts, pred)
+	}
 	rootMatchParts = append(rootMatchParts,
 		BuildCanonicalRootWhere(b.dialect, "root_session", f.IncludeOrphans))
 	rootMatch := strings.Join(rootMatchParts, " AND ")
-	childAutomationPred := automationScopePredicate(f, b.dialect, "s")
-	childAutomationWhere := ""
-	if childAutomationPred != "" {
-		childAutomationWhere = " AND " + childAutomationPred
-	}
 
 	cte := "WITH RECURSIVE tree(id) AS (" +
 		"SELECT root_session.id FROM sessions root_session" +
 		" WHERE root_session.message_count > 0" +
 		" AND root_session.deleted_at IS NULL AND " +
 		rootMatch +
-		" UNION " +
+		" " + b.dialect.recursiveUnionSQL() + " " +
 		"SELECT s.id FROM sessions s" +
-		" JOIN tree t ON s.parent_session_id = t.id" +
-		" WHERE s.message_count > 0 AND s.deleted_at IS NULL" +
-		childAutomationWhere +
+		" JOIN tree t ON " + b.dialect.ParentRelation("s", "t") +
+		" WHERE " + SessionTreeMemberPredicate(f, b.dialect, "s") +
 		") SELECT id FROM tree"
 
 	return baseWhere + " AND " + q("id") + " IN (" + cte + ")"
 }
 
-func automationScopePredicate(
+// SessionTreeMemberPredicate is the visibility every descendant in a session
+// tree view must pass: not trashed, not empty, and inside the automation
+// scope. The tree CTEs and the label and pull request ancestor walk share it
+// so both reach the same sessions.
+func SessionTreeMemberPredicate(
 	f SessionFilter, dialect QueryDialect, sessionAlias string,
 ) string {
-	col := "is_automated"
-	if sessionAlias != "" {
-		col = sessionAlias + "." + col
+	f = f.withAnnotationSelection()
+	pred := sessionAlias + ".message_count > 0 AND " + sessionAlias + ".deleted_at IS NULL"
+	if scope := dialect.AutomatedScopePredicate(NormalizeAutomatedScope(f.AutomatedScope, f.ExcludeAutomated), sessionAlias+".is_automated"); scope != "" {
+		pred += " AND " + scope
 	}
-	switch normalizeAutomatedScope(f.AutomatedScope, f.ExcludeAutomated) {
+	if f.OneShotFilterSet && f.ExcludeOneShot && f.HasAnnotationFilter() {
+		pred += " AND " + sessionAlias + ".user_message_count > 1"
+	}
+	return pred
+}
+
+// AutomatedScopePredicate renders a normalized scope against a boolean column.
+func (d QueryDialect) AutomatedScopePredicate(scope, col string) string {
+	switch scope {
 	case "human":
-		return col + " = " + dialect.falseLiteral
+		return col + " = " + d.falseLiteral
 	case "automated":
-		return col + " = " + dialect.trueLiteral
+		return col + " = " + d.trueLiteral
 	default:
 		return ""
 	}
@@ -560,7 +847,16 @@ func sessionFilterPredicates(
 	f SessionFilter, b *QueryBuilder, q func(string) string,
 ) ([]string, string) {
 	var preds []string
-	if f.Project != "" {
+	if f.IDs != nil {
+		preds = append(preds, sessionIDsPredicate(f, b, q("id")))
+	}
+	if f.SessionID != "" {
+		preds = append(preds, q("id")+" = "+b.Add(f.SessionID))
+	}
+	if f.ProjectLabels != nil {
+		preds = append(preds,
+			inPredicate(q("project"), f.ProjectLabels, b))
+	} else if f.Project != "" {
 		preds = append(preds, q("project")+" = "+b.Add(f.Project))
 	}
 	if f.ExcludeProject != "" {
@@ -576,6 +872,10 @@ func sessionFilterPredicates(
 			q("project"), q("git_branch"), f.GitBranch,
 			func(s string) string { return b.Add(s) }))
 	}
+	if f.GitBranchExact != "" {
+		preds = append(preds,
+			q("git_branch")+" = "+b.Add(f.GitBranchExact))
+	}
 	if f.Agent != "" {
 		preds = append(preds,
 			inPredicate(q("agent"), splitCSV(f.Agent), b))
@@ -590,21 +890,13 @@ func sessionFilterPredicates(
 				f.Date, f.Timezone, true,
 			)))+")")
 	}
-	if f.DateFrom != "" {
-		preds = append(preds, b.dialect.dateEndExpr(q)+" >= "+
-			b.dialect.dateParam(b.Add(sessionDateBoundary(
-				f.DateFrom, f.Timezone, false,
-			))))
-	}
-	if f.DateTo != "" {
-		preds = append(preds, b.dialect.dateStartExpr(q)+" < "+
-			b.dialect.dateParam(b.Add(sessionDateBoundary(
-				f.DateTo, f.Timezone, true,
-			))))
-	}
+	preds = append(preds, b.SessionDateRangePredicates(f.DateFrom, f.DateTo, f.Timezone, q)...)
 	if f.ActiveSince != "" {
 		preds = append(preds, b.dialect.dateEndExpr(q)+" >= "+
 			b.dialect.dateParam(b.Add(f.ActiveSince)))
+	}
+	if !f.ExcludeActiveSince.IsZero() {
+		preds = append(preds, excludeActiveSincePredicate(f.ExcludeActiveSince, b, q))
 	}
 	if f.MinMessages > 0 {
 		preds = append(preds,
@@ -648,11 +940,103 @@ func sessionFilterPredicates(
 		preds = append(preds, pred)
 	}
 	if f.Starred {
-		preds = append(preds,
-			"EXISTS (SELECT 1 FROM starred_sessions ss WHERE ss.session_id = "+
-				q("id")+")")
+		preds = append(preds, b.dialect.starredPredicateSQL(q("id")))
 	}
 	return preds, oneShotPred
+}
+
+// HasAnnotationFilter reports whether the filter selects sessions by label
+// or pull request link.
+func (f SessionFilter) HasAnnotationFilter() bool {
+	return len(f.Labels) > 0 || !f.PR.IsZero()
+}
+
+// withAnnotationSelection lifts the default one-shot and automated
+// exclusions when the filter selects by label or pull request link. Those
+// filters name the sessions the caller wants, the way explicit IDs do, and
+// sessions started by a launcher are usually headless single-prompt runs
+// that the defaults would hide. Explicit one-shot and AutomatedScope filters still apply.
+func (f SessionFilter) withAnnotationSelection() SessionFilter {
+	if f.HasAnnotationFilter() {
+		if !f.OneShotFilterSet {
+			f.ExcludeOneShot = false
+		}
+		if !f.AutomatedFilterSet {
+			f.ExcludeAutomated = false
+		}
+	}
+	return f
+}
+
+// annotationPredicates renders the label and pull request filters against
+// one session row.
+func annotationPredicates(
+	f SessionFilter, b *QueryBuilder, q func(string) string,
+) []string {
+	var preds []string
+	for _, label := range f.Labels {
+		preds = append(preds, b.dialect.labelPredicateSQL(q, b.Add(label)))
+	}
+	if !f.PR.IsZero() {
+		repoPh := ""
+		if f.PR.Repository != "" {
+			repoPh = b.Add(strings.ToLower(f.PR.Repository))
+		}
+		numPh := ""
+		if f.PR.Number > 0 {
+			numPh = b.Add(f.PR.Number)
+		}
+		hostPh := ""
+		if f.PR.Host != "" {
+			hostPh = b.Add(strings.ToLower(f.PR.Host))
+		}
+		preds = append(preds,
+			b.dialect.prLinkPredicateSQL(q("pr_links"), repoPh, numPh, hostPh))
+	}
+	return preds
+}
+
+// annotationTreePredicate keeps idExpr when it names a session that matches
+// the label and pull request filters or an ancestor of one. Tree views use
+// it on their roots, so a launcher's tree appears when only one of its
+// workers carries the label or pull request. The walk passes only sessions
+// the tree views would show, so a match hidden behind a trashed, empty, or
+// out-of-scope session keeps no root.
+func annotationTreePredicate(
+	f SessionFilter, b *QueryBuilder, idExpr string,
+) string {
+	preds := annotationPredicates(f, b, func(col string) string {
+		return "annotated_session." + col
+	})
+	if len(preds) == 0 {
+		return ""
+	}
+	return idExpr + " IN (WITH RECURSIVE annotated(id) AS (" +
+		"SELECT annotated_session.id FROM sessions annotated_session" +
+		" WHERE " + SessionTreeMemberPredicate(f, b.dialect, "annotated_session") +
+		" AND " + strings.Join(preds, " AND ") +
+		" " + b.dialect.recursiveUnionSQL() + " " +
+		"SELECT annotated_parent.id FROM sessions annotated_parent" +
+		" JOIN sessions annotated_child ON " +
+		b.dialect.ParentRelation("annotated_child", "annotated_parent") +
+		" JOIN annotated ON annotated_child.id = annotated.id" +
+		" WHERE " + SessionTreeMemberPredicate(f, b.dialect, "annotated_parent") +
+		") SELECT id FROM annotated)"
+}
+
+// ExcludeActiveSincePredicate returns a boolean expression that is true when
+// a session's last activity is at or before cutoff, or unknown.
+func (b *QueryBuilder) ExcludeActiveSincePredicate(cutoff time.Time) string {
+	return excludeActiveSincePredicate(cutoff, b, func(col string) string { return col })
+}
+
+func excludeActiveSincePredicate(cutoff time.Time, b *QueryBuilder, q func(string) string) string {
+	activity := b.activityExpr(q(""))
+	if b.dialect.name == "sqlite" || b.dialect.name == "duckdb" {
+		activity = b.dialect.dateParam(activity)
+	}
+	param := b.dialect.dateParam(b.Add(cutoff.UTC().Format(time.RFC3339Nano)))
+	return "COALESCE(" + activity + " <= " + param + ", " + b.dialect.trueLiteral + ")"
 }
 
 func appendSessionVisibilityPredicates(
@@ -661,7 +1045,7 @@ func appendSessionVisibilityPredicates(
 	b *QueryBuilder,
 	q func(string) string,
 ) ([]string, string) {
-	scope := normalizeAutomatedScope(f.AutomatedScope, f.ExcludeAutomated)
+	scope := NormalizeAutomatedScope(f.AutomatedScope, f.ExcludeAutomated)
 	oneShotPred := ""
 	if f.ExcludeOneShot {
 		pred := oneShotPredicate(f, b, q, scope)
@@ -671,13 +1055,8 @@ func appendSessionVisibilityPredicates(
 			preds = append(preds, pred)
 		}
 	}
-	switch scope {
-	case "human":
-		preds = append(preds, q("is_automated")+" = "+
-			b.dialect.falseLiteral)
-	case "automated":
-		preds = append(preds, q("is_automated")+" = "+
-			b.dialect.trueLiteral)
+	if pred := b.dialect.AutomatedScopePredicate(scope, q("is_automated")); pred != "" {
+		preds = append(preds, pred)
 	}
 	return preds, oneShotPred
 }
@@ -694,7 +1073,7 @@ func oneShotPredicate(
 	f SessionFilter, b *QueryBuilder, q func(string) string, scope string,
 ) string {
 	conds := []string{q("user_message_count") + " > 1"}
-	if scope != "human" {
+	if scope != "human" && (!f.OneShotFilterSet || !f.HasAnnotationFilter()) {
 		conds = append(conds,
 			q("is_automated")+" = "+b.dialect.trueLiteral)
 	}
@@ -723,14 +1102,26 @@ func inPredicate(col string, values []string, b *QueryBuilder) string {
 	if len(values) == 0 {
 		return "1 = 0"
 	}
+	return b.ValuesPredicate(col, values, true)
+}
+
+// ValuesPredicate renders membership and ignores empty optional filters.
+func (b *QueryBuilder) ValuesPredicate(col string, values []string, include bool) string {
+	if len(values) == 0 {
+		return ""
+	}
+	equalOp, listOp := " = ", " IN "
+	if !include {
+		equalOp, listOp = " != ", " NOT IN "
+	}
 	if len(values) == 1 {
-		return col + " = " + b.Add(values[0])
+		return col + equalOp + b.Add(values[0])
 	}
 	placeholders := make([]string, len(values))
 	for i, v := range values {
 		placeholders[i] = b.Add(v)
 	}
-	return col + " IN (" + strings.Join(placeholders, ",") + ")"
+	return col + listOp + "(" + strings.Join(placeholders, ",") + ")"
 }
 
 func splitCSV(s string) []string {
@@ -799,20 +1190,6 @@ func BranchPairPredicate(
 	return "(" + strings.Join(parts, " OR ") + ")"
 }
 
-// BranchPairClauseArgs is the raw-args ("?" placeholder) form of
-// BranchPairPredicate.
-func BranchPairClauseArgs(
-	projectCol, branchCol, tokens string, args []any,
-) (string, []any) {
-	clause := BranchPairPredicate(
-		projectCol, branchCol, tokens,
-		func(v string) string {
-			args = append(args, v)
-			return "?"
-		})
-	return clause, args
-}
-
 func nonEmpty(values []string) []string {
 	out := make([]string, 0, len(values))
 	for _, v := range values {
@@ -826,13 +1203,17 @@ func nonEmpty(values []string) []string {
 func terminationPredicate(
 	status string, b *QueryBuilder, q func(string) string,
 ) string {
+	return renderTerminationPredicate(status, b.dialect.terminationExpr, q("termination_status"), b.terminationParam)
+}
+
+func renderTerminationPredicate(status, activityExpr, statusExpr string, param func(time.Time) string) string {
 	if status == "" || status == "all" {
 		return ""
 	}
 	now := time.Now().UTC()
 	activeCutoff := now.Add(-activeWindow)
 	staleCutoff := now.Add(-staleWindow)
-	flagged := q("termination_status") +
+	flagged := statusExpr +
 		" IN ('tool_call_pending', 'truncated')"
 
 	parts := strings.Split(status, ",")
@@ -840,26 +1221,19 @@ func terminationPredicate(
 	for _, p := range parts {
 		switch strings.TrimSpace(p) {
 		case "active":
-			preds = append(preds, b.dialect.terminationExpr+" > "+
-				b.terminationParam(activeCutoff))
+			preds = append(preds, activityExpr+" > "+param(activeCutoff))
 		case "stale":
-			preds = append(preds, "("+
-				b.dialect.terminationExpr+" > "+
-				b.terminationParam(staleCutoff)+" AND "+
-				b.dialect.terminationExpr+" <= "+
-				b.terminationParam(activeCutoff)+" AND "+
-				flagged+")")
+			pred := activityExpr + " > " + param(staleCutoff) + " AND " + activityExpr + " <= " + param(activeCutoff)
+			preds = append(preds, "("+pred+" AND "+flagged+")")
 		case "unclean":
-			preds = append(preds, "("+
-				b.dialect.terminationExpr+" <= "+
-				b.terminationParam(staleCutoff)+" AND "+
-				flagged+")")
+			pred := activityExpr + " <= " + param(staleCutoff)
+			preds = append(preds, "("+pred+" AND "+flagged+")")
 		case "clean":
 			preds = append(preds,
-				q("termination_status")+" = 'clean'")
+				statusExpr+" = 'clean'")
 		case "awaiting_user":
 			preds = append(preds,
-				q("termination_status")+" = 'awaiting_user'")
+				statusExpr+" = 'awaiting_user'")
 		}
 	}
 	if len(preds) == 0 {
@@ -875,9 +1249,55 @@ func (b *QueryBuilder) terminationParam(t time.Time) string {
 	switch b.dialect.terminationKind {
 	case timestampUnixSeconds:
 		return b.Add(t.Unix())
+	case timestampTimestamptz:
+		return b.Add(t)
 	case timestampCast:
 		return b.dialect.activityParam(b.Add(t.Format(time.RFC3339)))
 	default:
 		return b.dialect.activityParam(b.Add(t))
 	}
+}
+
+// SessionDateRangePredicates matches sessions whose activity overlaps the inclusive
+// calendar-date range. Empty bounds add no restriction, as in session listing.
+func (b *QueryBuilder) SessionDateRangePredicates(dateFrom, dateTo, timezone string, q func(string) string) []string {
+	var preds []string
+	if dateFrom != "" {
+		preds = append(preds, b.dialect.dateEndExpr(q)+" >= "+
+			b.dialect.dateParam(b.Add(sessionDateBoundary(
+				dateFrom, timezone, false,
+			))))
+	}
+	if dateTo != "" {
+		preds = append(preds, b.dialect.dateStartExpr(q)+" < "+
+			b.dialect.dateParam(b.Add(sessionDateBoundary(
+				dateTo, timezone, true,
+			))))
+	}
+	return preds
+}
+
+// sessionIDsPredicate uses equality for exact IDs and literal, case-sensitive
+// tilde suffixes for raw IDs. SQL LIKE would treat ID characters as wildcards.
+func sessionIDsPredicate(f SessionFilter, b *QueryBuilder, col string) string {
+	parts := []string{inPredicate(col, f.IDs, b)}
+	if !f.IDsExact {
+		for _, id := range f.IDs {
+			if strings.Contains(id, "~") {
+				continue
+			}
+			suffix := "~" + id
+			ph := b.Add(suffix)
+			n := strconv.Itoa(utf8.RuneCountInString(suffix))
+			switch b.dialect.name {
+			case "sqlite":
+				parts = append(parts, "substr("+col+", -"+n+") = "+ph)
+			case "clickhouse":
+				parts = append(parts, "endsWith("+col+", "+ph+")")
+			default:
+				parts = append(parts, "right("+col+", "+n+") = "+ph)
+			}
+		}
+	}
+	return "(" + strings.Join(parts, " OR ") + ")"
 }

@@ -1,22 +1,36 @@
 // @vitest-environment jsdom
 import { describe, it, expect, vi, beforeEach, afterEach } from "vite-plus/test";
-import { mount, unmount, tick } from "svelte";
-import { createClassComponent } from "svelte/legacy";
+import { mount as mountComponent, unmount as unmountComponent, tick } from "svelte";
+import { createClassComponent as createLegacyComponent } from "svelte/legacy";
 // @ts-ignore
 import SessionBreadcrumb from "./SessionBreadcrumb.svelte";
-import type { Message, Session } from "../../api/types.js";
-import { OpenersService, SessionsService } from "../../api/generated/index";
+import type { Session } from "../../api/types.js";
+import {
+  OpenersService,
+  SessionsService,
+  type DbSessionTiming,
+  type SessionToolSequencesResponse,
+} from "../../api/generated/index";
+import { ApiError } from "../../api/runtime.js";
 import { messages } from "../../stores/messages.svelte.js";
+import { sessionTiming } from "../../stores/sessionTiming.svelte.js";
 import { sessions } from "../../stores/sessions.svelte.js";
 import { setLocale } from "../../i18n/index.js";
 import { router } from "../../stores/router.svelte.js";
+import { sync } from "../../stores/sync.svelte.js";
 import { ui } from "../../stores/ui.svelte.js";
 import { testMoney } from "../../test/money.js";
 import type { Money } from "../../money.js";
 import { copyToClipboard } from "../../utils/clipboard.js";
 
-const { generateForSession } = vi.hoisted(() => ({
+const { generateForSession, getTiming } = vi.hoisted(() => ({
   generateForSession: vi.fn(),
+  getTiming: vi.fn(),
+}));
+
+vi.mock("../../api/generated/sessions/sessions.js", async (importOriginal) => ({
+  ...(await importOriginal<typeof import("../../api/generated/sessions/sessions.js")>()),
+  getApiV1SessionsByIdTiming: getTiming,
 }));
 
 vi.mock("../../stores/insights.svelte.js", () => ({
@@ -44,10 +58,13 @@ vi.mock("../../api/generated/index", async (importOriginal) => {
       getApiV1Openers: vi.fn(),
     },
     SessionsService: {
-      getApiV1SessionsIdDirectory: vi.fn(),
-      getApiV1SessionsIdUsage: vi.fn(),
-      postApiV1SessionsIdResume: vi.fn(),
-      postApiV1SessionsIdOpen: vi.fn(),
+      getApiV1SessionsById: vi.fn(),
+      getApiV1SessionsByIdMessages: vi.fn(),
+      getApiV1SessionsByIdDirectory: vi.fn(),
+      getApiV1SessionsByIdUsage: vi.fn(),
+      getApiV1SessionsByIdToolSequences: vi.fn(),
+      postApiV1SessionsByIdResume: vi.fn(),
+      postApiV1SessionsByIdOpen: vi.fn(),
     },
   };
 });
@@ -57,9 +74,12 @@ const openersService = OpenersService as unknown as {
 };
 
 const sessionsService = SessionsService as unknown as {
-  getApiV1SessionsIdDirectory: ReturnType<typeof vi.fn>;
-  getApiV1SessionsIdUsage: ReturnType<typeof vi.fn>;
-  postApiV1SessionsIdResume: ReturnType<typeof vi.fn>;
+  getApiV1SessionsById: ReturnType<typeof vi.fn>;
+  getApiV1SessionsByIdMessages: ReturnType<typeof vi.fn>;
+  getApiV1SessionsByIdDirectory: ReturnType<typeof vi.fn>;
+  getApiV1SessionsByIdUsage: ReturnType<typeof vi.fn>;
+  getApiV1SessionsByIdToolSequences: ReturnType<typeof vi.fn>;
+  postApiV1SessionsByIdResume: ReturnType<typeof vi.fn>;
 };
 
 type SessionWithTokenFlags = Session & {
@@ -72,6 +92,19 @@ function makeSession(
   overrides: Partial<SessionWithTokenFlags> = {},
 ): SessionWithTokenFlags {
   return {
+    compaction_count: 0,
+    consecutive_failure_max: 0,
+    edit_churn_count: 0,
+    ended_with_role: "",
+    final_failure_streak: 0,
+    has_peak_context_tokens: false,
+    has_total_output_tokens: false,
+    mid_task_compaction_count: 0,
+    outcome: "",
+    outcome_confidence: "",
+    secret_leak_count: 0,
+    tool_failure_signal_count: 0,
+    tool_retry_count: 0,
     id: "run:123456789abcdef",
     project: "proj-a",
     machine: "mac",
@@ -142,6 +175,121 @@ function makeUsage(overrides: Partial<SessionUsage> = {}): SessionUsage {
   };
 }
 
+// Call rows render only inside an expanded sequence, so expand it before reading their text.
+async function expandedSequenceText(): Promise<string> {
+  const row = document.querySelector<HTMLButtonElement>(".tool-sequences-panel .sequence-row");
+  if (row?.getAttribute("aria-expanded") === "false") {
+    row.click();
+    await tick();
+  }
+  return document.body.textContent ?? "";
+}
+
+function makeToolSequences(
+  ordinal = 3,
+  sessionId = "run:123456789abcdef",
+  transcriptRevision = "revision-1",
+): SessionToolSequencesResponse {
+  return {
+    session_id: sessionId,
+    transcript_revision: transcriptRevision,
+    total_tool_calls: 1,
+    total_sequences: 1,
+    omitted_sequences: 0,
+    total_sequence_calls: 1,
+    omitted_calls: 0,
+    sequences: [
+      {
+        ending: "recovered",
+        identical: false,
+        near_identical: false,
+        tool_changed: false,
+        total_calls: 1,
+        omitted_calls: 0,
+        calls: [
+          {
+            ordinal,
+            call_index: 0,
+            tool_use_id: "tool-id",
+            call_fingerprint: "0000dddd",
+            tool_name: "Grep",
+            outcome: "empty",
+            repeat: "none",
+            tool_changed: false,
+            input_preview: "{}",
+            input_bytes: 2,
+            input_omitted_bytes: 0,
+            result_preview: "No matches found",
+            result_bytes: 15,
+            result_omitted_bytes: 0,
+            result_content_unknown: false,
+          },
+        ],
+      },
+    ],
+  };
+}
+
+// The timing view's snapshot, measuring the one Grep call at message 3.
+function makeTiming(sessionId: string, durationMs: number | null): DbSessionTiming {
+  return {
+    session_id: sessionId,
+    running: true,
+    turns: [
+      {
+        message_id: 3,
+        ordinal: 3,
+        started_at: "2026-02-20T12:30:30Z",
+        duration_ms: durationMs,
+        primary_category: "Grep",
+        calls: [
+          {
+            tool_use_id: "tool-id",
+            tool_name: "Grep",
+            category: "Grep",
+            duration_ms: durationMs,
+            input_preview: "",
+            is_parallel: false,
+          },
+        ],
+      },
+    ],
+  } as unknown as DbSessionTiming;
+}
+
+async function loadTiming(sessionId: string, durationMs: number | null) {
+  getTiming.mockResolvedValueOnce(makeTiming(sessionId, durationMs));
+  await sessionTiming.load(sessionId);
+}
+
+// Stand in for the message list having loaded rows from one transcript revision.
+function showMessages(sessionId: string, revision: string) {
+  messages.sessionId = sessionId;
+  messages.loadedRevision = revision;
+}
+
+function jumpLink(ordinal: number): HTMLAnchorElement | null {
+  return document.querySelector<HTMLAnchorElement>(
+    `.tool-sequences-panel a[aria-label="Message ${ordinal}: open the Grep call in the transcript"]`,
+  );
+}
+
+// Tool-sequence reads after the first wait out the panel's minimum interval.
+const SEQUENCE_READ_INTERVAL_MS = 5_000;
+
+function useSequenceClock() {
+  vi.useFakeTimers({ toFake: ["setTimeout", "clearTimeout", "Date"] });
+}
+
+async function passSequenceInterval() {
+  await vi.advanceTimersByTimeAsync(SEQUENCE_READ_INTERVAL_MS);
+  await flushPromises();
+}
+
+function panelBusy(): string | null | undefined {
+  return document.querySelector(".tool-sequences-panel")?.getAttribute("aria-busy");
+}
+
 async function openUsageBreakdown(): Promise<void> {
   const details = document.querySelector<HTMLDetailsElement>(".usage-breakdown");
   expect(details).not.toBeNull();
@@ -153,7 +301,7 @@ async function openUsageBreakdown(): Promise<void> {
   await tick();
 }
 
-function makeAssistantMessage(model: string): Message {
+function makeAssistantMessage(model: string, reasoning_effort?: string) {
   return {
     id: 1,
     session_id: "run:123456789abcdef",
@@ -166,6 +314,7 @@ function makeAssistantMessage(model: string): Message {
     has_tool_use: false,
     content_length: 2,
     model,
+    reasoning_effort,
     token_usage: null,
     context_tokens: 0,
     output_tokens: 0,
@@ -177,10 +326,12 @@ function makeAssistantMessage(model: string): Message {
 
 function deferred<T>() {
   let resolve!: (value: T | PromiseLike<T>) => void;
-  const promise = new Promise<T>((res) => {
+  let reject!: (reason?: unknown) => void;
+  const promise = new Promise<T>((res, rej) => {
     resolve = res;
+    reject = rej;
   });
-  return { promise, resolve };
+  return { promise, resolve, reject };
 }
 
 async function flushPromises() {
@@ -192,17 +343,52 @@ beforeEach(() => {
   generateForSession.mockReset();
   vi.mocked(copyToClipboard).mockReset().mockResolvedValue(true);
   openersService.getApiV1Openers.mockReset().mockResolvedValue({ openers: [] });
-  sessionsService.getApiV1SessionsIdDirectory.mockReset().mockResolvedValue({ path: "" });
-  sessionsService.getApiV1SessionsIdUsage.mockReset().mockResolvedValue(makeUsage());
-  sessionsService.postApiV1SessionsIdResume.mockReset();
+  sessionsService.getApiV1SessionsByIdDirectory.mockReset().mockResolvedValue({ path: "" });
+  sessionsService.getApiV1SessionsByIdUsage.mockReset().mockResolvedValue(makeUsage());
+  sessionsService.getApiV1SessionsByIdToolSequences
+    .mockReset()
+    .mockResolvedValue(makeToolSequences());
+  messages.clear();
+  sessionTiming.reset();
+  getTiming.mockReset();
+  sessionsService.postApiV1SessionsByIdResume.mockReset();
   sessions.activeSessionId = null;
   sessions.activeSessionUsageVersion = 0;
   sessions.childSessions = new Map();
   ui.sidebarOpen = true;
   ui.isMobileViewport = false;
+  ui.signalPanelOpen = false;
 });
 
+// A component a test leaves mounted keeps reacting to the shared stores, so each test tears down what it left.
+const live = new Map<object, () => void>();
+
+const mount: typeof mountComponent = (component, options) => {
+  const instance = mountComponent(component, options);
+  live.set(instance, () => void unmountComponent(instance));
+  return instance;
+};
+
+const unmount: typeof unmountComponent = (instance, options) => {
+  live.delete(instance);
+  return unmountComponent(instance, options);
+};
+
+const createClassComponent = ((options: Parameters<typeof createLegacyComponent>[0]) => {
+  const instance = createLegacyComponent(options);
+  const destroy = instance.$destroy.bind(instance);
+  instance.$destroy = () => {
+    live.delete(instance);
+    destroy();
+  };
+  live.set(instance, destroy);
+  return instance;
+}) as typeof createLegacyComponent;
+
 afterEach(() => {
+  vi.useRealTimers();
+  for (const teardown of live.values()) teardown();
+  live.clear();
   setLocale("en");
   document.body.innerHTML = "";
   ui.sidebarOpen = true;
@@ -222,15 +408,11 @@ describe("SessionBreadcrumb", () => {
     });
     await tick();
 
-    const controls = document.querySelector<HTMLElement>(
-      ".sidebar-controls",
-    );
+    const controls = document.querySelector<HTMLElement>(".sidebar-controls");
     const expandButton = controls?.querySelector<HTMLButtonElement>(
       'button[aria-label="Open sidebar"]',
     );
-    const filterButton = controls?.querySelector<HTMLButtonElement>(
-      ".filter-btn",
-    );
+    const filterButton = controls?.querySelector<HTMLButtonElement>(".filter-btn");
 
     expect(controls).not.toBeNull();
     expect(expandButton).not.toBeNull();
@@ -259,9 +441,7 @@ describe("SessionBreadcrumb", () => {
     await tick();
 
     expect(document.querySelector(".sidebar-controls")).toBeNull();
-    expect(
-      document.querySelector('button[aria-label="Open sidebar"]'),
-    ).toBeNull();
+    expect(document.querySelector('button[aria-label="Open sidebar"]')).toBeNull();
 
     await unmount(component);
   });
@@ -278,7 +458,7 @@ describe("SessionBreadcrumb", () => {
         },
       ],
     });
-    sessionsService.getApiV1SessionsIdDirectory.mockResolvedValue({
+    sessionsService.getApiV1SessionsByIdDirectory.mockResolvedValue({
       path: "/tmp/project",
     });
 
@@ -331,9 +511,28 @@ describe("SessionBreadcrumb", () => {
     unmount(component);
   });
 
+  it("renders the recorded effort beside the model", async () => {
+    sessionsService.getApiV1SessionsByIdUsage.mockResolvedValue(makeUsage());
+    messages.sessionId = "run:123456789abcdef";
+    messages.messages = [makeAssistantMessage("model-test", "high")];
+
+    const component = mount(SessionBreadcrumb, {
+      target: document.body,
+      props: {
+        session: makeSession("claude"),
+        onBack: () => {},
+      },
+    });
+
+    await vi.waitFor(() => {
+      expect(document.querySelector(".model-badge")?.textContent?.trim()).toBe("model-test high");
+    });
+    unmount(component);
+  });
+
   it("shows clipboard failures as errors when copying the directory path", async () => {
     vi.mocked(copyToClipboard).mockResolvedValue(false);
-    sessionsService.getApiV1SessionsIdDirectory.mockResolvedValue({
+    sessionsService.getApiV1SessionsByIdDirectory.mockResolvedValue({
       path: "/tmp/project",
     });
 
@@ -349,9 +548,14 @@ describe("SessionBreadcrumb", () => {
 
     await vi.waitFor(() => {
       expect(document.querySelector(".resume-btn")).toBeTruthy();
+      expect(sessionsService.getApiV1SessionsByIdDirectory).toHaveBeenCalled();
     });
+    await flushPromises();
     document.querySelector<HTMLButtonElement>(".resume-btn")?.click();
     await tick();
+    await vi.waitFor(() => {
+      expect(document.querySelector('[data-testid="claude-code-link"]')).toBeTruthy();
+    });
 
     const copyPathButton = Array.from(
       document.querySelectorAll<HTMLButtonElement>(".open-menu-item"),
@@ -372,7 +576,7 @@ describe("SessionBreadcrumb", () => {
   });
 
   it("keeps whole-session resume request bodies unchanged", async () => {
-    sessionsService.postApiV1SessionsIdResume.mockResolvedValue({
+    sessionsService.postApiV1SessionsByIdResume.mockResolvedValue({
       launched: false,
       command: "claude --resume run:123456789abcdef",
       cwd: "/tmp/project",
@@ -402,10 +606,10 @@ describe("SessionBreadcrumb", () => {
     await Promise.resolve();
     await tick();
 
-    expect(sessionsService.postApiV1SessionsIdResume).toHaveBeenCalledWith({
-      id: "run:123456789abcdef",
-      requestBody: {},
-    });
+    expect(sessionsService.postApiV1SessionsByIdResume).toHaveBeenCalledWith(
+      { id: "run:123456789abcdef" },
+      {},
+    );
 
     unmount(component);
   });
@@ -415,7 +619,7 @@ describe("SessionBreadcrumb", () => {
     messages.sessionId = "run:123456789abcdef";
     messages.messages = [makeAssistantMessage("claude sonnet")];
     messages.historyComplete = true;
-    sessionsService.postApiV1SessionsIdResume.mockResolvedValue({
+    sessionsService.postApiV1SessionsByIdResume.mockResolvedValue({
       launched: false,
       command: "claude --resume run:123456789abcdef",
       cwd: "/tmp/project",
@@ -451,7 +655,7 @@ describe("SessionBreadcrumb", () => {
     messages.sessionId = "run:123456789abcdef";
     messages.messages = [makeAssistantMessage("claude sonnet")];
     messages.historyComplete = true;
-    sessionsService.postApiV1SessionsIdResume.mockRejectedValue(new Error("backend unavailable"));
+    sessionsService.postApiV1SessionsByIdResume.mockRejectedValue(new Error("backend unavailable"));
 
     const component = mount(SessionBreadcrumb, {
       target: document.body,
@@ -484,7 +688,7 @@ describe("SessionBreadcrumb", () => {
     messages.messages = [makeAssistantMessage("claude sonnet")];
     messages.historyComplete = false;
     messages.hasOlder = true;
-    sessionsService.postApiV1SessionsIdResume.mockRejectedValue(new Error("backend unavailable"));
+    sessionsService.postApiV1SessionsByIdResume.mockRejectedValue(new Error("backend unavailable"));
 
     const component = mount(SessionBreadcrumb, {
       target: document.body,
@@ -512,15 +716,23 @@ describe("SessionBreadcrumb", () => {
 
   it("does not pin a reloading stable model in the resume fallback", async () => {
     vi.mocked(copyToClipboard).mockClear();
-    messages.sessionId = "run:123456789abcdef";
+    const session = makeSession("claude", { message_count: 1 });
+    vi.mocked(SessionsService.getApiV1SessionsById, { partial: true }).mockResolvedValueOnce({
+      id: session.id,
+      message_count: session.message_count,
+    });
+    vi.mocked(SessionsService.getApiV1SessionsByIdMessages).mockResolvedValueOnce({
+      messages: [makeAssistantMessage("claude sonnet")],
+      count: 1,
+    });
+    await messages.loadSession(session.id);
     messages.loading = true;
-    (messages as any)._stableMainModel = "claude sonnet";
-    sessionsService.postApiV1SessionsIdResume.mockRejectedValue(new Error("backend unavailable"));
+    sessionsService.postApiV1SessionsByIdResume.mockRejectedValue(new Error("backend unavailable"));
 
     const component = mount(SessionBreadcrumb, {
       target: document.body,
       props: {
-        session: makeSession("claude", { message_count: 3001 }),
+        session,
         onBack: () => {},
       },
     });
@@ -556,7 +768,7 @@ describe("SessionBreadcrumb", () => {
         },
       ],
     });
-    sessionsService.postApiV1SessionsIdResume.mockRejectedValue(new Error("backend unavailable"));
+    sessionsService.postApiV1SessionsByIdResume.mockRejectedValue(new Error("backend unavailable"));
 
     const component = mount(SessionBreadcrumb, {
       target: document.body,
@@ -576,9 +788,9 @@ describe("SessionBreadcrumb", () => {
       ).find((button) => button.textContent?.includes("Test Terminal"));
       expect(opener).toBeTruthy();
     });
-    const opener = Array.from(
-      document.querySelectorAll<HTMLButtonElement>(".open-menu-item"),
-    ).find((button) => button.textContent?.includes("Test Terminal"));
+    const opener = Array.from(document.querySelectorAll<HTMLButtonElement>(".open-menu-item")).find(
+      (button) => button.textContent?.includes("Test Terminal"),
+    );
     opener!.click();
     await vi.waitFor(() => {
       expect(copyToClipboard).toHaveBeenCalledWith(
@@ -604,7 +816,7 @@ describe("SessionBreadcrumb", () => {
         },
       ],
     });
-    sessionsService.postApiV1SessionsIdResume.mockResolvedValue({
+    sessionsService.postApiV1SessionsByIdResume.mockResolvedValue({
       launched: false,
       command: "claude --resume run:123456789abcdef",
       cwd: "/tmp/project",
@@ -618,7 +830,10 @@ describe("SessionBreadcrumb", () => {
       },
     });
 
-    await tick();
+    await vi.waitFor(() => {
+      expect(openersService.getApiV1Openers).toHaveBeenCalled();
+    });
+    await flushPromises();
     document.querySelector<HTMLButtonElement>(".resume-btn")?.click();
     await tick();
     const opener = Array.from(document.querySelectorAll<HTMLButtonElement>(".open-menu-item")).find(
@@ -638,7 +853,7 @@ describe("SessionBreadcrumb", () => {
     messages.sessionId = "run:123456789abcdef";
     messages.messages = [makeAssistantMessage("claude sonnet")];
     messages.historyComplete = true;
-    sessionsService.postApiV1SessionsIdResume.mockRejectedValue(new Error("backend unavailable"));
+    sessionsService.postApiV1SessionsByIdResume.mockRejectedValue(new Error("backend unavailable"));
 
     const component = mount(SessionBreadcrumb, {
       target: document.body,
@@ -669,7 +884,7 @@ describe("SessionBreadcrumb", () => {
     vi.mocked(copyToClipboard).mockClear();
     messages.sessionId = "run:123456789abcdef";
     messages.messages = [makeAssistantMessage("claude sonnet")];
-    sessionsService.postApiV1SessionsIdResume.mockResolvedValue({
+    sessionsService.postApiV1SessionsByIdResume.mockResolvedValue({
       launched: false,
       command: "claude --resume run:123456789abcdef",
       cwd: "/tmp/project",
@@ -746,7 +961,7 @@ describe("SessionBreadcrumb", () => {
   });
 
   it("offers a Claude Code deep link using the session directory", async () => {
-    sessionsService.getApiV1SessionsIdDirectory.mockResolvedValue({
+    sessionsService.getApiV1SessionsByIdDirectory.mockResolvedValue({
       path: "/tmp/claude project",
     });
 
@@ -775,9 +990,7 @@ describe("SessionBreadcrumb", () => {
 
   it("keeps the directory read across same-session metadata refreshes", async () => {
     const directory = deferred<{ path: string }>();
-    sessionsService.getApiV1SessionsIdDirectory.mockReturnValue(
-      directory.promise,
-    );
+    sessionsService.getApiV1SessionsByIdDirectory.mockReturnValue(directory.promise);
 
     const component = createClassComponent({
       component: SessionBreadcrumb,
@@ -798,9 +1011,7 @@ describe("SessionBreadcrumb", () => {
     });
     await flushPromises();
 
-    expect(
-      sessionsService.getApiV1SessionsIdDirectory,
-    ).toHaveBeenCalledOnce();
+    expect(sessionsService.getApiV1SessionsByIdDirectory).toHaveBeenCalledOnce();
 
     directory.resolve({ path: "/tmp/refreshed-session" });
     await flushPromises();
@@ -850,9 +1061,7 @@ describe("SessionBreadcrumb", () => {
     await tick();
     const badges = Array.from(document.querySelectorAll(".agent-badge"));
     expect(badges[0]?.textContent?.trim()).toBe("triage");
-    expect(
-      document.querySelector(".entrypoint-badge")?.textContent?.trim(),
-    ).toBe("sdk-cli");
+    expect(document.querySelector(".entrypoint-badge")?.textContent?.trim()).toBe("sdk-cli");
 
     unmount(component);
   });
@@ -967,6 +1176,56 @@ describe("SessionBreadcrumb", () => {
     });
 
     navigateSpy.mockRestore();
+    unmount(component);
+  });
+
+  it("starts a tool-effectiveness report from the session actions menu", async () => {
+    const navigateSpy = vi.spyOn(router, "navigate");
+    const session = makeSession("claude");
+    const component = mount(SessionBreadcrumb, {
+      target: document.body,
+      props: { session, onBack: () => {} },
+    });
+
+    await tick();
+    document.querySelector<HTMLButtonElement>(".actions-btn")!.click();
+    await tick();
+    const item = [...document.querySelectorAll<HTMLButtonElement>(".actions-menu-item")].find(
+      (button) => button.textContent?.trim() === "Analyze tool effectiveness",
+    );
+    expect(item).toBeTruthy();
+    item!.click();
+    await tick();
+
+    expect(generateForSession).toHaveBeenCalledWith(session, "tool_effectiveness");
+    expect(navigateSpy).toHaveBeenCalledWith("recall", { tab: "generated" });
+    expect(document.querySelector(".actions-menu")).toBeNull();
+
+    navigateSpy.mockRestore();
+    unmount(component);
+  });
+
+  it("leaves tool-effectiveness out of the menu when the server can't generate insights", async () => {
+    const previous = sync.serverVersion;
+    sync.serverVersion = {
+      ...previous,
+      insight_generation_available: false,
+    } as typeof sync.serverVersion;
+    const component = mount(SessionBreadcrumb, {
+      target: document.body,
+      props: { session: makeSession("claude"), onBack: () => {} },
+    });
+
+    await tick();
+    document.querySelector<HTMLButtonElement>(".actions-btn")!.click();
+    await tick();
+    const labels = [...document.querySelectorAll(".actions-menu-item")].map((b) =>
+      b.textContent?.trim(),
+    );
+    expect(labels).not.toContain("Analyze tool effectiveness");
+    expect(labels.length).toBeGreaterThan(0);
+
+    sync.serverVersion = previous;
     unmount(component);
   });
 
@@ -1204,26 +1463,160 @@ describe("SessionBreadcrumb", () => {
     });
   });
 
-  it("hides local-only actions for remote sessions", async () => {
+  it.each([false, true])(
+    "copies remote commands with fallback=%s and excludes local actions",
+    async (fallback) => {
+      const resume = vi.mocked(SessionsService.postApiV1SessionsByIdResume);
+      const command = "cd '/home/user/project' && claude --resume abc-123";
+      if (fallback) resume.mockRejectedValueOnce(new Error("offline"));
+      else resume.mockResolvedValueOnce({ launched: false, command, cwd: "/home/user/project" });
+      openersService.getApiV1Openers.mockResolvedValue({
+        openers: [
+          { id: "kitty", name: "Kitty", kind: "terminal", bin: "kitty" },
+          { id: "code", name: "VS Code", kind: "editor", bin: "code" },
+          { id: "finder", name: "Finder", kind: "files", bin: "open" },
+          { id: "claude-desktop", name: "Claude Desktop", kind: "action", bin: "open" },
+        ],
+      });
+      const component = mount(SessionBreadcrumb, {
+        target: document.body,
+        props: {
+          session: makeSession("claude", {
+            id: "devbox1~claude:abc-123",
+            machine: "devbox1",
+            file_path: "/remote/session.jsonl",
+          }),
+          onBack: () => {},
+        },
+      });
+
+      try {
+        await flushPromises();
+        const trigger = document.querySelector<HTMLButtonElement>(".resume-btn");
+        expect(trigger).not.toBeNull();
+        trigger!.click();
+        await tick();
+        expect(
+          Array.from(document.querySelectorAll(".open-menu-name"), (el) => el.textContent),
+        ).toEqual(["Copy command"]);
+        expect(document.querySelector(".open-menu-divider")).toBeNull();
+        document.dispatchEvent(new KeyboardEvent("keydown", { key: "1" }));
+        await tick();
+        expect(resume).not.toHaveBeenCalled();
+        document.querySelector<HTMLButtonElement>(".open-menu-item")!.click();
+        await vi.waitFor(() =>
+          expect(copyToClipboard).toHaveBeenCalledWith(
+            fallback ? "claude --resume abc-123" : command,
+          ),
+        );
+        expect(resume).toHaveBeenCalledExactlyOnceWith(
+          { id: "devbox1~claude:abc-123" },
+          { command_only: true },
+        );
+        expect(SessionsService.postApiV1SessionsByIdOpen).not.toHaveBeenCalled();
+        expect(trigger!.textContent).toContain("Command copied!");
+      } finally {
+        await unmount(component);
+      }
+    },
+  );
+
+  it("hides the remote menu for unsupported agents", async () => {
+    const component = mount(SessionBreadcrumb, {
+      target: document.body,
+      props: { session: makeSession("unknown", { id: "devbox1~unsupported" }), onBack: () => {} },
+    });
+    await flushPromises();
+    expect(document.querySelector(".resume-btn")).toBeNull();
+    await unmount(component);
+  });
+
+  it("copies remote Kiro commands", async () => {
+    const resume = vi.mocked(SessionsService.postApiV1SessionsByIdResume);
+    resume.mockResolvedValueOnce({
+      launched: false,
+      command: "cd '/home/user/project' && kiro-cli chat --resume-id session-1",
+      cwd: "/home/user/project",
+    });
     const component = mount(SessionBreadcrumb, {
       target: document.body,
       props: {
-        session: makeSession("claude", {
-          id: "devbox1~abc-123",
+        session: makeSession("kiro", {
+          id: "devbox1~kiro:session-1",
           machine: "devbox1",
         }),
         onBack: () => {},
       },
     });
+    try {
+      await flushPromises();
+      document.querySelector<HTMLButtonElement>(".resume-btn")!.click();
+      await tick();
+      document.querySelector<HTMLButtonElement>(".open-menu-item")!.click();
+      await vi.waitFor(() =>
+        expect(copyToClipboard).toHaveBeenCalledWith(
+          "cd '/home/user/project' && kiro-cli chat --resume-id session-1",
+        ),
+      );
+      expect(resume).toHaveBeenCalledExactlyOnceWith(
+        {
+          id: "devbox1~kiro:session-1",
+        },
+        { command_only: true },
+      );
+    } finally {
+      await unmount(component);
+    }
+  });
 
-    await tick();
-
-    // The dropdown trigger (.resume-btn) should not appear
-    // for remote sessions (no resume, no copy-dir, no open-in).
-    const resumeBtn = document.querySelector(".resume-btn");
-    expect(resumeBtn).toBeNull();
-
-    unmount(component);
+  it("keeps local launch and file actions with remote-looking machine metadata", async () => {
+    openersService.getApiV1Openers.mockResolvedValue({
+      openers: [
+        { id: "kitty", name: "Kitty", kind: "terminal", bin: "kitty" },
+        { id: "code", name: "VS Code", kind: "editor", bin: "code" },
+        { id: "finder", name: "Finder", kind: "files", bin: "open" },
+        { id: "claude-desktop", name: "Claude Desktop", kind: "action", bin: "open" },
+      ],
+    });
+    vi.mocked(SessionsService.postApiV1SessionsByIdResume).mockResolvedValueOnce({
+      launched: true,
+      command: "claude --resume abc-123",
+    });
+    const component = mount(SessionBreadcrumb, {
+      target: document.body,
+      props: {
+        session: makeSession("claude", { id: "claude:abc-123", machine: "devbox1~remote" }),
+        onBack: () => {},
+      },
+    });
+    try {
+      await flushPromises();
+      document.querySelector<HTMLButtonElement>(".resume-btn")!.click();
+      await tick();
+      expect(
+        Array.from(document.querySelectorAll(".open-menu-name"), (el) => el.textContent),
+      ).toEqual([
+        "Kitty",
+        "Default terminal",
+        "Open in Claude Code",
+        "Copy command",
+        "Copy directory path",
+        "VS Code",
+        "Finder",
+        "Claude Desktop",
+      ]);
+      document.dispatchEvent(new KeyboardEvent("keydown", { key: "1" }));
+      await vi.waitFor(() =>
+        expect(SessionsService.postApiV1SessionsByIdResume).toHaveBeenCalledExactlyOnceWith(
+          {
+            id: "claude:abc-123",
+          },
+          { opener_id: "kitty" },
+        ),
+      );
+    } finally {
+      await unmount(component);
+    }
   });
 
   describe("cost badge", () => {
@@ -1233,7 +1626,7 @@ describe("SessionBreadcrumb", () => {
     });
 
     it("renders the session cost when usage reports a priced cost", async () => {
-      sessionsService.getApiV1SessionsIdUsage.mockResolvedValue(
+      sessionsService.getApiV1SessionsByIdUsage.mockResolvedValue(
         makeUsage({ has_cost: true, cost: testMoney(1.234) }),
       );
 
@@ -1254,7 +1647,7 @@ describe("SessionBreadcrumb", () => {
     });
 
     it("renders a total badge for a complete subagent rollup", async () => {
-      sessionsService.getApiV1SessionsIdUsage.mockResolvedValue(
+      sessionsService.getApiV1SessionsByIdUsage.mockResolvedValue(
         makeUsage({
           has_cost: true,
           cost: testMoney(1),
@@ -1276,15 +1669,15 @@ describe("SessionBreadcrumb", () => {
         "Total cost including 2 subagents",
       );
       expect(document.querySelector(".cost-badge")?.textContent).toContain("Total");
-      expect(sessionsService.getApiV1SessionsIdUsage).toHaveBeenCalledWith({
-        id: "run:123456789abcdef",
-        rollup: true,
-      });
+      expect(sessionsService.getApiV1SessionsByIdUsage.mock.lastCall?.slice(0, 2)).toEqual([
+        { id: "run:123456789abcdef" },
+        { rollup: true },
+      ]);
       unmount(component);
     });
 
     it("keeps the root cost when the rollup is incomplete", async () => {
-      sessionsService.getApiV1SessionsIdUsage.mockResolvedValue(
+      sessionsService.getApiV1SessionsByIdUsage.mockResolvedValue(
         makeUsage({
           has_cost: true,
           cost: testMoney(1),
@@ -1306,7 +1699,7 @@ describe("SessionBreadcrumb", () => {
     });
 
     it("renders the cost badge between the token badges and the model badge", async () => {
-      sessionsService.getApiV1SessionsIdUsage.mockResolvedValue(
+      sessionsService.getApiV1SessionsByIdUsage.mockResolvedValue(
         makeUsage({ has_cost: true, cost: testMoney(4.12) }),
       );
       messages.sessionId = "run:123456789abcdef";
@@ -1350,7 +1743,7 @@ describe("SessionBreadcrumb", () => {
     });
 
     it("renders no cost badge when the session has no priced cost", async () => {
-      sessionsService.getApiV1SessionsIdUsage.mockResolvedValue(
+      sessionsService.getApiV1SessionsByIdUsage.mockResolvedValue(
         makeUsage({ has_cost: false, cost: testMoney(0) }),
       );
 
@@ -1364,7 +1757,7 @@ describe("SessionBreadcrumb", () => {
 
       await flushPromises();
       await vi.waitFor(() => {
-        expect(sessionsService.getApiV1SessionsIdUsage).toHaveBeenCalled();
+        expect(sessionsService.getApiV1SessionsByIdUsage).toHaveBeenCalled();
       });
       await flushPromises();
       expect(document.querySelector(".cost-badge")).toBeNull();
@@ -1373,7 +1766,7 @@ describe("SessionBreadcrumb", () => {
     });
 
     it("renders no cost badge when the usage request fails", async () => {
-      sessionsService.getApiV1SessionsIdUsage.mockRejectedValue(new Error("boom"));
+      sessionsService.getApiV1SessionsByIdUsage.mockRejectedValue(new Error("boom"));
 
       const component = mount(SessionBreadcrumb, {
         target: document.body,
@@ -1385,7 +1778,7 @@ describe("SessionBreadcrumb", () => {
 
       await flushPromises();
       await vi.waitFor(() => {
-        expect(sessionsService.getApiV1SessionsIdUsage).toHaveBeenCalled();
+        expect(sessionsService.getApiV1SessionsByIdUsage).toHaveBeenCalled();
       });
       await flushPromises();
       expect(document.querySelector(".cost-badge")).toBeNull();
@@ -1423,8 +1816,8 @@ describe("SessionBreadcrumb", () => {
           has_cost: true,
         },
       ];
-      sessionsService.getApiV1SessionsIdUsage.mockImplementation(
-        ({ breakdown }: { id: string; breakdown?: boolean }) =>
+      sessionsService.getApiV1SessionsByIdUsage.mockImplementation(
+        (_path: { id: string }, { breakdown }: { breakdown?: boolean }) =>
           Promise.resolve(
             makeUsage({
               has_cost: true,
@@ -1454,17 +1847,17 @@ describe("SessionBreadcrumb", () => {
         );
       });
       expect(document.querySelectorAll(".usage-breakdown-row")).toHaveLength(0);
-      expect(sessionsService.getApiV1SessionsIdUsage).toHaveBeenCalledTimes(1);
-      expect(sessionsService.getApiV1SessionsIdUsage).toHaveBeenCalledWith({
-        id: "run:123456789abcdef",
-        rollup: true,
-      });
+      expect(sessionsService.getApiV1SessionsByIdUsage).toHaveBeenCalledTimes(1);
+      expect(sessionsService.getApiV1SessionsByIdUsage.mock.calls[0]?.slice(0, 2)).toEqual([
+        { id: "run:123456789abcdef" },
+        { rollup: true },
+      ]);
 
       await openUsageBreakdown();
-      expect(sessionsService.getApiV1SessionsIdUsage).toHaveBeenCalledWith({
-        id: "run:123456789abcdef",
-        breakdown: true,
-      });
+      expect(sessionsService.getApiV1SessionsByIdUsage.mock.lastCall?.slice(0, 2)).toEqual([
+        { id: "run:123456789abcdef" },
+        { breakdown: true },
+      ]);
       const renderedRows = Array.from(document.querySelectorAll(".usage-breakdown-row"));
       expect(renderedRows).toHaveLength(2);
       const first = renderedRows[0]!;
@@ -1480,7 +1873,9 @@ describe("SessionBreadcrumb", () => {
     });
 
     it("renders no usage breakdown when the usage response counts no rows", async () => {
-      sessionsService.getApiV1SessionsIdUsage.mockResolvedValue(makeUsage({ breakdown_count: 0 }));
+      sessionsService.getApiV1SessionsByIdUsage.mockResolvedValue(
+        makeUsage({ breakdown_count: 0 }),
+      );
 
       const component = mount(SessionBreadcrumb, {
         target: document.body,
@@ -1492,7 +1887,7 @@ describe("SessionBreadcrumb", () => {
 
       await flushPromises();
       await vi.waitFor(() => {
-        expect(sessionsService.getApiV1SessionsIdUsage).toHaveBeenCalled();
+        expect(sessionsService.getApiV1SessionsByIdUsage).toHaveBeenCalled();
       });
       expect(document.querySelector(".usage-breakdown")).toBeNull();
 
@@ -1500,8 +1895,8 @@ describe("SessionBreadcrumb", () => {
     });
 
     it("renders every breakdown row in the scrollable menu", async () => {
-      sessionsService.getApiV1SessionsIdUsage.mockImplementation(
-        ({ breakdown }: { id: string; breakdown?: boolean }) =>
+      sessionsService.getApiV1SessionsByIdUsage.mockImplementation(
+        (_path: { id: string }, { breakdown }: { breakdown?: boolean }) =>
           Promise.resolve(
             makeUsage({
               breakdown_count: 8,
@@ -1545,8 +1940,8 @@ describe("SessionBreadcrumb", () => {
 
     it("shows a loading placeholder until breakdown rows arrive", async () => {
       const rowsFetch = deferred<SessionUsage>();
-      sessionsService.getApiV1SessionsIdUsage.mockImplementation(
-        ({ breakdown }: { id: string; breakdown?: boolean }) =>
+      sessionsService.getApiV1SessionsByIdUsage.mockImplementation(
+        (_path: { id: string }, { breakdown }: { breakdown?: boolean }) =>
           breakdown ? rowsFetch.promise : Promise.resolve(makeUsage({ breakdown_count: 1 })),
       );
 
@@ -1597,8 +1992,8 @@ describe("SessionBreadcrumb", () => {
     });
 
     it("shows a failure placeholder when the breakdown fetch fails", async () => {
-      sessionsService.getApiV1SessionsIdUsage.mockImplementation(
-        ({ breakdown }: { id: string; breakdown?: boolean }) =>
+      sessionsService.getApiV1SessionsByIdUsage.mockImplementation(
+        (_path: { id: string }, { breakdown }: { breakdown?: boolean }) =>
           breakdown
             ? Promise.reject(new Error("boom"))
             : Promise.resolve(makeUsage({ breakdown_count: 3 })),
@@ -1626,8 +2021,8 @@ describe("SessionBreadcrumb", () => {
 
     it("ignores a stale usage response after switching sessions", async () => {
       const first = deferred<SessionUsage>();
-      sessionsService.getApiV1SessionsIdUsage.mockImplementation(
-        ({ id, breakdown }: { id: string; breakdown?: boolean }) => {
+      sessionsService.getApiV1SessionsByIdUsage.mockImplementation(
+        ({ id }: { id: string }, { breakdown }: { breakdown?: boolean }) => {
           if (id === "run:aaa") return first.promise;
           return Promise.resolve(
             makeUsage({
@@ -1698,7 +2093,7 @@ describe("SessionBreadcrumb", () => {
     });
 
     it("refetches when a resync changes context tokens without output movement", async () => {
-      sessionsService.getApiV1SessionsIdUsage
+      sessionsService.getApiV1SessionsByIdUsage
         .mockResolvedValueOnce(makeUsage({ has_cost: true, cost: testMoney(1) }))
         .mockResolvedValueOnce(makeUsage({ has_cost: true, cost: testMoney(1.75) }));
 
@@ -1724,7 +2119,7 @@ describe("SessionBreadcrumb", () => {
         const badge = document.querySelector(".cost-badge");
         expect(badge?.textContent?.trim()).toBe("$1.75");
       });
-      expect(sessionsService.getApiV1SessionsIdUsage).toHaveBeenCalledTimes(2);
+      expect(sessionsService.getApiV1SessionsByIdUsage).toHaveBeenCalledTimes(2);
 
       component.$destroy();
     });
@@ -1732,7 +2127,7 @@ describe("SessionBreadcrumb", () => {
     it("refetches on return navigation and rejects the other session's late response", async () => {
       const bRequest = deferred<SessionUsage>();
       const aRefetch = deferred<SessionUsage>();
-      sessionsService.getApiV1SessionsIdUsage
+      sessionsService.getApiV1SessionsByIdUsage
         .mockResolvedValueOnce(
           makeUsage({
             session_id: "run:aaa",
@@ -1766,7 +2161,7 @@ describe("SessionBreadcrumb", () => {
         session: makeSession("claude", { id: "run:aaa" }),
       });
       await flushPromises();
-      expect(sessionsService.getApiV1SessionsIdUsage).toHaveBeenCalledTimes(3);
+      expect(sessionsService.getApiV1SessionsByIdUsage).toHaveBeenCalledTimes(3);
 
       // B's late response must not be shown on A.
       bRequest.resolve(
@@ -1798,7 +2193,7 @@ describe("SessionBreadcrumb", () => {
     it("keeps the newer cost when same-session responses resolve out of order", async () => {
       const first = deferred<SessionUsage>();
       const second = deferred<SessionUsage>();
-      sessionsService.getApiV1SessionsIdUsage
+      sessionsService.getApiV1SessionsByIdUsage
         .mockReturnValueOnce(first.promise)
         .mockReturnValueOnce(second.promise);
 
@@ -1818,7 +2213,7 @@ describe("SessionBreadcrumb", () => {
         session: makeSession("claude", { message_count: 3 }),
       });
       await flushPromises();
-      expect(sessionsService.getApiV1SessionsIdUsage).toHaveBeenCalledTimes(2);
+      expect(sessionsService.getApiV1SessionsByIdUsage).toHaveBeenCalledTimes(2);
 
       second.resolve(makeUsage({ has_cost: true, cost: testMoney(3.5) }));
       await vi.waitFor(() => {
@@ -1834,7 +2229,7 @@ describe("SessionBreadcrumb", () => {
     });
 
     it("refetches rollup cost when active session usage freshness changes", async () => {
-      sessionsService.getApiV1SessionsIdUsage
+      sessionsService.getApiV1SessionsByIdUsage
         .mockResolvedValueOnce(
           makeUsage({
             has_cost: true,
@@ -1875,13 +2270,13 @@ describe("SessionBreadcrumb", () => {
       await vi.waitFor(() => {
         expect(document.querySelector(".cost-badge")?.textContent).toContain("$5.00");
       });
-      expect(sessionsService.getApiV1SessionsIdUsage).toHaveBeenCalledTimes(2);
+      expect(sessionsService.getApiV1SessionsByIdUsage).toHaveBeenCalledTimes(2);
 
       component.$destroy();
     });
 
     it("uses singular total-cost copy for one subagent", async () => {
-      sessionsService.getApiV1SessionsIdUsage.mockResolvedValue(
+      sessionsService.getApiV1SessionsByIdUsage.mockResolvedValue(
         makeUsage({
           has_cost: true,
           cost: testMoney(1),
@@ -1903,6 +2298,368 @@ describe("SessionBreadcrumb", () => {
       });
 
       unmount(component);
+    });
+
+    it("loads tool sequences only while visible and skips usage-only refreshes", async () => {
+      const session = makeSession("claude", { termination_status: "clean" });
+      showMessages(session.id, "revision-1");
+      const component = createClassComponent({
+        component: SessionBreadcrumb,
+        target: document.body,
+        props: { session, onBack: () => {} },
+      });
+      await flushPromises();
+      expect(sessionsService.getApiV1SessionsByIdToolSequences).not.toHaveBeenCalled();
+
+      ui.signalPanelOpen = true;
+      await vi.waitFor(async () => {
+        expect(await expandedSequenceText()).toContain("Message 3");
+        expect(panelBusy()).toBe("false");
+      });
+      expect(sessionsService.getApiV1SessionsByIdToolSequences).toHaveBeenCalledTimes(1);
+
+      // Other sessions changing, or this session's metadata moving ahead, says nothing new about the loaded transcript.
+      sessions.activeSessionUsageVersion += 1;
+      component.$set({ session: { ...session, transcript_revision: "revision-2" } });
+      await flushPromises();
+      expect(sessionsService.getApiV1SessionsByIdToolSequences).toHaveBeenCalledTimes(1);
+      component.$destroy();
+    });
+
+    it("takes durations from live timing and follows a running child with no parent change", async () => {
+      const session = makeSession("claude", { termination_status: "tool_call_pending" });
+      showMessages(session.id, "revision-1");
+      await loadTiming(session.id, 1000);
+      ui.signalPanelOpen = true;
+      const component = createClassComponent({
+        component: SessionBreadcrumb,
+        target: document.body,
+        props: { session, onBack: () => {} },
+      });
+      await vi.waitFor(async () => expect(await expandedSequenceText()).toContain("1.0s"));
+
+      // The delegated call's child keeps running: its end time advances while the parent transcript stays put.
+      sessionTiming.applyEvent(makeTiming(session.id, 4000));
+      await tick();
+      expect(document.body.textContent).toContain("4.0s");
+      expect(document.body.textContent).not.toContain("1.0s");
+      expect(sessionsService.getApiV1SessionsByIdToolSequences).toHaveBeenCalledTimes(1);
+      component.$destroy();
+    });
+
+    it("refetches when the loaded message revision or the end state changes, at most once per interval", async () => {
+      useSequenceClock();
+      const session = makeSession("claude", { termination_status: "tool_call_pending" });
+      showMessages(session.id, "revision-1");
+      sessionsService.getApiV1SessionsByIdToolSequences
+        .mockResolvedValueOnce(makeToolSequences(3, session.id, "revision-1"))
+        .mockResolvedValueOnce(makeToolSequences(5, session.id, "revision-2"))
+        .mockResolvedValueOnce(makeToolSequences(6, session.id, "revision-2"));
+      ui.signalPanelOpen = true;
+      const component = createClassComponent({
+        component: SessionBreadcrumb,
+        target: document.body,
+        props: { session, onBack: () => {} },
+      });
+      await vi.waitFor(async () => {
+        await expandedSequenceText();
+        expect(jumpLink(3)).not.toBeNull();
+      });
+
+      // A new message lands right after the first read, so the next read waits out the interval.
+      messages.loadedRevision = "revision-2";
+      await flushPromises();
+      await vi.advanceTimersByTimeAsync(SEQUENCE_READ_INTERVAL_MS / 2);
+      expect(sessionsService.getApiV1SessionsByIdToolSequences).toHaveBeenCalledTimes(1);
+      expect(jumpLink(3)).not.toBeNull();
+      await passSequenceInterval();
+      expect(sessionsService.getApiV1SessionsByIdToolSequences).toHaveBeenCalledTimes(2);
+      await vi.waitFor(async () => {
+        await expandedSequenceText();
+        expect(jumpLink(5)).not.toBeNull();
+      });
+
+      component.$set({ session: { ...session, termination_status: "clean" } });
+      await passSequenceInterval();
+      await vi.waitFor(async () => {
+        await expandedSequenceText();
+        expect(jumpLink(6)).not.toBeNull();
+      });
+      expect(sessionsService.getApiV1SessionsByIdToolSequences).toHaveBeenCalledTimes(3);
+      component.$destroy();
+    });
+
+    it("keeps an expanded sequence and its links while a refresh is in flight", async () => {
+      useSequenceClock();
+      const refresh = deferred<SessionToolSequencesResponse>();
+      const session = makeSession("claude", { termination_status: "tool_call_pending" });
+      showMessages(session.id, "revision-1");
+      sessionsService.getApiV1SessionsByIdToolSequences
+        .mockResolvedValueOnce(makeToolSequences(3, session.id, "revision-1"))
+        .mockReturnValueOnce(refresh.promise);
+      ui.signalPanelOpen = true;
+      const component = createClassComponent({
+        component: SessionBreadcrumb,
+        target: document.body,
+        props: { session, onBack: () => {} },
+      });
+      await vi.waitFor(async () => {
+        await expandedSequenceText();
+        expect(jumpLink(3)).not.toBeNull();
+        expect(panelBusy()).toBe("false");
+      });
+
+      component.$set({ session: { ...session, termination_status: "clean" } });
+      await passSequenceInterval();
+      expect(sessionsService.getApiV1SessionsByIdToolSequences).toHaveBeenCalledTimes(2);
+      expect(panelBusy()).toBe("true");
+      expect(document.body.textContent).not.toContain("Loading tool sequences");
+      expect(document.querySelector(".sequence-row")?.getAttribute("aria-expanded")).toBe("true");
+      const scrollToOrdinal = vi.spyOn(ui, "scrollToOrdinal");
+      jumpLink(3)!.click();
+      expect(scrollToOrdinal).toHaveBeenCalledWith(3, session.id, {
+        index: 0,
+        toolUseId: "tool-id",
+        fingerprint: "0000dddd",
+      });
+      scrollToOrdinal.mockRestore();
+
+      refresh.resolve(makeToolSequences(3, session.id, "revision-1"));
+      await vi.waitFor(() => expect(panelBusy()).toBe("false"));
+      expect(document.querySelector(".sequence-row")?.getAttribute("aria-expanded")).toBe("true");
+      expect(jumpLink(3)).not.toBeNull();
+      component.$destroy();
+    });
+
+    it("keeps the shown sequences through a read a sync interrupts and reads again", async () => {
+      useSequenceClock();
+      const session = makeSession("claude");
+      showMessages(session.id, "revision-1");
+      const conflict = () =>
+        new ApiError(409, "session changed while it was read; try again", "source_changed");
+      sessionsService.getApiV1SessionsByIdToolSequences
+        .mockResolvedValueOnce(makeToolSequences(3, session.id, "revision-1"))
+        .mockRejectedValueOnce(conflict())
+        .mockResolvedValueOnce(makeToolSequences(5, session.id, "revision-2"));
+      ui.signalPanelOpen = true;
+      const component = createClassComponent({
+        component: SessionBreadcrumb,
+        target: document.body,
+        props: { session, onBack: () => {} },
+      });
+      await vi.waitFor(async () => {
+        await expandedSequenceText();
+        expect(jumpLink(3)).not.toBeNull();
+      });
+
+      messages.loadedRevision = "revision-2";
+      await passSequenceInterval();
+      expect(sessionsService.getApiV1SessionsByIdToolSequences).toHaveBeenCalledTimes(2);
+      expect(document.querySelector('.tool-sequences-panel [role="alert"]')).toBeNull();
+      expect(jumpLink(3)).not.toBeNull();
+      expect(panelBusy()).toBe("true");
+
+      await passSequenceInterval();
+      await vi.waitFor(async () => {
+        await expandedSequenceText();
+        expect(jumpLink(5)).not.toBeNull();
+      });
+      expect(sessionsService.getApiV1SessionsByIdToolSequences).toHaveBeenCalledTimes(3);
+      component.$destroy();
+    });
+
+    it("reports a failure once a sync interrupts three reads in a row", async () => {
+      useSequenceClock();
+      const session = makeSession("claude");
+      showMessages(session.id, "revision-1");
+      sessionsService.getApiV1SessionsByIdToolSequences.mockRejectedValue(
+        new ApiError(409, "session changed while it was read; try again", "source_changed"),
+      );
+      ui.signalPanelOpen = true;
+      const component = createClassComponent({
+        component: SessionBreadcrumb,
+        target: document.body,
+        props: { session, onBack: () => {} },
+      });
+      await flushPromises();
+      await passSequenceInterval();
+      expect(document.querySelector('.tool-sequences-panel [role="alert"]')).toBeNull();
+      await passSequenceInterval();
+      await vi.waitFor(() => {
+        expect(document.querySelector('.tool-sequences-panel [role="alert"]')).not.toBeNull();
+      });
+      expect(sessionsService.getApiV1SessionsByIdToolSequences).toHaveBeenCalledTimes(3);
+      component.$destroy();
+    });
+
+    it("waits for the message list to land rows before reading sequences", async () => {
+      const session = makeSession("claude");
+      messages.sessionId = session.id;
+      messages.loading = true;
+      ui.signalPanelOpen = true;
+      const component = createClassComponent({
+        component: SessionBreadcrumb,
+        target: document.body,
+        props: { session, onBack: () => {} },
+      });
+      await flushPromises();
+      expect(sessionsService.getApiV1SessionsByIdToolSequences).not.toHaveBeenCalled();
+      expect(document.body.textContent).toContain("Loading tool sequences");
+
+      messages.loadedRevision = "revision-1";
+      messages.loading = false;
+      await vi.waitFor(async () => {
+        await expandedSequenceText();
+        expect(jumpLink(3)).not.toBeNull();
+      });
+      expect(sessionsService.getApiV1SessionsByIdToolSequences).toHaveBeenCalledTimes(1);
+      component.$destroy();
+    });
+
+    it("ignores a superseded tool-sequence response for the same session", async () => {
+      useSequenceClock();
+      const revision2 = deferred<SessionToolSequencesResponse>();
+      const session = makeSession("claude");
+      showMessages(session.id, "revision-1");
+      sessionsService.getApiV1SessionsByIdToolSequences
+        .mockResolvedValueOnce(makeToolSequences(3, session.id, "revision-1"))
+        .mockReturnValueOnce(revision2.promise)
+        .mockResolvedValueOnce(makeToolSequences(9, session.id, "revision-3"));
+      ui.signalPanelOpen = true;
+      const component = createClassComponent({
+        component: SessionBreadcrumb,
+        target: document.body,
+        props: { session, onBack: () => {} },
+      });
+      await vi.waitFor(async () => {
+        await expandedSequenceText();
+        expect(jumpLink(3)).not.toBeNull();
+      });
+      messages.loadedRevision = "revision-2";
+      await passSequenceInterval();
+      expect(sessionsService.getApiV1SessionsByIdToolSequences).toHaveBeenCalledTimes(2);
+      messages.loadedRevision = "revision-3";
+      await passSequenceInterval();
+      await vi.waitFor(async () => {
+        await expandedSequenceText();
+        expect(jumpLink(9)).not.toBeNull();
+      });
+
+      revision2.resolve(makeToolSequences(5, session.id, "revision-2"));
+      await flushPromises();
+      expect(jumpLink(9)).not.toBeNull();
+      expect(document.body.textContent).not.toContain("Message 5");
+      component.$destroy();
+    });
+
+    it("does not let a closed-panel response replace the next read", async () => {
+      const first = deferred<SessionToolSequencesResponse>();
+      const session = makeSession("claude");
+      showMessages(session.id, "revision-1");
+      sessionsService.getApiV1SessionsByIdToolSequences
+        .mockReturnValueOnce(first.promise)
+        .mockResolvedValueOnce(makeToolSequences(3, session.id, "revision-1"));
+      ui.signalPanelOpen = true;
+      const component = createClassComponent({
+        component: SessionBreadcrumb,
+        target: document.body,
+        props: { session, onBack: () => {} },
+      });
+      await flushPromises();
+      expect(sessionsService.getApiV1SessionsByIdToolSequences).toHaveBeenCalledTimes(1);
+
+      ui.signalPanelOpen = false;
+      await flushPromises();
+      ui.signalPanelOpen = true;
+      await vi.waitFor(async () => {
+        await expandedSequenceText();
+        expect(jumpLink(3)).not.toBeNull();
+      });
+      first.resolve(makeToolSequences(8, session.id, "revision-1"));
+      await flushPromises();
+      expect(jumpLink(3)).not.toBeNull();
+      expect(document.body.textContent).not.toContain("Message 8");
+      expect(sessionsService.getApiV1SessionsByIdToolSequences).toHaveBeenCalledTimes(2);
+      component.$destroy();
+    });
+
+    it("retries a failed tool-sequence read", async () => {
+      const session = makeSession("claude");
+      showMessages(session.id, "revision-1");
+      sessionsService.getApiV1SessionsByIdToolSequences
+        .mockRejectedValueOnce(new Error("offline"))
+        .mockResolvedValueOnce(makeToolSequences(3, session.id, "revision-1"));
+      ui.signalPanelOpen = true;
+      const component = createClassComponent({
+        component: SessionBreadcrumb,
+        target: document.body,
+        props: { session, onBack: () => {} },
+      });
+      await vi.waitFor(() => {
+        expect(document.querySelector('.tool-sequences-panel [role="alert"]')).not.toBeNull();
+      });
+
+      // A metadata-only session update says nothing new, so the failed read is not repeated on its own.
+      component.$set({ session: { ...session, first_message: "hello again" } });
+      await flushPromises();
+      expect(sessionsService.getApiV1SessionsByIdToolSequences).toHaveBeenCalledTimes(1);
+
+      document
+        .querySelector<HTMLButtonElement>('.tool-sequences-panel [role="alert"] button')!
+        .click();
+      await vi.waitFor(async () => {
+        await expandedSequenceText();
+        expect(jumpLink(3)).not.toBeNull();
+      });
+      expect(document.querySelector('.tool-sequences-panel [role="alert"]')).toBeNull();
+      expect(sessionsService.getApiV1SessionsByIdToolSequences).toHaveBeenCalledTimes(2);
+      component.$destroy();
+    });
+
+    it("says tool sequences are unavailable when the archive records no transcript revision", async () => {
+      sessionsService.getApiV1SessionsByIdToolSequences.mockRejectedValueOnce(
+        new ApiError(501, "this backend records no transcript revision", "revision_unavailable"),
+      );
+      ui.signalPanelOpen = true;
+      const component = createClassComponent({
+        component: SessionBreadcrumb,
+        target: document.body,
+        props: { session: makeSession("claude"), onBack: () => {} },
+      });
+      await vi.waitFor(() => {
+        expect(document.querySelector(".tool-sequences-panel")?.textContent).toContain(
+          "doesn't record transcript versions",
+        );
+      });
+      expect(document.querySelector('.tool-sequences-panel [role="alert"]')).toBeNull();
+      expect(sessionsService.getApiV1SessionsByIdToolSequences).toHaveBeenCalledTimes(1);
+      component.$destroy();
+    });
+
+    it("ignores a late tool-sequence response after switching sessions", async () => {
+      const first = deferred<SessionToolSequencesResponse>();
+      showMessages("run:bbb", "revision-1");
+      sessionsService.getApiV1SessionsByIdToolSequences
+        .mockReturnValueOnce(first.promise)
+        .mockResolvedValueOnce(makeToolSequences(3, "run:bbb", "revision-1"));
+      ui.signalPanelOpen = true;
+      const component = createClassComponent({
+        component: SessionBreadcrumb,
+        target: document.body,
+        props: { session: makeSession("claude", { id: "run:aaa" }), onBack: () => {} },
+      });
+      await flushPromises();
+      component.$set({ session: makeSession("claude", { id: "run:bbb" }) });
+      await vi.waitFor(async () => {
+        await expandedSequenceText();
+        expect(jumpLink(3)).not.toBeNull();
+      });
+
+      first.resolve(makeToolSequences(8, "run:aaa", "revision-1"));
+      await flushPromises();
+      expect(jumpLink(3)).not.toBeNull();
+      expect(document.body.textContent).not.toContain("Message 8");
+      component.$destroy();
     });
   });
 });

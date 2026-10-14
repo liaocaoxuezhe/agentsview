@@ -7,6 +7,7 @@ import (
 	"sync"
 	"time"
 
+	"go.kenn.io/kit/embedmodel"
 	kitvec "go.kenn.io/kit/vector"
 	"go.kenn.io/kit/vector/sqlitevec"
 )
@@ -88,6 +89,13 @@ type Manager struct {
 	// non-blocking while a build is in flight.
 	opMu sync.Mutex
 
+	// detachedCtx is the lifecycle context for StartBuild's detached build
+	// goroutines: it outlives the HTTP request that triggered a build but is
+	// canceled by Shutdown, so a build stuck waiting out rate limits cannot
+	// block daemon shutdown forever. cancelDetached cancels it.
+	detachedCtx    context.Context
+	cancelDetached context.CancelFunc
+
 	// mu guards running and status; held only for short field updates so
 	// Status() stays responsive during a build.
 	mu        sync.Mutex
@@ -155,11 +163,14 @@ type BuildStatus struct {
 }
 
 // EncodeSettings groups the encode-shape knobs of one embeddings server,
-// resolved from config ([vector.embeddings.servers.<name>] batch_size and
-// concurrency).
+// resolved from config.
 type EncodeSettings struct {
 	// BatchSize is the number of inputs sent per HTTP call.
 	BatchSize int
+	// ModelContextTokens and MaxBatchTokens bound the worst-case total input
+	// tokens sent per HTTP call. Zero leaves token-budget batching disabled.
+	ModelContextTokens int
+	MaxBatchTokens     int
 	// Concurrency is the number of documents encoded in parallel.
 	Concurrency int
 }
@@ -187,6 +198,9 @@ type BuildTarget struct {
 	Source         UnitSource
 	Generation     kitvec.Generation
 	CorpusRevision string
+	// Space recognizes existing generations of the configured embedding
+	// space; see BuildOptions.Space.
+	Space embedmodel.Descriptor
 }
 
 // NewManager creates a Manager that builds gen's embedding space over ix,
@@ -219,9 +233,11 @@ func NewResolvingManager(
 		me.Encode = recoveringEncoder(me.Encode)
 		wrapped.ByName[name] = me
 	}
+	detachedCtx, cancelDetached := context.WithCancel(context.Background())
 	return &Manager{
 		ix: ix, encoders: wrapped, gen: displayGen,
 		resolveTarget: resolveTarget, now: time.Now,
+		detachedCtx: detachedCtx, cancelDetached: cancelDetached,
 	}
 }
 
@@ -259,8 +275,8 @@ func recoveringEncoder(enc kitvec.EncodeFunc) kitvec.EncodeFunc {
 
 // StartBuild launches a Build in a background goroutine, returning
 // ErrBuildRunning if one is already in flight rather than queuing behind it.
-// The goroutine runs against context.Background() so it outlives the HTTP
-// request that triggered it.
+// The goroutine runs against the manager's detached lifecycle context so it
+// outlives the HTTP request that triggered it but still stops on Shutdown.
 func (m *Manager) StartBuild(req BuildRequest) error {
 	if err := validateBuildRequest(req); err != nil {
 		return err
@@ -273,7 +289,7 @@ func (m *Manager) StartBuild(req BuildRequest) error {
 		return err
 	}
 	go func() {
-		result, err := m.runBuild(context.Background(), req, me)
+		result, err := m.runBuild(m.detachedCtx, req, me)
 		m.finish(result, err)
 	}()
 	return nil
@@ -291,7 +307,10 @@ func (m *Manager) TryBuild(ctx context.Context, req BuildRequest) (bool, error) 
 		return false, err
 	}
 	if err := m.begin(); err != nil {
-		return false, nil
+		if errors.Is(err, ErrBuildRunning) {
+			return false, nil
+		}
+		return false, err
 	}
 	result, err := m.runBuild(ctx, req, me)
 	m.finish(result, err)
@@ -328,6 +347,17 @@ func (m *Manager) Wait() {
 	}
 }
 
+// Shutdown cancels any detached StartBuild in flight and blocks until no
+// build is running. Owners call it instead of Wait when closing down: a
+// detached build's encoder may be waiting out provider rate limits
+// indefinitely (EncoderConfig.RetryRateLimits), so without cancellation
+// Wait could never return. Build progress is durable, so a canceled build
+// resumes incrementally on the next start.
+func (m *Manager) Shutdown() {
+	m.cancelDetached()
+	m.Wait()
+}
+
 // Generations delegates to the underlying Index, listing every generation
 // with its coverage of the current mirror.
 func (m *Manager) Generations(ctx context.Context) ([]GenerationInfo, error) {
@@ -356,7 +386,17 @@ func (m *Manager) Activate(ctx context.Context, id int64, force bool) error {
 		return refusedf("generation %d still has %d documents needing embedding; use --force",
 			id, target.Missing)
 	}
-	return m.ix.activateGeneration(ctx, target.Fingerprint)
+	if force || target.State == string(sqlitevec.StateRetired) {
+		return m.ix.forceActivateGeneration(ctx, target.key)
+	}
+	activated, err := m.ix.maybeActivate(ctx, target.key, true)
+	if err != nil {
+		return err
+	}
+	if !activated {
+		return refusedf("generation %d gained documents needing embedding; use --force", id)
+	}
+	return nil
 }
 
 // Retire transitions the generation identified by id to retired. Without
@@ -377,7 +417,7 @@ func (m *Manager) Retire(ctx context.Context, id int64, force bool) error {
 	if !force && target.State == string(sqlitevec.StateActive) {
 		return refusedf("generation %d is active; use --force to retire it", id)
 	}
-	return m.ix.SetStateByID(ctx, id, sqlitevec.StateRetired)
+	return m.ix.RetireByID(ctx, id)
 }
 
 // begin transitions the manager into the running state, resetting the
@@ -427,14 +467,17 @@ func (m *Manager) runBuild(
 		return BuildResult{}, errors.New("embedding build target has no unit source")
 	}
 	return m.ix.Build(ctx, target.Source, me.Encode, target.Generation, BuildOptions{
-		FullRebuild:      req.FullRebuild,
-		Backstop:         req.Backstop,
-		RepairInvalid:    req.RepairInvalid,
-		IncludeAutomated: req.IncludeAutomated,
-		BatchSize:        me.Settings.BatchSize,
-		Concurrency:      me.Settings.Concurrency,
-		CorpusRevision:   target.CorpusRevision,
-		Progress:         m.reportProgress,
+		FullRebuild:        req.FullRebuild,
+		Backstop:           req.Backstop,
+		RepairInvalid:      req.RepairInvalid,
+		IncludeAutomated:   req.IncludeAutomated,
+		BatchSize:          me.Settings.BatchSize,
+		ModelContextTokens: me.Settings.ModelContextTokens,
+		MaxBatchTokens:     me.Settings.MaxBatchTokens,
+		Concurrency:        me.Settings.Concurrency,
+		CorpusRevision:     target.CorpusRevision,
+		Space:              target.Space,
+		Progress:           m.reportProgress,
 	})
 }
 

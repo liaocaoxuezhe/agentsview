@@ -1,75 +1,25 @@
 import { spawnSync } from "node:child_process";
-import { mkdtempSync, readFileSync, readdirSync, rmSync, writeFileSync } from "node:fs";
-import { tmpdir } from "node:os";
+import { existsSync, readFileSync, readdirSync, rmSync, writeFileSync } from "node:fs";
 import { dirname, join, relative, resolve } from "node:path";
 import { fileURLToPath } from "node:url";
+import { generate } from "orval";
 
 const frontendDir = resolve(dirname(fileURLToPath(import.meta.url)), "..");
 const repoRoot = resolve(frontendDir, "..");
+const generatedDir = join(frontendDir, "src/lib/api/generated");
 
-function suppressExpectedAbortLogging() {
-  const requestPath = join(frontendDir, "src/lib/api/generated/core/request.ts");
-  const source = readFileSync(requestPath, "utf8");
-  const generatedCatch = `    } catch (error) {
-      console.error(error);
-    }
-`;
-  const cancellationAwareCatch = `    } catch (error) {
-      if (!(error instanceof DOMException && error.name === 'AbortError')) {
-        console.error(error);
-      }
-    }
-`;
-  if (!source.includes(generatedCatch)) {
-    throw new Error("generated request body handler no longer matches the abort-log patch");
-  }
-  writeFileSync(requestPath, source.replace(generatedCatch, cancellationAwareCatch));
-}
-
-function generatedTrailingNewlineCounts(dir, base = dir, counts = new Map()) {
+function generatedSources(dir, base = dir, sources = new Map()) {
+  if (!existsSync(dir)) return sources;
   for (const entry of readdirSync(dir, { withFileTypes: true })) {
     const path = join(dir, entry.name);
     if (entry.isDirectory()) {
-      generatedTrailingNewlineCounts(path, base, counts);
+      generatedSources(path, base, sources);
       continue;
     }
     if (!entry.name.endsWith(".ts")) continue;
-    const source = readFileSync(path, "utf8");
-    counts.set(relative(base, path), source.match(/\n+$/)?.[0].length ?? 0);
+    sources.set(relative(base, path), readFileSync(path, "utf8"));
   }
-  return counts;
-}
-
-function normalizeGeneratedTrailingNewlines(dir, preferred, base = dir) {
-  for (const entry of readdirSync(dir, { withFileTypes: true })) {
-    const path = join(dir, entry.name);
-    if (entry.isDirectory()) {
-      normalizeGeneratedTrailingNewlines(path, preferred, base);
-      continue;
-    }
-    if (!entry.name.endsWith(".ts")) continue;
-    const source = readFileSync(path, "utf8");
-    const newlineCount = preferred.get(relative(base, path)) ?? 1;
-    const normalized = source.replace(/\n*$/, "\n".repeat(newlineCount));
-    if (normalized !== source) writeFileSync(path, normalized);
-  }
-}
-
-// openapi-typescript-codegen 0.31 treats OpenAPI 3.1 nullable array type
-// unions as untyped arrays. Normalize affected response arrays to the
-// equivalent nullable form it understands before generation.
-function normalizeNullableArray(schema, label) {
-  if (!schema || !Array.isArray(schema.type) || !schema.type.includes("null")) {
-    throw new Error(`missing nullable OpenAPI array schema for ${label}`);
-  }
-  const concreteTypes = schema.type.filter((item) => item !== "null");
-  if (concreteTypes.length !== 1) {
-    throw new Error(
-      `cannot normalize nullable OpenAPI type for ${label}: ${JSON.stringify(schema.type)}`,
-    );
-  }
-  schema.type = concreteTypes[0];
-  schema.nullable = true;
+  return sources;
 }
 
 function run(cmd, args, options = {}) {
@@ -85,54 +35,234 @@ function run(cmd, args, options = {}) {
   return result.stdout ?? "";
 }
 
-const generatedDir = join(frontendDir, "src/lib/api/generated");
-const generatedTrailingNewlines = generatedTrailingNewlineCounts(generatedDir);
-const tempDir = mkdtempSync(join(tmpdir(), "agentsview-openapi-"));
-try {
-  const specPath = join(tempDir, "openapi.json");
-  const spec = run("go", ["run", "./cmd/agentsview", "openapi"], {
+// Patch generated code, failing when the generator's output no longer has the expected matches.
+function replaceCounted(text, pattern, replacement, expected, what) {
+  const found = text.match(pattern)?.length ?? 0;
+  if (found !== expected) {
+    throw new Error(`Expected ${expected} ${what} in the generated Go client, found ${found}`);
+  }
+  return text.replace(pattern, replacement);
+}
+
+function operationName(operation, route) {
+  if (!operation.operationId) throw new Error("Every API operation must have an operationId");
+  let name = operation.operationId;
+  for (const match of route.matchAll(/\{([^}]+)\}/g)) {
+    const parameter = match[1]
+      .replace(/([a-z0-9])([A-Z])/g, "$1-$2")
+      .replaceAll("_", "-")
+      .toLowerCase();
+    for (const candidate of [parameter, parameter.replaceAll("-", "")]) {
+      const next = name.replace(`-${candidate}`, `-by-${parameter}`);
+      if (next !== name) {
+        name = next;
+        break;
+      }
+    }
+  }
+  return name.replace(/-([a-z0-9])/g, (_, character) => character.toUpperCase());
+}
+
+function writeIndex() {
+  const exports = ['export * from "./models/index.ts";'];
+  for (const entry of readdirSync(generatedDir, { withFileTypes: true })) {
+    if (!entry.isDirectory() || entry.name === "models") continue;
+    const serviceName = `${entry.name
+      .split("-")
+      .map((part) => part[0].toUpperCase() + part.slice(1))
+      .join("")}Service`;
+    exports.push(`export * as ${serviceName} from "./${entry.name}/${entry.name}.ts";`);
+  }
+  writeFileSync(join(generatedDir, "index.ts"), `${exports.sort().join("\n")}\n`);
+}
+
+const checkIfGoAvailable = process.argv.includes("--check-if-go-available");
+const verifyGenerated = process.argv.includes("--check") || checkIfGoAvailable;
+if (checkIfGoAvailable) {
+  const goVersion = spawnSync("go", ["version"], { stdio: "ignore" });
+  if (goVersion.error?.code === "ENOENT") {
+    console.warn("Skipping generated API client check because Go is not available.");
+    process.exit(0);
+  }
+}
+
+const previousGeneratedSources = verifyGenerated ? generatedSources(generatedDir) : null;
+const specPath = join(repoRoot, "openapi.yaml");
+const previousSpec =
+  verifyGenerated && existsSync(specPath) ? readFileSync(specPath, "utf8") : null;
+const pricingSnapshot = join(repoRoot, "internal/pricing/snapshot/litellm_snapshot.json.gz");
+if (!existsSync(pricingSnapshot)) {
+  run("go", ["run", "./internal/pricing/cmd/litellm-snapshot"], { cwd: repoRoot });
+}
+run("go", ["run", "./internal/pricing/cmd/litellm-snapshot", "-restore"], {
+  cwd: repoRoot,
+});
+const spec = run("go", ["run", "./cmd/agentsview", "openapi", "--yaml"], {
+  cwd: repoRoot,
+  capture: true,
+});
+writeFileSync(specPath, spec);
+
+const goClientPath = join(repoRoot, "internal/apiclient/client.gen.go");
+const previousGoClient =
+  verifyGenerated && existsSync(goClientPath) ? readFileSync(goClientPath, "utf8") : null;
+run(
+  "go",
+  [
+    "run",
+    "github.com/doordash-oss/oapi-codegen-dd/v3/cmd/oapi-codegen@v3.75.15",
+    "--config",
+    "internal/apiclient/generate.yaml",
+    "openapi.yaml",
+  ],
+  { cwd: repoRoot },
+);
+// The generator still emits the v1 import and an ambiguous tool name.
+// Keep generated code on the module's JSON v2 contract and record provenance.
+const goClient = readFileSync(goClientPath, "utf8")
+  .replace(
+    "Code generated by oapi-codegen.",
+    "Code generated by github.com/doordash-oss/oapi-codegen-dd/v3.",
+  )
+  .replaceAll('"encoding/json"', '"encoding/json/v2"');
+// Required response fields preserve empty strings and explicit nulls.
+function preserveToolSequenceCallFields(model) {
+  model = replaceCounted(
+    model,
+    /(\t(?:ResultBytes|ResultOmittedBytes)\s+\*int64\s+`json:"[^"]+),omitempty"/g,
+    '$1"',
+    2,
+    "nullable SessionToolSequenceCall tags",
+  );
+  model = replaceCounted(
+    model,
+    /(\t(?:InputPreview|ResultPreview|ToolName|ToolUseID)\s+string\s+`json:"[^"]+") validate:"required"/g,
+    "$1",
+    4,
+    "required SessionToolSequenceCall string tags",
+  );
+  return replaceCounted(
+    model,
+    /\tif err := typesValidator\.Var\(s\.(?:InputPreview|ResultPreview|ToolName|ToolUseID), "required"\); err != nil \{\n\t\terrors = errors.Append\("[^"]+", err\)\n\t\}\n/g,
+    "",
+    4,
+    "required SessionToolSequenceCall string checks",
+  );
+}
+writeFileSync(
+  goClientPath,
+  replaceCounted(
+    goClient,
+    /type SessionToolSequenceCall struct \{[\s\S]*?(?=\ntype )/g,
+    preserveToolSequenceCallFields,
+    1,
+    "SessionToolSequenceCall models",
+  ),
+);
+
+// Keep the declaration order used by the existing TypeScript client.
+const apiDocument = JSON.parse(
+  run("go", ["run", "./cmd/agentsview", "openapi"], {
     cwd: repoRoot,
     capture: true,
-  });
-  const parsedSpec = JSON.parse(spec);
-  const schemas = parsedSpec.components?.schemas;
-  for (const [model, property] of [
-    ["ExportEffectiveModelRate", "bands"],
-    ["ExportPricingApplication", "bands"],
-    ["ExportModelPricingProvenance", "resolutions"],
-    ["SessionProviderResponse", "dirs"],
-    ["SettingsResponse", "disabled_agents"],
-    ["SettingsResponse", "session_providers"],
-    ["SyncWatchBatch", "paths"],
-    ["SyncWatchBatch", "reconcile_roots"],
-    ["SyncWatchBatch", "renames"],
-    ["SyncWatchRecoveryScope", "available_roots"],
-    ["SyncWatchRecoveryScope", "deferred_roots"],
-  ]) {
-    normalizeNullableArray(schemas?.[model]?.properties?.[property], `${model}.${property}`);
+  }),
+);
+const rawResponseMediaTypes = new Set([
+  "text/event-stream",
+  "text/html",
+  "text/markdown",
+  "application/octet-stream",
+  "application/x-tar",
+]);
+const rawOperations = Object.values(apiDocument.paths).flatMap((path) =>
+  Object.values(path)
+    .filter(
+      (op) =>
+        op.responses &&
+        Object.values(op.responses).some((response) =>
+          Object.keys(response.content ?? {}).some((media) => rawResponseMediaTypes.has(media)),
+        ),
+    )
+    .map((op) => [
+      op.operationId,
+      {
+        mutator: {
+          path: join(frontendDir, "src/lib/api/runtime.ts"),
+          name: "orvalRequest",
+        },
+      },
+    ]),
+);
+
+// Huma marks file parts `contentEncoding: binary`. Orval reads any
+// contentEncoding as an encoded text string and types the part as `string`.
+// The JSON Schema "binary" encoding means the bytes are unchanged, so dropping
+// it keeps the schema's meaning and lets Orval type file parts as Blob | File.
+function dropBinaryContentEncoding(node) {
+  if (Array.isArray(node)) {
+    node.forEach(dropBinaryContentEncoding);
+    return;
   }
-  writeFileSync(specPath, JSON.stringify(parsedSpec));
-  const openapiArgs = [
-    "openapi",
-    "-i",
-    specPath,
-    "-o",
-    "src/lib/api/generated",
-    "-c",
-    "fetch",
-    "--useOptions",
-    "--indent",
-    "2",
-  ];
-  if (process.platform === "win32") {
-    run(process.env.ComSpec ?? "cmd.exe", ["/d", "/s", "/c", "npx.cmd", ...openapiArgs], {
-      cwd: frontendDir,
-    });
-  } else {
-    run("npx", openapiArgs, { cwd: frontendDir });
+  if (node === null || typeof node !== "object") return;
+  if (node.contentEncoding === "binary") delete node.contentEncoding;
+  Object.values(node).forEach(dropBinaryContentEncoding);
+}
+dropBinaryContentEncoding(apiDocument);
+
+rmSync(generatedDir, { recursive: true, force: true });
+await generate(
+  {
+    input: { target: apiDocument },
+    output: {
+      client: "fetch",
+      mode: "tags-split",
+      target: generatedDir,
+      schemas: join(generatedDir, "models"),
+      clean: true,
+      urlEncodeParameters: true,
+      override: {
+        fetch: { includeHttpResponseReturnType: false },
+        operations: Object.fromEntries(rawOperations),
+        // Preserve response bodies for streaming and downloads. Orval still
+        // owns each operation's URL, parameters, method, and request encoding.
+        transformer: (operation) => {
+          const media = operation.response.contentTypes;
+          if (media.some((type) => rawResponseMediaTypes.has(type))) {
+            operation.response.definition.success = "Response";
+          }
+          return operation;
+        },
+        header: () => ["Generated by Orval. Do not edit manually."],
+        mutator: {
+          path: join(frontendDir, "src/lib/api/runtime.ts"),
+          name: "orvalFetch",
+        },
+        operationName,
+        useNamedParameters: true,
+      },
+    },
+  },
+  frontendDir,
+);
+writeIndex();
+run("vp", ["fmt", generatedDir], { cwd: frontendDir });
+if (verifyGenerated && previousSpec !== readFileSync(specPath, "utf8")) {
+  throw new Error("OpenAPI YAML was stale and has been regenerated");
+}
+
+if (previousGeneratedSources) {
+  const currentGeneratedSources = generatedSources(generatedDir);
+  const paths = new Set([...previousGeneratedSources.keys(), ...currentGeneratedSources.keys()]);
+  const changed = [...paths].filter(
+    (path) => previousGeneratedSources.get(path) !== currentGeneratedSources.get(path),
+  );
+  if (changed.length > 0) {
+    throw new Error(
+      `generated API client was stale and has been regenerated:\n${changed.join("\n")}`,
+    );
   }
-  suppressExpectedAbortLogging();
-  normalizeGeneratedTrailingNewlines(generatedDir, generatedTrailingNewlines);
-} finally {
-  rmSync(tempDir, { recursive: true, force: true });
+}
+
+if (verifyGenerated && previousGoClient !== readFileSync(goClientPath, "utf8")) {
+  throw new Error("Go API client was stale and has been regenerated");
 }

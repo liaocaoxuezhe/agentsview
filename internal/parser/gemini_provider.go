@@ -3,6 +3,7 @@ package parser
 import (
 	"context"
 	"crypto/sha256"
+	"encoding/hex"
 	"errors"
 	"fmt"
 	"hash"
@@ -33,11 +34,9 @@ func (f geminiProviderFactory) Capabilities() Capabilities {
 func (f geminiProviderFactory) NewProvider(cfg ProviderConfig) Provider {
 	cfg = cfg.Clone()
 	return &geminiProvider{
-		ProviderBase: ProviderBase{
-			Def:    cloneAgentDef(f.def),
-			Caps:   geminiProviderCapabilities(),
-			Config: cfg,
-		},
+		Def:     cloneAgentDef(f.def),
+		Caps:    geminiProviderCapabilities(),
+		Config:  cfg,
 		sources: newGeminiSourceSet(cfg.Roots),
 	}
 }
@@ -97,11 +96,21 @@ func (p *geminiProvider) Parse(
 	}
 	path, ok := p.sources.pathFromSource(req.Source)
 	if !ok {
-		return ParseOutcome{}, fmt.Errorf("gemini source path unavailable")
+		return ParseOutcome{}, errors.New("gemini source path unavailable")
 	}
 	machine := firstNonEmptyJSONLString(req.Machine, p.Config.Machine)
 	sess, msgs, err := p.parseSession(path, req.Source.ProjectHint, machine)
 	if err != nil {
+		if errors.Is(err, errGeminiMissingSessionID) {
+			// A session-shaped file without Gemini's metadata record has no
+			// stable identity to archive. Treat the durable source shape as an
+			// unsupported skip so reconciliation can advance without claiming
+			// authority to retire previously archived sessions.
+			return ParseOutcome{
+				ResultSetComplete: true,
+				SkipReason:        SkipUnsupportedSource,
+			}, nil
+		}
 		return ParseOutcome{}, err
 	}
 	if sess == nil {
@@ -442,7 +451,7 @@ func (s geminiSourceSet) Fingerprint(
 	}
 	root, path, ok := s.rootPathFromSource(source)
 	if !ok {
-		return SourceFingerprint{}, fmt.Errorf("gemini source path unavailable")
+		return SourceFingerprint{}, errors.New("gemini source path unavailable")
 	}
 	info, err := os.Stat(path)
 	if err != nil {
@@ -466,7 +475,7 @@ func (s geminiSourceSet) Fingerprint(
 	); err != nil {
 		return SourceFingerprint{}, err
 	}
-	fingerprint.Hash = fmt.Sprintf("%x", h.Sum(nil))
+	fingerprint.Hash = hex.EncodeToString(h.Sum(nil))
 	return fingerprint, nil
 }
 
@@ -669,9 +678,11 @@ func geminiProviderCapabilities() Capabilities {
 			PerSessionErrors:     CapabilityNotApplicable,
 			ExcludedSessions:     CapabilityNotApplicable,
 			ForceReplaceOnParse:  CapabilityNotApplicable,
+			SharedSessionIDs:     CapabilitySupported,
 		},
 		Content: ContentCapabilities{
 			FirstMessage:         CapabilitySupported,
+			SessionName:          CapabilitySupported,
 			Thinking:             CapabilitySupported,
 			ToolCalls:            CapabilitySupported,
 			ToolResults:          CapabilitySupported,

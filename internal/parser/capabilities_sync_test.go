@@ -22,6 +22,13 @@ func TestProviderSyncSemanticsDeclarations(t *testing.T) {
 			FingerprintHashRequiredForFreshness: true,
 			SkipCacheFreshWithoutStoredRow:      true,
 		},
+		// Augure Code shares the Codex provider, so it must share its
+		// semantics.
+		AgentAugureCode: {
+			FingerprintHashInCacheKey:           true,
+			FingerprintHashRequiredForFreshness: true,
+			SkipCacheFreshWithoutStoredRow:      true,
+		},
 		// TraeX shares the Codex provider, so it must share its semantics.
 		AgentTraeX: {
 			FingerprintHashInCacheKey:           true,
@@ -40,21 +47,51 @@ func TestProviderSyncSemanticsDeclarations(t *testing.T) {
 			FingerprintHashInCacheKey:           true,
 			FingerprintHashRequiredForFreshness: true,
 		},
+		// Augure Desktop shares the Hermes provider, so it must share its
+		// semantics.
+		AgentAugureDesktop: {
+			FingerprintHashRequiredForFreshness: true,
+		},
 		AgentHermes: {
 			FingerprintHashRequiredForFreshness: true,
 		},
 		AgentGemini: {
 			FingerprintHashRequiredForFreshness: true,
 		},
+		AgentPositron: {
+			FingerprintHashRequiredForFreshness: true,
+		},
+		AgentJunie: {
+			FingerprintHashInCacheKey:           true,
+			FingerprintHashRequiredForFreshness: true,
+		},
 		AgentGoose: {
+			FingerprintHashInCacheKey:           true,
+			FingerprintHashRequiredForFreshness: true,
+		},
+		AgentCrush: {
+			FingerprintHashInCacheKey:           true,
+			FingerprintHashRequiredForFreshness: true,
+		},
+		AgentCodeBuddy: {
 			FingerprintHashInCacheKey:           true,
 			FingerprintHashRequiredForFreshness: true,
 		},
 		AgentZed: {
 			UnchangedResults: UnchangedResultMTime,
 		},
+		AgentCursor: {
+			FingerprintHashInCacheKey:           true,
+			FingerprintHashRequiredForFreshness: true,
+		},
+		AgentCursorIDE: {
+			FingerprintHashInCacheKey:           true,
+			FingerprintHashRequiredForFreshness: true,
+			UnchangedResults:                    UnchangedResultMTimeAndHash,
+		},
 		AgentKiro: {
-			UnchangedResults: UnchangedResultMTime,
+			UnchangedResults:                    UnchangedResultMTimeAndHash,
+			FingerprintHashRequiredForFreshness: true,
 		},
 		AgentTrae: {
 			UnchangedResults: UnchangedResultMTimeAndHash,
@@ -91,12 +128,28 @@ func TestProviderSyncSemanticsDeclarations(t *testing.T) {
 			FingerprintHashRequiredForFreshness: true,
 			UnchangedResults:                    UnchangedResultMTimeAndHash,
 		},
+		AgentEvener: {
+			FingerprintHashRequiredForFreshness: true,
+		},
 		// Codebuff requires the per-component stat-hash digest (persisted in
 		// the provider_freshness side-table) before a warm pass may consider a
 		// source fresh; the side-table row is the only signal that sees
 		// companion-file rewrites, offsetting size deltas, and sibling-only
 		// directory mutations.
 		AgentCodebuff: {
+			FingerprintHashRequiredForFreshness: true,
+		},
+		AgentCopilot: {
+			FingerprintHashRequiredForFreshness: true,
+		},
+		AgentOpenClaw: {
+			FingerprintHashInCacheKey:           true,
+			FingerprintHashRequiredForFreshness: true,
+		},
+		// Grok companion edits can keep the summary's size and mtime, so
+		// freshness depends on the content fingerprint.
+		AgentGrok: {
+			FingerprintHashInCacheKey:           true,
 			FingerprintHashRequiredForFreshness: true,
 		},
 	}

@@ -147,7 +147,7 @@ func TestPGGetActivityReportOpenSessionWithInRangeMessageIncluded(t *testing.T) 
 
 // TestPGGetActivityReportUsageCostAndTokens exercises the PG usage
 // union + cost path: a single priced assistant message must surface
-// its output tokens and computed cost in the day totals, matching
+// its input and output tokens and computed cost in the day totals, matching
 // the SQLite reference behavior.
 func TestPGGetActivityReportUsageCostAndTokens(t *testing.T) {
 	_, store := prepareUsageSchema(t, "agentsview_daily_report_usage_test")
@@ -186,6 +186,8 @@ func TestPGGetActivityReportUsageCostAndTokens(t *testing.T) {
 		pgDayQuery(t, "2026-06-16", "UTC"))
 	require.NoError(t, err)
 	assert.Equal(t, 1, r.Totals.Sessions)
+	require.Len(t, r.Buckets, 288)
+	assert.Equal(t, 1000, r.Buckets[126].InputTokens)
 	assert.Equal(t, 500, r.Totals.OutputTokens)
 	// Cost = (1000*3 + 500*15) / 1e6 = 0.0105
 	assert.Equal(t, money.MustParseDollars("0.0105"), r.Totals.Cost)
@@ -279,6 +281,9 @@ func TestPGGetActivityReportIncludesSubagentUsage(t *testing.T) {
 			 '2026-06-16T10:05:00Z'::timestamptz,
 			 '2026-06-16T10:06:00Z'::timestamptz, 1, 1, 'root', 'fork')`)
 	require.NoError(t, err, "insert sessions")
+	_, err = store.DB().ExecContext(ctx, `UPDATE sessions SET is_automated = true WHERE id = 'agent-sub'`)
+	require.NoError(t, err)
+
 	_, err = store.DB().ExecContext(ctx, `
 		INSERT INTO messages (
 			session_id, ordinal, role, content, timestamp,
@@ -308,11 +313,21 @@ func TestPGGetActivityReportIncludesSubagentUsage(t *testing.T) {
 	assert.Contains(t, ids, "agent-sub",
 		"subagent session must be a candidate")
 	assert.Contains(t, ids, "fork", "fork session must be a candidate")
+	assert.Equal(t, 3, r.Totals.Sessions)
+	assert.Equal(t, 2, r.Totals.InteractiveSessions, "subagents are not interactive conversations")
+	assert.Equal(t, 1, r.Totals.SubagentSessions)
+	assert.Zero(t, r.Totals.AutomatedSessions)
 	assert.Equal(t, 1200, r.Totals.OutputTokens,
 		"totals include subagent usage; the fork's replayed row dedups away")
 	// Cost = root (1000*3+500*15)/1e6 + subagent (2000*3+700*15)/1e6; the
 	// fork's duplicate row contributes nothing.
 	assert.Equal(t, money.MustParseDollars("0.027"), r.Totals.Cost)
+	_, err = store.DB().ExecContext(ctx, `UPDATE sessions SET entrypoint = 'sdk-cli', parent_session_id = NULL WHERE id = 'agent-sub'`)
+	require.NoError(t, err)
+	r, err = store.GetActivityReport(ctx, db.AnalyticsFilter{Timezone: "UTC"}, pgDayQuery(t, "2026-06-16", "UTC"))
+	require.NoError(t, err)
+	assert.Equal(t, 1, r.Totals.SubagentSessions)
+	assert.Zero(t, r.Totals.AutomatedSessions)
 }
 
 func TestPGGetActivityReportPricingModelsOnlyIncludeDedupSurvivors(t *testing.T) {
@@ -576,8 +591,8 @@ func TestPGGetActivityReportDedupUsesChronologicalOrder(t *testing.T) {
 	ids := []string{"dup-b", "dup-a"}
 
 	q := pgDayQuery(t, "2026-06-16", "UTC")
-	lower := paddedUTCBound(q.RangeStart.UTC().Format(time.RFC3339), -14)
-	upper := paddedUTCBound(q.RangeEnd.UTC().Format(time.RFC3339), 14)
+	lower := db.PaddedUTCBound(q.RangeStart.UTC().Format(time.RFC3339), -14)
+	upper := db.PaddedUTCBound(q.RangeEnd.UTC().Format(time.RFC3339), 14)
 	usage, _, err := store.activityReportUsage(ctx, ids, lower, upper, q)
 	require.NoError(t, err)
 

@@ -11,10 +11,13 @@ import (
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
 
+	"go.kenn.io/agentsview/internal/activity"
 	"go.kenn.io/agentsview/internal/db"
 	"go.kenn.io/agentsview/internal/export"
 	"go.kenn.io/agentsview/internal/money"
+	"go.kenn.io/agentsview/internal/pricing"
 	"go.kenn.io/agentsview/internal/service"
+	"go.kenn.io/agentsview/internal/storage"
 )
 
 func prepareUsageSchema(
@@ -48,7 +51,7 @@ func TestStoreGetDailyUsageUsesFallbackPricing(t *testing.T) {
 			message_count, user_message_count
 		) VALUES (
 			'usage-fallback-001', 'test-machine', 'proj', 'claude',
-			'2026-03-12T10:00:00Z'::timestamptz, 1, 1
+			'2026-08-13T10:00:00Z'::timestamptz, 1, 1
 		)`)
 	require.NoError(t, err, "insert session")
 	_, err = store.DB().ExecContext(ctx, `
@@ -57,20 +60,55 @@ func TestStoreGetDailyUsageUsesFallbackPricing(t *testing.T) {
 			content_length, model, token_usage
 		) VALUES (
 			'usage-fallback-001', 0, 'assistant', 'hi',
-			'2026-03-12T10:00:00Z'::timestamptz, 2,
-			'claude-sonnet-4-20250514',
+			'2026-08-13T10:00:00Z'::timestamptz, 2,
+			'xai/grok-4.6',
 			'{"input_tokens":1000000}'
 		)`)
 	require.NoError(t, err, "insert message")
 
 	result, err := store.GetDailyUsage(ctx, db.UsageFilter{
-		From:     "2026-03-12",
-		To:       "2026-03-12",
+		From:     "2026-08-13",
+		To:       "2026-08-13",
 		Timezone: "UTC",
 	})
 	require.NoError(t, err, "GetDailyUsage")
-	assert.Equal(t, money.MustParseDollars("6"), result.Totals.TotalCost)
+	assert.Equal(t, money.MustParseDollars("4"), result.Totals.TotalCost)
 	assert.Len(t, result.Daily, 1)
+}
+
+func TestStoreGetDailyUsageCodexBedrockPricing(t *testing.T) {
+	_, store := prepareUsageSchema(t, "agentsview_usage_codex_bedrock_test")
+	for _, tt := range []struct{ model, date, cost string }{
+		{"openai.gpt-5.4", "2026-09-09", "1.925"},
+		{"openai.gpt-5.6-luna", "2026-07-29", "0.77"},
+		{"openai.gpt-5.6-luna", "2026-07-30", "0.154"},
+		{"openai.gpt-5.6-terra", "2026-07-29", "1.925"},
+		{"openai.gpt-5.6-terra", "2026-07-30", "1.54"},
+		{"openai.gpt-6-astra", "2026-09-09", "6.6"},
+	} {
+		t.Run(tt.model+"/"+tt.date, func(t *testing.T) {
+			id := tt.model + ":" + tt.date
+			ts := tt.date + "T12:00:00Z"
+			_, err := store.DB().ExecContext(t.Context(), `
+				INSERT INTO sessions (id, machine, project, agent, started_at, message_count)
+				VALUES ($1, 'test-machine', 'proj', 'codex', $2::timestamptz, 1)`, id, ts)
+			require.NoError(t, err)
+			_, err = store.DB().ExecContext(t.Context(), `
+				INSERT INTO messages (session_id, ordinal, role, content, timestamp, model, token_usage)
+				VALUES ($1, 0, 'assistant', 'hi', $2::timestamptz, $3,
+					'{"input_tokens":100000,"output_tokens":100000}')`, id, ts, tt.model)
+			require.NoError(t, err)
+			got, err := store.GetDailyUsage(t.Context(), db.UsageFilter{
+				From: tt.date, To: tt.date, Timezone: "UTC", Model: tt.model,
+			})
+			require.NoError(t, err)
+			assert.Equal(t, money.MustParseDollars(tt.cost), got.Totals.TotalCost)
+			require.NotNil(t, got.Pricing)
+			resolutions := got.Pricing.Models[tt.model].Resolutions
+			require.Len(t, resolutions, 1)
+			assert.Equal(t, "bedrock_mantle/"+tt.model, resolutions[0].PricedModel)
+		})
+	}
 }
 
 func TestStoreGetDailyUsageReturnsAggregateCostOverflow(t *testing.T) {
@@ -543,7 +581,7 @@ func TestStoreGetSessionUsagePricedModel(t *testing.T) {
 		INSERT INTO model_pricing (
 			model_pattern, input_microdollars_per_mtok, output_microdollars_per_mtok,
 			cache_creation_microdollars_per_mtok, cache_read_microdollars_per_mtok, updated_at
-		) VALUES ('gpt-5.1', 3000000, 15000000, 3750000, 300000, 'seed')`)
+		) VALUES ('priced-model', 3000000, 15000000, 3750000, 300000, 'seed')`)
 	require.NoError(t, err, "insert pricing")
 	_, err = store.DB().ExecContext(ctx, `
 		INSERT INTO sessions (
@@ -564,7 +602,7 @@ func TestStoreGetSessionUsagePricedModel(t *testing.T) {
 		) VALUES (
 			'codex:usage-priced', 1, 'assistant', 'done',
 			'2026-03-12T10:01:00Z'::timestamptz, 4,
-			'gpt-5.1',
+			'priced-model',
 			'{"input_tokens":1000,"output_tokens":500,"cache_creation_input_tokens":200,"cache_read_input_tokens":300}'
 		)`)
 	require.NoError(t, err, "insert message")
@@ -585,7 +623,7 @@ func TestStoreGetSessionUsagePricedModel(t *testing.T) {
 	// SQLite and DuckDB for the same cost (see db.CostUSDFromCost).
 	require.NotNil(t, got.CostUSD)
 	assert.InDelta(t, 0.01134, *got.CostUSD, 1e-9)
-	assert.Equal(t, []string{"gpt-5.1"}, got.Models)
+	assert.Equal(t, []string{"priced-model"}, got.Models)
 	assert.Empty(t, got.UnpricedModels)
 	require.Len(t, got.Breakdown, 1, "Breakdown")
 	entry := got.Breakdown[0]
@@ -595,7 +633,7 @@ func TestStoreGetSessionUsagePricedModel(t *testing.T) {
 	assert.Equal(t, "message", entry.Source)
 	assert.Equal(t, "Prompt 2", entry.Label)
 	assert.Equal(t, "2026-03-12T10:01:00Z", entry.Timestamp)
-	assert.Equal(t, "gpt-5.1", entry.Model)
+	assert.Equal(t, "priced-model", entry.Model)
 	assert.Equal(t, 1000, entry.InputTokens)
 	assert.Equal(t, 500, entry.OutputTokens)
 	assert.Equal(t, 200, entry.CacheCreationInputTokens)
@@ -611,7 +649,7 @@ func TestStoreSessionUsageRollupParity(t *testing.T) {
 		INSERT INTO model_pricing (
 			model_pattern, input_microdollars_per_mtok, output_microdollars_per_mtok,
 			cache_creation_microdollars_per_mtok, cache_read_microdollars_per_mtok, updated_at
-		) VALUES ('gpt-5.1', 3000000, 15000000, 3750000, 300000, 'seed')`)
+		) VALUES ('rollup-model', 3000000, 15000000, 3750000, 300000, 'seed')`)
 	require.NoError(t, err)
 	_, err = store.DB().ExecContext(ctx, `
 		INSERT INTO sessions (
@@ -627,9 +665,9 @@ func TestStoreSessionUsageRollupParity(t *testing.T) {
 			session_id, ordinal, role, content, timestamp, content_length,
 			model, token_usage, claude_message_id, claude_request_id
 		) VALUES
-			('pg-rollup-root', 0, 'assistant', 'root', '2026-03-12T10:00:00Z', 4, 'gpt-5.1', '{"input_tokens":1000,"output_tokens":500}', 'pg-rollup-shared', 'pg-rollup-request'),
-			('pg-rollup-child', 0, 'assistant', 'child', '2026-03-12T10:02:00Z', 5, 'gpt-5.1', '{"input_tokens":1000,"output_tokens":500}', 'pg-rollup-shared', 'pg-rollup-request'),
-			('pg-rollup-child', 1, 'assistant', 'child unique', '2026-03-12T10:03:00Z', 12, 'gpt-5.1', '{"input_tokens":1000,"output_tokens":500}', 'pg-rollup-unique', 'pg-rollup-unique-request')`)
+			('pg-rollup-root', 0, 'assistant', 'root', '2026-03-12T10:00:00Z', 4, 'rollup-model', '{"input_tokens":1000,"output_tokens":500}', 'pg-rollup-shared', 'pg-rollup-request'),
+			('pg-rollup-child', 0, 'assistant', 'child', '2026-03-12T10:02:00Z', 5, 'rollup-model', '{"input_tokens":1000,"output_tokens":500}', 'pg-rollup-shared', 'pg-rollup-request'),
+			('pg-rollup-child', 1, 'assistant', 'child unique', '2026-03-12T10:03:00Z', 12, 'rollup-model', '{"input_tokens":1000,"output_tokens":500}', 'pg-rollup-unique', 'pg-rollup-unique-request')`)
 	require.NoError(t, err)
 
 	rollup, err := service.GetSessionUsageRollup(ctx, store, "pg-rollup-root", false)
@@ -677,6 +715,17 @@ func TestStoreSessionUsageRollupUsesCopilotReportedSessionCost(t *testing.T) {
 	require.NoError(t, err)
 	require.True(t, rollup.HasCost)
 	assert.Equal(t, money.MustParseDollars("0.05"), rollup.Cost)
+	for _, filter := range []db.UsageFilter{{}, {Model: " , "}, {ExcludeModel: " , "}, {Model: " , ", ExcludeModel: " , "}} {
+		filter.From, filter.To, filter.Timezone = "2026-03-12", "2026-03-12", "UTC"
+		daily, err := store.GetDailyUsage(ctx, filter)
+		require.NoError(t, err)
+		assert.Equal(t, money.MustParseDollars("0.05"), daily.Totals.TotalCost)
+		top, err := store.GetTopSessionsByCost(ctx, filter, 10)
+		require.NoError(t, err)
+		require.Len(t, top, 2)
+		assert.Equal(t, money.MustParseDollars("0.03"), top[0].Cost)
+		assert.Equal(t, money.MustParseDollars("0.02"), top[1].Cost)
+	}
 }
 
 func TestStoreSessionUsageRollupIncludesUntimedRows(t *testing.T) {
@@ -686,7 +735,7 @@ func TestStoreSessionUsageRollupIncludesUntimedRows(t *testing.T) {
 		INSERT INTO model_pricing (
 			model_pattern, input_microdollars_per_mtok, output_microdollars_per_mtok,
 			cache_creation_microdollars_per_mtok, cache_read_microdollars_per_mtok, updated_at
-		) VALUES ('gpt-5.1', 3000000, 15000000, 3750000, 300000, 'seed')`)
+		) VALUES ('gpt-5.6-luna', 3000000, 15000000, 3750000, 300000, 'seed')`)
 	require.NoError(t, err)
 	_, err = store.DB().ExecContext(ctx, `
 		INSERT INTO sessions (
@@ -701,8 +750,8 @@ func TestStoreSessionUsageRollupIncludesUntimedRows(t *testing.T) {
 			session_id, ordinal, role, content, timestamp, content_length,
 			model, token_usage
 		) VALUES
-			('pg-rollup-untimed-root', 0, 'assistant', 'root', NULL, 4, 'gpt-5.1', '{"input_tokens":1000,"output_tokens":500}'),
-			('pg-rollup-untimed-child', 0, 'assistant', 'child', NULL, 5, 'gpt-5.1', '{"input_tokens":1000,"output_tokens":500}')`)
+			('pg-rollup-untimed-root', 0, 'assistant', 'root', NULL, 4, 'gpt-5.6-luna', '{"input_tokens":1000,"output_tokens":500}'),
+			('pg-rollup-untimed-child', 0, 'assistant', 'child', NULL, 5, 'gpt-5.6-luna', '{"input_tokens":1000,"output_tokens":500}')`)
 	require.NoError(t, err)
 
 	rollup, err := service.GetSessionUsageRollup(ctx, store, "pg-rollup-untimed-root", false)
@@ -1405,7 +1454,7 @@ func TestPostgresUsagePreservesSessionSummaryUsageEventTokens(t *testing.T) {
 		INSERT INTO model_pricing (
 			model_pattern, input_microdollars_per_mtok, output_microdollars_per_mtok,
 			cache_creation_microdollars_per_mtok, cache_read_microdollars_per_mtok, updated_at
-		) VALUES ('gpt-5.4', 1000000, 2000000, 0, 0, 'seed')`)
+		) VALUES ('summary-event-model', 1000000, 2000000, 0, 0, 'seed')`)
 	require.NoError(t, err, "insert pricing")
 	_, err = store.DB().ExecContext(ctx, `
 		INSERT INTO sessions (
@@ -1424,7 +1473,7 @@ func TestPostgresUsagePreservesSessionSummaryUsageEventTokens(t *testing.T) {
 			session_id, message_ordinal, source, model, input_tokens,
 			output_tokens, occurred_at, dedup_key
 		) VALUES (
-			'hermes-summary', 0, 'session', 'gpt-5.4', $1, $2,
+			'hermes-summary', 0, 'session', 'summary-event-model', $1, $2,
 			'2026-05-14T10:05:00Z'::timestamptz, 'session:hermes-summary'
 		)`, rawInput, rawOutput)
 	require.NoError(t, err, "insert usage event")
@@ -1471,7 +1520,7 @@ func TestPostgresUsageCostsMessageReasoningTokens(t *testing.T) {
 		INSERT INTO model_pricing (
 			model_pattern, input_microdollars_per_mtok, output_microdollars_per_mtok,
 			cache_creation_microdollars_per_mtok, cache_read_microdollars_per_mtok, updated_at
-		) VALUES ('gpt-5.4', 1000000, 2000000, 0, 0, 'seed')`)
+		) VALUES ('reasoning-model', 1000000, 2000000, 0, 0, 'seed')`)
 	require.NoError(t, err, "insert pricing")
 	_, err = store.DB().ExecContext(ctx, `
 		INSERT INTO sessions (
@@ -1489,7 +1538,7 @@ func TestPostgresUsageCostsMessageReasoningTokens(t *testing.T) {
 		) VALUES (
 			'pg-message-reasoning', 0, 'assistant', 'done',
 			'2026-05-14T10:30:00Z'::timestamptz, 4,
-			'gpt-5.4',
+			'reasoning-model',
 			'{"input_tokens":1000,"output_tokens":0,"reasoning_tokens":3000000000}'
 		)`)
 	require.NoError(t, err, "insert message")
@@ -1584,7 +1633,7 @@ func TestPushSyncsModelPricingToPostgres(t *testing.T) {
 		}},
 	}}), "UpsertModelPricing")
 
-	ps, err := New(pgURL, "agentsview", local, "test-machine", true, SyncOptions{})
+	ps, err := New(pgURL, "agentsview", local, "test-machine", true, storage.PusherOptions{})
 	require.NoError(t, err, "New")
 	defer ps.Close()
 
@@ -1673,13 +1722,85 @@ func TestPushSyncsModelPricingToPostgres(t *testing.T) {
 		"band removal must advance the parent pricing revision")
 }
 
+func TestPushRetiresOpenRouterPricingRows(t *testing.T) {
+	pgURL := testPGURL(t)
+	cleanPGSchema(t, pgURL)
+	t.Cleanup(func() { cleanPGSchema(t, pgURL) })
+
+	local := testDB(t)
+	require.NoError(t, local.ReconcileModelPricing(
+		[]db.ModelPricing{{
+			ModelPattern: "minimax/minimax-m3",
+			InputPerMTok: money.MustParseDollars("9"),
+			Bands: []db.PricingBand{{
+				AboveInputTokens: 1000,
+				InputPerMTok:     money.MustParseDollars("10"),
+			}},
+		}},
+		nil,
+		db.PricingMeta{
+			Key:   pricing.OpenRouterModelsMetaKey,
+			Value: `["minimax/minimax-m3"]`,
+		},
+	))
+	ps, err := New(pgURL, "agentsview", local, "test-machine", true, storage.PusherOptions{})
+	require.NoError(t, err, "New")
+	defer ps.Close()
+	_, err = ps.Push(context.Background(), false, nil)
+	require.NoError(t, err, "first push")
+
+	// LiteLLM now covers the model: the local refresh retires the
+	// OpenRouter row and rewrites the ownership sentinel.
+	require.NoError(t, local.ReconcileModelPricing(
+		[]db.ModelPricing{{
+			ModelPattern: "minimax/MiniMax-M3",
+			InputPerMTok: money.MustParseDollars("2"),
+		}},
+		[]string{"minimax/minimax-m3"},
+		db.PricingMeta{Key: pricing.OpenRouterModelsMetaKey, Value: `[]`},
+	))
+	_, err = ps.Push(context.Background(), false, nil)
+	require.NoError(t, err, "second push")
+
+	store, err := NewStore(pgURL, "agentsview", true)
+	require.NoError(t, err, "NewStore")
+	defer store.Close()
+	var patterns []string
+	rows, err := store.DB().QueryContext(context.Background(), `
+		SELECT model_pattern FROM model_pricing
+		WHERE model_pattern IN ('minimax/minimax-m3', 'minimax/MiniMax-M3')
+		ORDER BY model_pattern`)
+	require.NoError(t, err)
+	defer rows.Close()
+	for rows.Next() {
+		var pattern string
+		require.NoError(t, rows.Scan(&pattern))
+		patterns = append(patterns, pattern)
+	}
+	require.NoError(t, rows.Err())
+	assert.Equal(t, []string{"minimax/MiniMax-M3"}, patterns,
+		"retired row deleted, replacement pushed")
+
+	var bandCount int
+	require.NoError(t, store.DB().QueryRowContext(context.Background(), `
+		SELECT COUNT(*) FROM model_pricing_bands
+		WHERE model_pattern = 'minimax/minimax-m3'`).Scan(&bandCount))
+	assert.Zero(t, bandCount, "retired row's bands deleted")
+
+	var meta string
+	require.NoError(t, store.DB().QueryRowContext(context.Background(), `
+		SELECT updated_at FROM model_pricing WHERE model_pattern = $1`,
+		pricing.OpenRouterModelsMetaKey).Scan(&meta))
+	assert.Equal(t, `[]`, meta, "ownership sentinel mirrored by value")
+}
+
 func TestPushFallsBackToBuiltinPricingWhenLocalTableEmpty(t *testing.T) {
 	pgURL := testPGURL(t)
 	cleanPGSchema(t, pgURL)
 	t.Cleanup(func() { cleanPGSchema(t, pgURL) })
 
 	local := testDB(t)
-	ps, err := New(pgURL, "agentsview", local, "test-machine", true, SyncOptions{})
+	ps, err := New(pgURL, "agentsview", local, "test-machine", true, storage.PusherOptions{})
 	require.NoError(t, err, "New")
 	defer ps.Close()
 
@@ -1930,6 +2051,12 @@ func TestStoreSessionUsageWithSubagentsParity(t *testing.T) {
 	assert.Equal(t, map[string]struct{}{
 		"pg-sub-parent": {}, "agent-pg-a": {}, "agent-pg-dedup-only": {},
 	}, rowSet.DiscardedContributingSessions)
+	assert.Equal(t, map[string]activity.SessionTokenCoverage{
+		"pg-sub-parent":       {OutputTokens: 500, PeakContextTokens: 1000},
+		"agent-pg-a":          {OutputTokens: 1500, PeakContextTokens: 2000},
+		"agent-pg-b":          {OutputTokens: 100, PeakContextTokens: 500},
+		"agent-pg-dedup-only": {OutputTokens: 500, PeakContextTokens: 1000},
+	}, rowSet.CanonicalTokenCoverageBySession)
 	require.Len(t, rowSet.Rows, 3)
 	assert.Equal(t, []string{
 		"agent-pg-a", "agent-pg-b", "agent-pg-dedup-only",

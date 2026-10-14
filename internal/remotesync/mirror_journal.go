@@ -1,11 +1,9 @@
 package remotesync
 
 import (
-	"bytes"
-	"encoding/json"
+	"encoding/json/v2"
 	"errors"
 	"fmt"
-	"io"
 	"io/fs"
 	"os"
 	pathpkg "path"
@@ -14,6 +12,7 @@ import (
 	"strings"
 
 	"go.kenn.io/agentsview/internal/parser"
+	"go.kenn.io/kit/atomicfile"
 )
 
 const (
@@ -140,8 +139,7 @@ func mergeMirrorChangesWithForce(
 	fileScopedPathBytes := 0
 	if journal.FileScopedDirs != nil {
 		var err error
-		fileScopedPathCount, fileScopedPathBytes, err =
-			validateFileScopedJournalDirs(journal.FileScopedDirs)
+		fileScopedPathCount, fileScopedPathBytes, err = validateFileScopedJournalDirs(journal.FileScopedDirs)
 		if err != nil {
 			return MirrorChangeJournal{}, JournalMergeStats{}, err
 		}
@@ -275,7 +273,7 @@ func loadMirrorChangeJournal(path string) (MirrorChangeJournal, error) {
 	}
 	if err != nil {
 		return MirrorChangeJournal{}, fmt.Errorf(
-			"%w: read %q: %v", ErrUnreadableMirrorJournal, path, err,
+			"%w: read %q: %w", ErrUnreadableMirrorJournal, path, err,
 		)
 	}
 
@@ -284,7 +282,7 @@ func loadMirrorChangeJournal(path string) (MirrorChangeJournal, error) {
 	}
 	if err := json.Unmarshal(data, &header); err != nil {
 		return MirrorChangeJournal{}, fmt.Errorf(
-			"%w: decode %q: %v", ErrMalformedMirrorJournal, path, err,
+			"%w: decode %q: %w", ErrMalformedMirrorJournal, path, err,
 		)
 	}
 	if header.Version != mirrorJournalVersion {
@@ -294,36 +292,19 @@ func loadMirrorChangeJournal(path string) (MirrorChangeJournal, error) {
 	}
 
 	var journal MirrorChangeJournal
-	decoder := json.NewDecoder(bytes.NewReader(data))
-	decoder.DisallowUnknownFields()
-	if err := decoder.Decode(&journal); err != nil {
+	if err := json.Unmarshal(
+		data, &journal, json.RejectUnknownMembers(true),
+	); err != nil {
 		return MirrorChangeJournal{}, fmt.Errorf(
-			"%w: decode %q: %v", ErrMalformedMirrorJournal, path, err,
-		)
-	}
-	if err := requireJSONEOF(decoder); err != nil {
-		return MirrorChangeJournal{}, fmt.Errorf(
-			"%w: decode %q: %v", ErrMalformedMirrorJournal, path, err,
+			"%w: decode %q: %w", ErrMalformedMirrorJournal, path, err,
 		)
 	}
 	if err := validateMirrorChangeJournal(journal); err != nil {
 		return MirrorChangeJournal{}, fmt.Errorf(
-			"%w: validate %q: %v", ErrMalformedMirrorJournal, path, err,
+			"%w: validate %q: %w", ErrMalformedMirrorJournal, path, err,
 		)
 	}
 	return journal, nil
-}
-
-func requireJSONEOF(decoder *json.Decoder) error {
-	var trailing any
-	err := decoder.Decode(&trailing)
-	if errors.Is(err, io.EOF) {
-		return nil
-	}
-	if err == nil {
-		return errors.New("unexpected trailing JSON value")
-	}
-	return err
 }
 
 func validateMirrorChangeJournal(journal MirrorChangeJournal) error {
@@ -360,8 +341,7 @@ func validateMirrorChangeJournal(journal MirrorChangeJournal) error {
 	fileScopedPathBytes := 0
 	if journal.FileScopedDirs != nil {
 		var err error
-		fileScopedPathCount, fileScopedPathBytes, err =
-			validateFileScopedJournalDirs(journal.FileScopedDirs)
+		fileScopedPathCount, fileScopedPathBytes, err = validateFileScopedJournalDirs(journal.FileScopedDirs)
 		if err != nil {
 			return err
 		}
@@ -437,7 +417,7 @@ type mirrorJournalStore struct {
 func newMirrorJournalStore() mirrorJournalStore {
 	return mirrorJournalStore{
 		createTemp: os.CreateTemp,
-		rename:     os.Rename,
+		rename:     atomicfile.Replace,
 		remove:     os.Remove,
 		open:       os.Open,
 	}

@@ -1,8 +1,7 @@
 package service_test
 
 import (
-	"context"
-	"encoding/json"
+	"encoding/json/jsontext"
 	"fmt"
 	"testing"
 
@@ -102,14 +101,61 @@ func usageMessage(
 	msg.Model = "test-opus"
 	msg.ClaudeMessageID = messageID
 	msg.ClaudeRequestID = "req-" + messageID
-	msg.TokenUsage = json.RawMessage(fmt.Sprintf(
+	msg.TokenUsage = jsontext.Value(fmt.Sprintf(
 		`{"input_tokens":%d,"output_tokens":%d}`, in, out))
 	return msg
 }
 
+func TestSessionUsageWithRequiredSubagentsRequiresPerSessionContextCoverage(
+	t *testing.T,
+) {
+	d := dbtest.OpenTestDB(t)
+	ctx := t.Context()
+	parent := subagentParentID
+	started := subagentUsageDay + "T09:00:00Z"
+	dbtest.SeedSession(t, d, subagentParentID, "proj", func(s *db.Session) {
+		s.Agent = "claude"
+		s.StartedAt = &started
+		s.EndedAt = &started
+		s.TotalOutputTokens = 10
+		s.HasTotalOutputTokens = true
+		s.PeakContextTokens = 2000
+		s.HasPeakContextTokens = true
+	})
+	dbtest.SeedSession(t, d, subagentChildAID, "proj", func(s *db.Session) {
+		s.Agent = "claude"
+		s.StartedAt = &started
+		s.EndedAt = &started
+		s.ParentSessionID = &parent
+		s.RelationshipType = "subagent"
+		s.TotalOutputTokens = 10
+		s.HasTotalOutputTokens = true
+		s.PeakContextTokens = 1000
+		s.HasPeakContextTokens = true
+	})
+	dbtest.SeedMessages(t, d,
+		usageMessage(subagentParentID, 0, "10:00:00", "m-parent", 2000, 10),
+		usageMessage(subagentChildAID, 0, "10:01:00", "m-child", 0, 10),
+	)
+
+	got, _, err := service.SessionUsageWithRequiredSubagents(
+		ctx, d, subagentParentID, []string{subagentChildAID}, true)
+	require.NoError(t, err)
+	require.NotNil(t, got)
+
+	_, complete, err := service.SessionUsageTokenTotals(ctx, got)
+	require.NoError(t, err)
+	assert.False(t, complete,
+		"the parent's context must not cover the child's missing context categories")
+	assert.False(t, got.HasCost,
+		"computed cost must not omit the child's uncovered context categories")
+	assert.Zero(t, got.Cost)
+	assert.Nil(t, got.CostUSD)
+}
+
 func TestSessionUsageWithSubagentsOverSQLiteCombinesAndDedupes(t *testing.T) {
 	d := dbtest.OpenTestDB(t)
-	ctx := context.Background()
+	ctx := t.Context()
 	seedSubagentUsageFixture(t, d)
 
 	own, err := d.GetSessionUsage(ctx, subagentParentID, true)
@@ -168,7 +214,7 @@ func TestSessionUsageWithSubagentsDoesNotRestoreDedupedOnlyChildTokens(
 	t *testing.T,
 ) {
 	d := dbtest.OpenTestDB(t)
-	ctx := context.Background()
+	ctx := t.Context()
 
 	require.NoError(t, d.UpsertModelPricing([]db.ModelPricing{{
 		ModelPattern:  "test-opus",
@@ -202,7 +248,7 @@ func TestSessionUsageWithSubagentsPreservesOutputOnlyTokensAcrossSnapshots(
 	t *testing.T,
 ) {
 	d := dbtest.OpenTestDB(t)
-	ctx := context.Background()
+	ctx := t.Context()
 	require.NoError(t, d.UpsertModelPricing([]db.ModelPricing{{
 		ModelPattern:  "test-opus",
 		InputPerMTok:  money.MustParseDollars("2.0"),
@@ -244,7 +290,7 @@ func TestSessionUsageRollupRecognizesChildSourcedAttributedSnapshot(
 	t *testing.T,
 ) {
 	d := dbtest.OpenTestDB(t)
-	ctx := context.Background()
+	ctx := t.Context()
 	require.NoError(t, d.UpsertModelPricing([]db.ModelPricing{{
 		ModelPattern:  "test-opus",
 		InputPerMTok:  money.MustParseDollars("2.0"),
@@ -272,7 +318,7 @@ func TestSessionUsageRollupRecognizesChildSourcedAttributedSnapshot(
 
 func TestSessionUsageWithSubagentsPreservesOutputWithoutUsageRows(t *testing.T) {
 	d := dbtest.OpenTestDB(t)
-	ctx := context.Background()
+	ctx := t.Context()
 
 	require.NoError(t, d.UpsertModelPricing([]db.ModelPricing{{
 		ModelPattern:  "test-opus",
@@ -303,7 +349,7 @@ func TestSessionUsageWithSubagentsPreservesOutputWithoutUsageRows(t *testing.T) 
 
 func TestSessionUsageWithSubagentsMarksRowlessContextIncomplete(t *testing.T) {
 	d := dbtest.OpenTestDB(t)
-	ctx := context.Background()
+	ctx := t.Context()
 
 	require.NoError(t, d.UpsertModelPricing([]db.ModelPricing{{
 		ModelPattern:  "test-opus",
@@ -322,29 +368,35 @@ func TestSessionUsageWithSubagentsMarksRowlessContextIncomplete(t *testing.T) {
 		s.EndedAt = &started
 		s.ParentSessionID = &parent
 		s.RelationshipType = "subagent"
-		s.PeakContextTokens = 2_000
+		s.PeakContextTokens = 1_000
 		s.HasPeakContextTokens = true
 	})
 	dbtest.SeedMessages(t, d,
 		usageMessage(parentID, 0, "10:00:00", "m-priced", 1000, 500),
 	)
 
-	got, err := service.SessionUsageWithSubagents(ctx, d, parentID, true)
+	got, _, err := service.SessionUsageWithRequiredSubagents(
+		ctx, d, parentID, []string{childID}, true)
 	require.NoError(t, err)
 	require.NotNil(t, got)
 
 	assert.Equal(t, 1, got.BreakdownCount)
 	assert.Equal(t, 500, got.TotalOutputTokens)
-	assert.Equal(t, 2_000, got.PeakContextTokens,
+	assert.Equal(t, 1_000, got.PeakContextTokens,
 		"the rowless subagent's context high-water mark remains visible")
 	assert.True(t, got.HasTokenData)
 	assert.False(t, got.HasCost,
 		"priced parent rows do not cover a rowless subagent's context tokens")
+	totals, complete, err := service.SessionUsageTokenTotals(ctx, got)
+	require.NoError(t, err)
+	assert.False(t, complete,
+		"parent rows do not prove the required subagent's input and cache usage")
+	assert.Equal(t, 1_000, totals.InputTokens)
 }
 
 func TestSessionUsageWithSubagentsAllowsExplicitZeroValuedSubagent(t *testing.T) {
 	d := dbtest.OpenTestDB(t)
-	ctx := context.Background()
+	ctx := t.Context()
 
 	require.NoError(t, d.UpsertModelPricing([]db.ModelPricing{{
 		ModelPattern:  "test-opus",
@@ -393,7 +445,7 @@ func TestSessionUsageWithSubagentsIgnoresZeroRowForContextCoverage(t *testing.T)
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
 			d := dbtest.OpenTestDB(t)
-			ctx := context.Background()
+			ctx := t.Context()
 			require.NoError(t, d.UpsertModelPricing([]db.ModelPricing{{
 				ModelPattern:  "test-opus",
 				InputPerMTok:  money.MustParseDollars("2.0"),
@@ -436,7 +488,7 @@ func TestSessionUsageWithSubagentsIgnoresZeroRowForContextCoverage(t *testing.T)
 
 func TestSessionUsageWithSubagentsDeductsStreamingSnapshotsOnce(t *testing.T) {
 	d := dbtest.OpenTestDB(t)
-	ctx := context.Background()
+	ctx := t.Context()
 
 	require.NoError(t, d.UpsertModelPricing([]db.ModelPricing{{
 		ModelPattern:  "test-opus",
@@ -487,7 +539,7 @@ func TestSessionUsageWithSubagentsDeductsStreamingSnapshotsOnce(t *testing.T) {
 // view, not a relabeling of the archive.
 func TestSessionUsageWithSubagentsIsQueriedFromTheChildToo(t *testing.T) {
 	d := dbtest.OpenTestDB(t)
-	ctx := context.Background()
+	ctx := t.Context()
 	seedSubagentUsageFixture(t, d)
 
 	got, err := service.SessionUsageWithSubagents(ctx, d, subagentChildBID, true)
@@ -504,7 +556,7 @@ func TestSessionUsageWithSubagentsIsQueriedFromTheChildToo(t *testing.T) {
 // computed.
 func TestSubagentRollupLeavesDayAggregatesUnchanged(t *testing.T) {
 	d := dbtest.OpenTestDB(t)
-	ctx := context.Background()
+	ctx := t.Context()
 	seedSubagentUsageFixture(t, d)
 
 	filter := db.UsageFilter{
@@ -539,10 +591,10 @@ func TestSubagentRollupLeavesDayAggregatesUnchanged(t *testing.T) {
 
 // TestSessionUsageWithSubagentsReportsTokenDataForEmptyParent covers the exit
 // code contract: a parent whose only usage lives in its subagents must look
-// like it has data.
+// like it has data in the ordinary archive view.
 func TestSessionUsageWithSubagentsReportsTokenDataForEmptyParent(t *testing.T) {
 	d := dbtest.OpenTestDB(t)
-	ctx := context.Background()
+	ctx := t.Context()
 
 	require.NoError(t, d.UpsertModelPricing([]db.ModelPricing{{
 		ModelPattern:  "test-opus",

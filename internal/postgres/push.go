@@ -6,9 +6,10 @@ import (
 	"crypto/sha256"
 	"database/sql"
 	"encoding/hex"
-	"encoding/json"
+	"encoding/json/v2"
 	"errors"
 	"fmt"
+	"iter"
 	"log"
 	"maps"
 	"slices"
@@ -19,18 +20,21 @@ import (
 
 	"go.kenn.io/agentsview/internal/db"
 	"go.kenn.io/agentsview/internal/export"
+	"go.kenn.io/agentsview/internal/parser"
+	"go.kenn.io/agentsview/internal/storage"
 )
 
 const (
-	lastPushBoundaryStateKey           = "last_push_boundary_state"
-	lastPushSourceArchiveIDKey         = "pg_source_archive_id_v1"
-	lastPushTargetFingerprintKey       = "pg_target_fingerprint_v1"
-	sessionAliasBackfillStateKey       = "pg_session_alias_backfill_v1"
-	legacyProjectIdentityStateKey      = "project_identity_publication_revision_v2"
-	projectIdentityPublicationStateKey = "project_identity_publication_revision_v3"
-	transcriptRevisionBackfillStateKey = "pg_transcript_revision_backfill_v1"
-	sessionProvenanceBackfillStateKey  = "pg_session_provenance_backfill_v2"
-	unfilteredPublicationScope         = "all-projects"
+	lastPushBoundaryStateKey               = "last_push_boundary_state"
+	lastPushSourceArchiveIDKey             = "pg_source_archive_id_v1"
+	lastPushTargetFingerprintKey           = "pg_target_fingerprint_v1"
+	sessionAliasBackfillStateKey           = "pg_session_alias_backfill_v1"
+	legacyProjectIdentityStateKey          = "project_identity_publication_revision_v2"
+	projectIdentityPublicationStateKey     = "project_identity_publication_revision_v3"
+	transcriptRevisionBackfillStateKey     = "pg_transcript_revision_backfill_v1"
+	sessionProvenanceBackfillStateKey      = "pg_session_provenance_backfill_v2"
+	timestampNormalizationBackfillStateKey = "pg_timestamp_normalization_backfill_v1"
+	unfilteredPublicationScope             = "all-projects"
 )
 
 // pushMarkerIDStateKey names the local sync-state entry holding this DB's
@@ -42,22 +46,14 @@ const (
 	pushMarkerMachineAliasesKeyPrefix = "push_marker_machine_aliases:"
 )
 
-var errSessionOwnershipConflict = errors.New("session ownership conflict")
-var errSessionExcluded = errors.New("session excluded")
+var (
+	errSessionOwnershipConflict = errors.New("session ownership conflict")
+	errSessionExcluded          = errors.New("session excluded")
+)
 
 type pushBoundaryState struct {
 	Cutoff       string            `json:"cutoff"`
 	Fingerprints map[string]string `json:"fingerprints"`
-}
-
-// PushResult summarizes a push sync operation.
-type PushResult struct {
-	SessionsPushed   int
-	MessagesPushed   int
-	SkippedConflicts int
-	Errors           int
-	Duration         time.Duration
-	Vectors          VectorPushResult
 }
 
 // pushPrepareProgressStride bounds how many sessions the fingerprint loop
@@ -78,67 +74,24 @@ func timedPushSetupStep(name string, fn func() error) error {
 	return nil
 }
 
-// PushProgress is reported after each batch during Push.
-type PushProgress struct {
-	// Phase is "preparing" while per-session push fingerprints are computed
-	// (SessionsDone/SessionsTotal count candidate sessions fingerprinted; on
-	// a full push this covers every local session and can run for minutes),
-	// "" during the session/message push, and "vectors" during the vector
-	// phase, whose progress is carried by the Vector* fields.
-	Phase            string
-	SessionsDone     int
-	SessionsTotal    int
-	MessagesDone     int
-	SkippedConflicts int
-	Errors           int
-	// VectorSessionsDone counts local sessions examined by the vector
-	// phase's delta scan (most are unchanged and skipped cheaply);
-	// VectorSessionsTotal is the local candidate count and
-	// VectorChunksPushed the embedding chunks written so far.
-	VectorSessionsDone  int
-	VectorSessionsTotal int
-	VectorChunksPushed  int
-}
-
-// PushOptions controls a single push. The zero value matches Push's
-// historical behavior.
-type PushOptions struct {
-	// Full bypasses unchanged-fingerprint and unchanged-hash skips so
-	// every session is resent.
-	Full bool
-	// ScopeVectorsToChangedSessions limits the vector phase's local
-	// hash read and PG state read to this push's changed relational
-	// sessions, instead of reconciling the whole generation. Ignored
-	// when the push runs (or is internally promoted to run) full, so
-	// reset recovery and backfills keep generation-wide reconciliation.
-	ScopeVectorsToChangedSessions bool
-	// LastReconciledVectorGeneration is the PG generation id the caller
-	// last reconciled generation-wide. When a scoped push resolves a
-	// different active generation id, the vector phase promotes itself to a
-	// generation-wide read so a newly active or recreated generation is
-	// never left partially populated (see pushVectors). Zero on the first
-	// push, which the reconcile bit already forces generation-wide.
-	LastReconciledVectorGeneration int64
-}
-
 // Push syncs local sessions and messages to PostgreSQL.
 // The onProgress callback, if non-nil, is called after each
 // batch with current totals.
 func (s *Sync) Push(
 	ctx context.Context, full bool,
-	onProgress func(PushProgress),
-) (PushResult, error) {
-	return s.PushWithOptions(ctx, PushOptions{Full: full}, onProgress)
+	onProgress func(storage.PushProgress),
+) (storage.PushResult, error) {
+	return s.PushWithOptions(ctx, storage.PushOptions{Full: full}, onProgress)
 }
 
-// PushWithOptions is Push with per-push options; see PushOptions.
+// PushWithOptions is Push with per-push options; see storage.PushOptions.
 func (s *Sync) PushWithOptions(
-	ctx context.Context, opts PushOptions,
-	onProgress func(PushProgress),
-) (PushResult, error) {
+	ctx context.Context, opts storage.PushOptions,
+	onProgress func(storage.PushProgress),
+) (storage.PushResult, error) {
 	full := opts.Full
 	start := time.Now()
-	var result PushResult
+	var result storage.PushResult
 	state := s.effectiveSyncState()
 	aliasBackfillState := s.aliasBackfillSyncStateOrDefault()
 
@@ -147,7 +100,7 @@ func (s *Sync) PushWithOptions(
 	// produces no per-batch reports, and some of it runs for minutes on a
 	// full push against a remote target.
 	if onProgress != nil {
-		onProgress(PushProgress{Phase: "preparing"})
+		onProgress(storage.PushProgress{Phase: "preparing"})
 	}
 
 	if err := CheckDataVersionCompat(ctx, s.pg); err != nil {
@@ -158,13 +111,13 @@ func (s *Sync) PushWithOptions(
 		return result, err
 	}
 
-	lastPush, err := state.GetSyncState("last_push_at")
+	lastPush, err := state.GetSyncState(ctx, "last_push_at")
 	if err != nil {
 		return result, fmt.Errorf(
 			"reading last_push_at: %w", err,
 		)
 	}
-	storedTargetFingerprint, err := state.GetSyncState(
+	storedTargetFingerprint, err := state.GetSyncState(ctx,
 		lastPushTargetFingerprintKey,
 	)
 	if err != nil {
@@ -173,7 +126,7 @@ func (s *Sync) PushWithOptions(
 			lastPushTargetFingerprintKey, err,
 		)
 	}
-	boundaryState, err := state.GetSyncState(
+	boundaryState, err := state.GetSyncState(ctx,
 		lastPushBoundaryStateKey,
 	)
 	if err != nil {
@@ -193,7 +146,7 @@ func (s *Sync) PushWithOptions(
 			"pgsync: %s; clearing local push watermark state",
 			reason,
 		)
-		if err := clearPushState(state); err != nil {
+		if err := clearPushState(ctx, state); err != nil {
 			return result, err
 		}
 		lastPush = ""
@@ -206,7 +159,7 @@ func (s *Sync) PushWithOptions(
 	}
 	s.archiveID = archiveID
 	repairedPreviousArchiveID := ""
-	storedArchiveID, err := state.GetSyncState(lastPushSourceArchiveIDKey)
+	storedArchiveID, err := state.GetSyncState(ctx, lastPushSourceArchiveIDKey)
 	if err != nil {
 		return result, fmt.Errorf(
 			"reading %s: %w", lastPushSourceArchiveIDKey, err,
@@ -220,7 +173,7 @@ func (s *Sync) PushWithOptions(
 			return result, err
 		}
 		repairedPreviousArchiveID = storedArchiveID
-		if err := clearPushState(state); err != nil {
+		if err := clearPushState(ctx, state); err != nil {
 			return result, err
 		}
 		lastPush = ""
@@ -233,7 +186,7 @@ func (s *Sync) PushWithOptions(
 		return result, fmt.Errorf("reading database generation: %w", err)
 	}
 	s.databaseGeneration = databaseGeneration
-	markerID, err := s.pushMarkerID()
+	markerID, err := s.pushMarkerID(ctx)
 	if err != nil {
 		return result, err
 	}
@@ -249,8 +202,8 @@ func (s *Sync) PushWithOptions(
 	// Keep the backfill marker scoped to target only; all other push
 	// state remains scoped by full effective sync state (including filter
 	// fingerprint when present).
-	aliasBackfillNeeded := false
-	full, aliasBackfillNeeded, err = applySessionAliasBackfillRequirement(
+	var aliasBackfillNeeded bool
+	full, aliasBackfillNeeded, err = applySessionAliasBackfillRequirement(ctx,
 		aliasBackfillState, full,
 	)
 	if err != nil {
@@ -268,8 +221,8 @@ func (s *Sync) PushWithOptions(
 		// its watermark and boundary fingerprints.
 		provenanceBackfillState = state
 	}
-	provenanceBackfillNeeded := false
-	full, provenanceBackfillNeeded, err = applySessionProvenanceBackfillRequirement(
+	var provenanceBackfillNeeded bool
+	full, provenanceBackfillNeeded, err = applySessionProvenanceBackfillRequirement(ctx,
 		provenanceBackfillState, full,
 	)
 	if err != nil {
@@ -280,15 +233,24 @@ func (s *Sync) PushWithOptions(
 			"pgsync: session provenance backfill marker missing; forcing full push",
 		)
 	}
-	transcriptRevisionBackfillNeeded := false
-	full, transcriptRevisionBackfillNeeded, err =
-		applyTranscriptRevisionBackfillRequirement(state, full)
+	var transcriptRevisionBackfillNeeded bool
+	full, transcriptRevisionBackfillNeeded, err = applyTranscriptRevisionBackfillRequirement(ctx, state, full)
 	if err != nil {
 		return result, err
 	}
 	if transcriptRevisionBackfillNeeded {
 		log.Printf(
 			"pgsync: transcript revision backfill marker missing; forcing full push",
+		)
+	}
+	var timestampNormalizationBackfillNeeded bool
+	full, timestampNormalizationBackfillNeeded, err = applyTimestampNormalizationBackfillRequirement(ctx, state, full)
+	if err != nil {
+		return result, err
+	}
+	if timestampNormalizationBackfillNeeded {
+		log.Printf(
+			"pgsync: timestamp normalization backfill marker missing; forcing full push",
 		)
 	}
 	if full {
@@ -308,7 +270,7 @@ func (s *Sync) PushWithOptions(
 		// watermark and boundary state so the next
 		// unfiltered push also starts from scratch.
 		if s.isFiltered() && !pushStateCleared {
-			if err := clearPushState(state); err != nil {
+			if err := clearPushState(ctx, state); err != nil {
 				return result, err
 			}
 		}
@@ -344,7 +306,7 @@ func (s *Sync) PushWithOptions(
 			// watermark and boundary state so the next
 			// unfiltered push also starts from scratch.
 			if s.isFiltered() && !pushStateCleared {
-				if err := clearPushState(state); err != nil {
+				if err := clearPushState(ctx, state); err != nil {
 					return result, err
 				}
 			}
@@ -367,13 +329,15 @@ func (s *Sync) PushWithOptions(
 				identityRefreshSessionIDs, candidate.ID,
 			)
 		}
-		reconciledScopeMoveIDs, scopeErr = reconcilePGProjectScopeMoves(
-			ctx, s.pg, markerID, scopeMoveCandidates,
-			s.projects, s.excludeProjects,
+		reconciledScopeMoveIDs, scopeErr = s.reconcilePGProjectScopeMoves(
+			ctx, markerID, legacyMarkerMachines, scopeMoveCandidates,
 		)
 		if scopeErr != nil {
 			return result, scopeErr
 		}
+	}
+	if err := s.syncMachineMetadata(ctx); err != nil {
+		return result, err
 	}
 	if err := timedPushSetupStep("model pricing sync",
 		func() error { return s.syncModelPricing(ctx) }); err != nil {
@@ -413,7 +377,7 @@ func (s *Sync) PushWithOptions(
 	sessionFingerprints := make(map[string]string, len(sessionByID))
 	if !full {
 		var bErr error
-		priorFingerprints, _, _, bErr = readBoundaryAndFingerprints(
+		priorFingerprints, _, _, bErr = readBoundaryAndFingerprints(ctx,
 			state, lastPush,
 		)
 		if bErr != nil {
@@ -425,7 +389,7 @@ func (s *Sync) PushWithOptions(
 	}
 
 	if err := purgePGExcludedPushSessions(
-		ctx, s.pg, sessionByID,
+		ctx, s.pg, sessionByID, markerID, s.machine, legacyMarkerMachines,
 	); err != nil {
 		return result, err
 	}
@@ -448,7 +412,7 @@ func (s *Sync) PushWithOptions(
 		if onProgress == nil {
 			return
 		}
-		onProgress(PushProgress{
+		onProgress(storage.PushProgress{
 			Phase:         "preparing",
 			SessionsDone:  done,
 			SessionsTotal: len(sessionByID),
@@ -477,10 +441,10 @@ func (s *Sync) PushWithOptions(
 			}
 			sess := sessionByID[id]
 			sessionFingerprints[id] = sessionPushFingerprint(
-				sess, pushedSessionMachine(sess, s.machine),
+				sess, db.MirroredSessionMachine(sess, s.machine),
 				s.archiveID, usageFP, markerID,
 				dependencyFP+"\x00source-database-generation:"+
-					s.databaseGeneration,
+					s.databaseGeneration+"\x00archive-content:"+string(s.local.ArchiveContent()),
 			)
 			prepared++
 			if prepared%pushPrepareProgressStride == 0 {
@@ -520,7 +484,7 @@ func (s *Sync) PushWithOptions(
 			// Filtered pushes use filter-scoped sync state, so
 			// they can advance their own watermark without
 			// moving the unfiltered/global cursor.
-			if err := finalizeFilteredPushState(
+			if err := finalizeFilteredPushState(ctx,
 				state, lastPush, cutoff, sessions,
 				priorFingerprints, sessionFingerprints,
 				result.Errors,
@@ -528,7 +492,7 @@ func (s *Sync) PushWithOptions(
 				return result, err
 			}
 		} else {
-			if err := finalizeUnfilteredPushState(
+			if err := finalizeUnfilteredPushState(ctx,
 				state, lastPush, cutoff, sessions,
 				priorFingerprints, sessionFingerprints,
 				result.Errors,
@@ -536,7 +500,7 @@ func (s *Sync) PushWithOptions(
 				return result, err
 			}
 		}
-		if err := persistPushTargetFingerprint(
+		if err := persistPushTargetFingerprint(ctx,
 			state, s.targetFingerprint,
 		); err != nil {
 			return result, err
@@ -546,18 +510,23 @@ func (s *Sync) PushWithOptions(
 		); err != nil {
 			return result, err
 		}
-		if err := completeSessionAliasBackfill(
+		if err := completeSessionAliasBackfill(ctx,
 			aliasBackfillState, aliasBackfillNeeded, result,
 		); err != nil {
 			return result, err
 		}
-		if err := completeSessionProvenanceBackfill(
+		if err := completeSessionProvenanceBackfill(ctx,
 			provenanceBackfillState, provenanceBackfillNeeded, result,
 		); err != nil {
 			return result, err
 		}
-		if err := completeTranscriptRevisionBackfill(
+		if err := completeTranscriptRevisionBackfill(ctx,
 			state, transcriptRevisionBackfillNeeded, result,
+		); err != nil {
+			return result, err
+		}
+		if err := completeTimestampNormalizationBackfill(ctx,
+			state, timestampNormalizationBackfillNeeded, result,
 		); err != nil {
 			return result, err
 		}
@@ -632,7 +601,7 @@ func (s *Sync) PushWithOptions(
 			}
 		}
 		if onProgress != nil {
-			onProgress(PushProgress{
+			onProgress(storage.PushProgress{
 				SessionsDone:     end,
 				SessionsTotal:    len(sessions),
 				MessagesDone:     result.MessagesPushed,
@@ -646,7 +615,7 @@ func (s *Sync) PushWithOptions(
 		// Filtered pushes use filter-scoped sync state, so
 		// they can advance their own watermark without moving
 		// the unfiltered/global cursor.
-		if err := finalizeFilteredPushState(
+		if err := finalizeFilteredPushState(ctx,
 			state, lastPush, cutoff, pushed,
 			priorFingerprints, sessionFingerprints,
 			result.Errors,
@@ -654,7 +623,7 @@ func (s *Sync) PushWithOptions(
 			return result, err
 		}
 	} else {
-		if err := finalizeUnfilteredPushState(
+		if err := finalizeUnfilteredPushState(ctx,
 			state, lastPush, cutoff, pushed,
 			priorFingerprints, sessionFingerprints,
 			result.Errors,
@@ -662,7 +631,7 @@ func (s *Sync) PushWithOptions(
 			return result, err
 		}
 	}
-	if err := persistPushTargetFingerprint(
+	if err := persistPushTargetFingerprint(ctx,
 		state, s.targetFingerprint,
 	); err != nil {
 		return result, err
@@ -676,18 +645,23 @@ func (s *Sync) PushWithOptions(
 	); err != nil {
 		return result, err
 	}
-	if err := completeSessionAliasBackfill(
+	if err := completeSessionAliasBackfill(ctx,
 		aliasBackfillState, aliasBackfillNeeded, result,
 	); err != nil {
 		return result, err
 	}
-	if err := completeSessionProvenanceBackfill(
+	if err := completeSessionProvenanceBackfill(ctx,
 		provenanceBackfillState, provenanceBackfillNeeded, result,
 	); err != nil {
 		return result, err
 	}
-	if err := completeTranscriptRevisionBackfill(
+	if err := completeTranscriptRevisionBackfill(ctx,
 		state, transcriptRevisionBackfillNeeded, result,
+	); err != nil {
+		return result, err
+	}
+	if err := completeTimestampNormalizationBackfill(ctx,
+		state, timestampNormalizationBackfillNeeded, result,
 	); err != nil {
 		return result, err
 	}
@@ -723,10 +697,10 @@ func (s *Sync) PushWithOptions(
 }
 
 // runVectorPushPhase runs the vector push phase and wraps its error. With no
-// source attached the phase never runs: it returns a Skipped result with an
-// empty reason, which the summary printer renders as nothing (an unconfigured
+// source attached no export runs; usage-only pushes still evict owned vectors.
+// A Skipped result with an empty reason renders as nothing (an unconfigured
 // phase is not a diagnosable skip like an unavailable extension). Without this
-// the zero-valued VectorPushResult would print "Vectors: 0 session(s) pushed".
+// the zero-valued storage.VectorPushResult would print "Vectors: 0 session(s) pushed".
 // failedSessions names sessions whose session-phase push failed; their vectors
 // are deferred so pgvector data never runs ahead of the sessions/messages rows.
 // full bypasses the unchanged-hash skip so a --full push also repairs vector
@@ -738,10 +712,13 @@ func (s *Sync) runVectorPushPhase(
 	ctx context.Context, full bool, scope []string,
 	lastReconciledGeneration int64,
 	failedSessions map[string]struct{},
-	onProgress func(PushProgress),
-) (VectorPushResult, error) {
+	onProgress func(storage.PushProgress),
+) (storage.VectorPushResult, error) {
+	if s.local.ArchiveContent().UsageOnly() {
+		return storage.VectorPushResult{Skipped: true}, s.clearUsageOnlyVectorSessions(ctx)
+	}
 	if s.vectorSource == nil {
-		return VectorPushResult{Skipped: true}, nil
+		return storage.VectorPushResult{Skipped: true}, nil
 	}
 	res, err := s.pushVectors(
 		ctx, full, scope, lastReconciledGeneration,
@@ -767,14 +744,14 @@ func (s *Sync) syncProjectIdentityObservations(
 	revisionValue := strconv.FormatInt(revision, 10)
 	state := s.effectiveSyncState()
 	stateKey := projectIdentityPublicationStateKey + ":" + databaseGeneration
-	publishedRevisionValue, err := state.GetSyncState(stateKey)
+	publishedRevisionValue, err := state.GetSyncState(ctx, stateKey)
 	if err != nil {
 		return fmt.Errorf("reading project identity publication revision: %w", err)
 	}
 	adoptLegacyFilteredScope := false
 	if s.isFiltered() && publishedRevisionValue == "" {
-		legacyValue, loadErr := state.GetSyncState(
-			legacyProjectIdentityStateKey + ":" + databaseGeneration,
+		legacyValue, loadErr := state.GetSyncState(ctx,
+			legacyProjectIdentityStateKey+":"+databaseGeneration,
 		)
 		if loadErr != nil {
 			return fmt.Errorf(
@@ -804,13 +781,12 @@ func (s *Sync) syncProjectIdentityObservations(
 		if err != nil {
 			return fmt.Errorf("loading project identity observations: %w", err)
 		}
-		observations = filterProjectIdentityObservations(
+		observations = db.FilterIdentityScope(
 			observations, s.projects, s.excludeProjects,
 		)
-		snapshots, err =
-			s.local.ListPublishableSessionProjectIdentitySnapshots(
-				ctx, nil, s.projects, s.excludeProjects,
-			)
+		snapshots, err = s.local.ListPublishableSessionProjectIdentitySnapshots(
+			ctx, nil, s.projects, s.excludeProjects,
+		)
 		if err != nil {
 			return fmt.Errorf("loading session project identity snapshots: %w", err)
 		}
@@ -825,17 +801,16 @@ func (s *Sync) syncProjectIdentityObservations(
 		snapshots = delta.Snapshots
 	}
 	if len(refreshSessionIDs) > 0 {
-		refreshSnapshots, loadErr :=
-			s.local.ListPublishableSessionProjectIdentitySnapshots(
-				ctx, refreshSessionIDs, s.projects, s.excludeProjects,
-			)
+		refreshSnapshots, loadErr := s.local.ListPublishableSessionProjectIdentitySnapshots(
+			ctx, refreshSessionIDs, s.projects, s.excludeProjects,
+		)
 		if loadErr != nil {
 			return fmt.Errorf(
 				"loading refreshed session project identity snapshots: %w",
 				loadErr,
 			)
 		}
-		snapshots = mergeProjectIdentitySnapshots(snapshots, refreshSnapshots)
+		snapshots = db.MergeProjectIdentitySnapshots(snapshots, refreshSnapshots)
 	}
 
 	archiveID, err := s.local.GetArchiveID(ctx)
@@ -934,51 +909,10 @@ func (s *Sync) syncProjectIdentityObservations(
 	if err := tx.Commit(); err != nil {
 		return fmt.Errorf("committing project identity observation sync: %w", err)
 	}
-	if err := state.SetSyncState(stateKey, revisionValue); err != nil {
+	if err := state.SetSyncState(ctx, stateKey, revisionValue); err != nil {
 		return fmt.Errorf("recording project identity publication revision: %w", err)
 	}
 	return nil
-}
-
-func mergeProjectIdentitySnapshots(
-	base, refresh []export.ProjectIdentityObservation,
-) []export.ProjectIdentityObservation {
-	merged := make(map[string]export.ProjectIdentityObservation, len(base)+len(refresh))
-	for _, snapshot := range base {
-		merged[snapshot.SessionID] = snapshot
-	}
-	for _, snapshot := range refresh {
-		merged[snapshot.SessionID] = snapshot
-	}
-	out := make([]export.ProjectIdentityObservation, 0, len(merged))
-	for _, snapshot := range merged {
-		out = append(out, snapshot)
-	}
-	sort.Slice(out, func(i, j int) bool {
-		return out[i].SessionID < out[j].SessionID
-	})
-	return out
-}
-
-func filterProjectIdentityObservations(
-	observations []export.ProjectIdentityObservation,
-	projects []string,
-	excludeProjects []string,
-) []export.ProjectIdentityObservation {
-	if len(projects) == 0 && len(excludeProjects) == 0 {
-		return observations
-	}
-	out := observations[:0]
-	for _, obs := range observations {
-		if len(projects) > 0 && !slices.Contains(projects, obs.Project) {
-			continue
-		}
-		if slices.Contains(excludeProjects, obs.Project) {
-			continue
-		}
-		out = append(out, obs)
-	}
-	return out
 }
 
 // pgPushMarkerMachineState reports whether this host's push marker is present
@@ -993,7 +927,7 @@ func filterProjectIdentityObservations(
 // dropped or recreated) since this host last pushed, so a full re-push is
 // needed. Counting rows by machine cannot detect this reliably: another host
 // pushing to the same PG can repopulate rows under a machine value this host
-// also writes -- a remote host's sessions synced in over SSH, or this host's
+// also writes -- a remote host's sessions synced from a remote, or this host's
 // own renamed identity -- masking the loss of this host's own rows. The marker
 // is per-local-DB, so no other pusher can satisfy this check.
 func (s *Sync) pgPushMarkerMachineState(
@@ -1188,12 +1122,12 @@ func normalizePushMarkerMachineAliases(
 // and persisting a random one on first use. It is independent of the machine
 // name, so a machine rename keeps the same marker, and unique per local DB, so
 // a different host pushing to the same PG cannot mask this host's reset.
-func (s *Sync) pushMarkerID() (string, error) {
+func (s *Sync) pushMarkerID(ctx context.Context) (string, error) {
 	state := s.local
 	if state == nil {
-		return "", fmt.Errorf("local db is required")
+		return "", errors.New("local db is required")
 	}
-	id, err := state.GetSyncState(pushMarkerIDStateKey)
+	id, err := state.GetSyncState(ctx, pushMarkerIDStateKey)
 	if err != nil {
 		return "", fmt.Errorf("reading push marker id: %w", err)
 	}
@@ -1205,7 +1139,7 @@ func (s *Sync) pushMarkerID() (string, error) {
 		return "", fmt.Errorf("generating push marker id: %w", err)
 	}
 	id = hex.EncodeToString(buf)
-	storedID, err := state.GetOrCreateSyncState(
+	storedID, err := state.GetOrCreateSyncState(ctx,
 		pushMarkerIDStateKey, id,
 	)
 	if err != nil {
@@ -1274,6 +1208,10 @@ func (s *Sync) pushBatchAttempt(
 		return batchResult{}, fmt.Errorf(
 			"begin pg tx: %w", err,
 		)
+	}
+	if err := s.migrateCodexPages(ctx, tx, batch, markerID, legacyMarkerMachines); err != nil {
+		_ = tx.Rollback()
+		return batchResult{}, err
 	}
 
 	n := 0
@@ -1378,25 +1316,25 @@ func (s *Sync) pushBatchAttempt(
 	return batchResult{ok: true, sessions: n, messages: msgs, skippedConflicts: skippedConflicts}, nil
 }
 
-func finalizePushState(
+func finalizePushState(ctx context.Context,
 	local syncStateStore,
 	cutoff string,
 	sessions []db.Session,
 	priorFingerprints map[string]string,
 	sessionFingerprints map[string]string,
 ) error {
-	if err := local.SetSyncState(
+	if err := local.SetSyncState(ctx,
 		"last_push_at", cutoff,
 	); err != nil {
 		return fmt.Errorf("updating last_push_at: %w", err)
 	}
-	return writePushBoundaryState(
+	return writePushBoundaryState(ctx,
 		local, cutoff, sessions, priorFingerprints,
 		sessionFingerprints,
 	)
 }
 
-func finalizeUnfilteredPushState(
+func finalizeUnfilteredPushState(ctx context.Context,
 	local syncStateStore,
 	lastPush, cutoff string,
 	sessions []db.Session,
@@ -1413,13 +1351,13 @@ func finalizeUnfilteredPushState(
 	if errors > 0 {
 		finalizeCutoff = lastPush
 	}
-	return finalizePushState(
+	return finalizePushState(ctx,
 		local, finalizeCutoff, sessions,
 		priorFingerprints, sessionFingerprints,
 	)
 }
 
-func finalizeFilteredPushState(
+func finalizeFilteredPushState(ctx context.Context,
 	local syncStateStore,
 	lastPush, cutoff string,
 	sessions []db.Session,
@@ -1431,7 +1369,7 @@ func finalizeFilteredPushState(
 	if errors > 0 {
 		finalizeCutoff = lastPush
 	}
-	return finalizePushState(
+	return finalizePushState(ctx,
 		local, finalizeCutoff, sessions,
 		priorFingerprints, sessionFingerprints,
 	)
@@ -1439,15 +1377,15 @@ func finalizeFilteredPushState(
 
 // clearPushState resets the active watermark and boundary state so
 // that the next push for this sync-state scope starts from scratch.
-func clearPushState(local syncStateStore) error {
-	if err := local.SetSyncState(
+func clearPushState(ctx context.Context, local syncStateStore) error {
+	if err := local.SetSyncState(ctx,
 		lastPushBoundaryStateKey, "",
 	); err != nil {
 		return fmt.Errorf(
 			"clearing boundary state: %w", err,
 		)
 	}
-	if err := local.SetSyncState(
+	if err := local.SetSyncState(ctx,
 		"last_push_at", "",
 	); err != nil {
 		return fmt.Errorf(
@@ -1535,16 +1473,16 @@ func (s *Sync) finalizeSourceArchiveRepair(
 			return fmt.Errorf("cleaning up repaired source archive: %w", err)
 		}
 	}
-	if err := persistPushSourceArchiveID(state, s.archiveID); err != nil {
+	if err := persistPushSourceArchiveID(ctx, state, s.archiveID); err != nil {
 		return err
 	}
 	return nil
 }
 
-func applySessionAliasBackfillRequirement(
+func applySessionAliasBackfillRequirement(ctx context.Context,
 	local syncStateStore, full bool,
 ) (bool, bool, error) {
-	needed, err := sessionAliasBackfillNeeded(local)
+	needed, err := sessionAliasBackfillNeeded(ctx, local)
 	if err != nil {
 		return full, false, err
 	}
@@ -1554,8 +1492,8 @@ func applySessionAliasBackfillRequirement(
 	return true, true, nil
 }
 
-func sessionAliasBackfillNeeded(local syncStateStore) (bool, error) {
-	done, err := local.GetSyncState(sessionAliasBackfillStateKey)
+func sessionAliasBackfillNeeded(ctx context.Context, local syncStateStore) (bool, error) {
+	done, err := local.GetSyncState(ctx, sessionAliasBackfillStateKey)
 	if err != nil {
 		return false, fmt.Errorf(
 			"reading %s: %w", sessionAliasBackfillStateKey, err,
@@ -1564,8 +1502,8 @@ func sessionAliasBackfillNeeded(local syncStateStore) (bool, error) {
 	return done != "1", nil
 }
 
-func markSessionAliasBackfillDone(local syncStateStore) error {
-	if err := local.SetSyncState(
+func markSessionAliasBackfillDone(ctx context.Context, local syncStateStore) error {
+	if err := local.SetSyncState(ctx,
 		sessionAliasBackfillStateKey, "1",
 	); err != nil {
 		return fmt.Errorf(
@@ -1575,8 +1513,8 @@ func markSessionAliasBackfillDone(local syncStateStore) error {
 	return nil
 }
 
-func completeSessionAliasBackfill(
-	local syncStateStore, needed bool, result PushResult,
+func completeSessionAliasBackfill(ctx context.Context,
+	local syncStateStore, needed bool, result storage.PushResult,
 ) error {
 	// Skipped ownership conflicts are sessions owned by another machine on
 	// the hub; this host neither can nor should re-push them, so they do not
@@ -1588,11 +1526,11 @@ func completeSessionAliasBackfill(
 	if !needed || result.Errors > 0 {
 		return nil
 	}
-	return markSessionAliasBackfillDone(local)
+	return markSessionAliasBackfillDone(ctx, local)
 }
 
-func sessionProvenanceBackfillNeeded(local syncStateStore) (bool, error) {
-	done, err := local.GetSyncState(sessionProvenanceBackfillStateKey)
+func sessionProvenanceBackfillNeeded(ctx context.Context, local syncStateStore) (bool, error) {
+	done, err := local.GetSyncState(ctx, sessionProvenanceBackfillStateKey)
 	if err != nil {
 		return false, fmt.Errorf(
 			"reading session provenance backfill state: %w", err)
@@ -1604,10 +1542,10 @@ func sessionProvenanceBackfillNeeded(local syncStateStore) (bool, error) {
 // provenance backfill marker is missing. Callers select the marker namespace:
 // target-wide for unfiltered pushes, or effective-filter-scoped for filtered
 // pushes, so each scope repairs its own fingerprint-matched rows exactly once.
-func applySessionProvenanceBackfillRequirement(
+func applySessionProvenanceBackfillRequirement(ctx context.Context,
 	local syncStateStore, full bool,
 ) (bool, bool, error) {
-	needed, err := sessionProvenanceBackfillNeeded(local)
+	needed, err := sessionProvenanceBackfillNeeded(ctx, local)
 	if err != nil {
 		return full, false, err
 	}
@@ -1617,8 +1555,8 @@ func applySessionProvenanceBackfillRequirement(
 	return true, true, nil
 }
 
-func markSessionProvenanceBackfillDone(local syncStateStore) error {
-	if err := local.SetSyncState(
+func markSessionProvenanceBackfillDone(ctx context.Context, local syncStateStore) error {
+	if err := local.SetSyncState(ctx,
 		sessionProvenanceBackfillStateKey, "1",
 	); err != nil {
 		return fmt.Errorf(
@@ -1630,19 +1568,19 @@ func markSessionProvenanceBackfillDone(local syncStateStore) error {
 // completeSessionProvenanceBackfill marks the caller-selected target or filter
 // scope complete only after every session in that scope was pushed without an
 // error.
-func completeSessionProvenanceBackfill(
-	local syncStateStore, needed bool, result PushResult,
+func completeSessionProvenanceBackfill(ctx context.Context,
+	local syncStateStore, needed bool, result storage.PushResult,
 ) error {
 	if !needed || result.Errors > 0 {
 		return nil
 	}
-	return markSessionProvenanceBackfillDone(local)
+	return markSessionProvenanceBackfillDone(ctx, local)
 }
 
-func applyTranscriptRevisionBackfillRequirement(
+func applyTranscriptRevisionBackfillRequirement(ctx context.Context,
 	local syncStateStore, full bool,
 ) (bool, bool, error) {
-	done, err := local.GetSyncState(transcriptRevisionBackfillStateKey)
+	done, err := local.GetSyncState(ctx, transcriptRevisionBackfillStateKey)
 	if err != nil {
 		return full, false, fmt.Errorf(
 			"reading %s: %w", transcriptRevisionBackfillStateKey, err,
@@ -1654,8 +1592,8 @@ func applyTranscriptRevisionBackfillRequirement(
 	return true, true, nil
 }
 
-func markTranscriptRevisionBackfillDone(local syncStateStore) error {
-	if err := local.SetSyncState(
+func markTranscriptRevisionBackfillDone(ctx context.Context, local syncStateStore) error {
+	if err := local.SetSyncState(ctx,
 		transcriptRevisionBackfillStateKey, "1",
 	); err != nil {
 		return fmt.Errorf(
@@ -1665,20 +1603,49 @@ func markTranscriptRevisionBackfillDone(local syncStateStore) error {
 	return nil
 }
 
-func completeTranscriptRevisionBackfill(
-	local syncStateStore, needed bool, result PushResult,
+func completeTranscriptRevisionBackfill(ctx context.Context,
+	local syncStateStore, needed bool, result storage.PushResult,
 ) error {
 	if !needed || result.Errors > 0 {
 		return nil
 	}
-	return markTranscriptRevisionBackfillDone(local)
+	return markTranscriptRevisionBackfillDone(ctx, local)
 }
 
-func persistPushTargetFingerprint(
+func applyTimestampNormalizationBackfillRequirement(ctx context.Context,
+	local syncStateStore, full bool,
+) (bool, bool, error) {
+	done, err := local.GetSyncState(ctx, timestampNormalizationBackfillStateKey)
+	if err != nil {
+		return full, false, fmt.Errorf(
+			"reading %s: %w", timestampNormalizationBackfillStateKey, err,
+		)
+	}
+	if done == "1" {
+		return full, false, nil
+	}
+	return true, true, nil
+}
+
+func completeTimestampNormalizationBackfill(ctx context.Context,
+	local syncStateStore, needed bool, result storage.PushResult,
+) error {
+	if !needed || result.Errors > 0 {
+		return nil
+	}
+	if err := local.SetSyncState(ctx, timestampNormalizationBackfillStateKey, "1"); err != nil {
+		return fmt.Errorf(
+			"updating %s: %w", timestampNormalizationBackfillStateKey, err,
+		)
+	}
+	return nil
+}
+
+func persistPushTargetFingerprint(ctx context.Context,
 	local syncStateStore,
 	fingerprint string,
 ) error {
-	if err := local.SetSyncState(
+	if err := local.SetSyncState(ctx,
 		lastPushTargetFingerprintKey,
 		fingerprint,
 	); err != nil {
@@ -1690,8 +1657,8 @@ func persistPushTargetFingerprint(
 	return nil
 }
 
-func persistPushSourceArchiveID(local syncStateStore, archiveID string) error {
-	if err := local.SetSyncState(lastPushSourceArchiveIDKey, archiveID); err != nil {
+func persistPushSourceArchiveID(ctx context.Context, local syncStateStore, archiveID string) error {
+	if err := local.SetSyncState(ctx, lastPushSourceArchiveIDKey, archiveID); err != nil {
 		return fmt.Errorf("updating %s: %w", lastPushSourceArchiveIDKey, err)
 	}
 	return nil
@@ -1717,7 +1684,7 @@ func pushTargetState(
 	return false, ""
 }
 
-func readBoundaryAndFingerprints(
+func readBoundaryAndFingerprints(ctx context.Context,
 	local syncStateStore,
 	cutoff string,
 ) (
@@ -1726,7 +1693,7 @@ func readBoundaryAndFingerprints(
 	boundaryOK bool,
 	err error,
 ) {
-	raw, err := local.GetSyncState(
+	raw, err := local.GetSyncState(ctx,
 		lastPushBoundaryStateKey,
 	)
 	if err != nil {
@@ -1742,7 +1709,7 @@ func readBoundaryAndFingerprints(
 	if err := json.Unmarshal(
 		[]byte(raw), &state,
 	); err != nil {
-		return nil, nil, false, nil
+		return nil, nil, false, nil //nolint:nilerr // Malformed cached boundary metadata forces a fresh full boundary scan.
 	}
 	fingerprints = state.Fingerprints
 	if cutoff != "" &&
@@ -1754,7 +1721,7 @@ func readBoundaryAndFingerprints(
 	return fingerprints, boundary, boundaryOK, nil
 }
 
-func writePushBoundaryState(
+func writePushBoundaryState(ctx context.Context,
 	local syncStateStore,
 	cutoff string,
 	sessions []db.Session,
@@ -1786,7 +1753,7 @@ func writePushBoundaryState(
 			lastPushBoundaryStateKey, err,
 		)
 	}
-	if err := local.SetSyncState(
+	if err := local.SetSyncState(ctx,
 		lastPushBoundaryStateKey, string(data),
 	); err != nil {
 		return fmt.Errorf(
@@ -1806,13 +1773,13 @@ func mapKeys(m map[string]db.Session) []string {
 }
 
 func readPGExcludedSessionIDs(
-	ctx context.Context, pg pgSessionQueryer, ids []string,
-) (map[string]struct{}, error) {
-	ids = uniqueNonEmptyStrings(ids)
-	if len(ids) == 0 {
+	ctx context.Context, pg pgSessionQueryer, sessions iter.Seq[db.Session],
+	markerID, machine string, legacyMarkerMachines []string,
+) (map[string]bool, error) {
+	query, args := pgExcludedSessionIDsQuery(sessions, markerID, machine, legacyMarkerMachines)
+	if query == "" {
 		return nil, nil
 	}
-	query, args := pgExcludedSessionIDsQuery(ids)
 	rows, err := pg.QueryContext(ctx, query, args...)
 	if err != nil {
 		return nil, fmt.Errorf(
@@ -1821,15 +1788,18 @@ func readPGExcludedSessionIDs(
 	}
 	defer rows.Close()
 
-	excluded := make(map[string]struct{})
+	excluded := make(map[string]bool)
 	for rows.Next() {
 		var id string
-		if err := rows.Scan(&id); err != nil {
+		var scoped bool
+		if err := rows.Scan(&id, &scoped); err != nil {
 			return nil, fmt.Errorf(
 				"scanning pg excluded session id: %w", err,
 			)
 		}
-		excluded[id] = struct{}{}
+		if previous, exists := excluded[id]; !exists || previous {
+			excluded[id] = scoped
+		}
 	}
 	if err := rows.Err(); err != nil {
 		return nil, fmt.Errorf(
@@ -1839,22 +1809,40 @@ func readPGExcludedSessionIDs(
 	return excluded, nil
 }
 
-func pgExcludedSessionIDsQuery(ids []string) (string, []any) {
-	return `SELECT id FROM excluded_sessions
-			 WHERE id = ANY($1)`, []any{ids}
+func pgExcludedSessionIDsQuery(sessions iter.Seq[db.Session], markerID, machine string, legacyMarkerMachines []string) (string, []any) {
+	var ids, agents, machines []string
+	for sess := range sessions {
+		for _, id := range pgSessionTombstoneIDs(sess) {
+			ids = append(ids, id)
+			agents = append(agents, sess.Agent)
+			machines = append(machines, db.MirroredSessionMachine(sess, machine))
+		}
+	}
+	if len(ids) == 0 {
+		return "", nil
+	}
+	return `SELECT id, FALSE AS scoped FROM excluded_sessions
+			 WHERE id = ANY($1)
+			 UNION ALL
+			 SELECT candidate.id, TRUE FROM (SELECT input.*, $4::text AS owner_marker
+			   FROM unnest($1::text[], $2::text[], $3::text[]) AS input(id, agent, machine)) candidate
+			 JOIN excluded_sessions scope ON scope.id = left(candidate.id, -37)
+			 WHERE scope.include_codex_pages AND left(right(candidate.id, 37), 1) = '_'
+			   AND (scope.agent IS NULL OR scope.agent = candidate.agent)
+			   AND (` + pgCodexScopeOwnerMatchSQL + `
+			     OR (scope.owner_marker = '' AND scope.machine = ANY($5)))`, []any{ids, agents, machines, markerID, legacyMarkerMachines}
 }
 
 func purgePGExcludedPushSessions(
 	ctx context.Context, pg *sql.DB, sessionByID map[string]db.Session,
+	markerID, machine string, legacyMarkerMachines []string,
 ) error {
 	tombstoneIDsBySession := make(map[string][]string, len(sessionByID))
-	candidateIDs := []string{}
 	for id, sess := range sessionByID {
 		tombstoneIDs := pgSessionTombstoneIDs(sess)
 		tombstoneIDsBySession[id] = tombstoneIDs
-		candidateIDs = append(candidateIDs, tombstoneIDs...)
 	}
-	excludedIDs, err := readPGExcludedSessionIDs(ctx, pg, candidateIDs)
+	excludedIDs, err := readPGExcludedSessionIDs(ctx, pg, maps.Values(sessionByID), markerID, machine, legacyMarkerMachines)
 	if err != nil {
 		return err
 	}
@@ -1863,12 +1851,27 @@ func purgePGExcludedPushSessions(
 	}
 
 	purgeIDs := []string{}
+	var scopedIDs []string
 	for id, tombstoneIDs := range tombstoneIDsBySession {
 		if !hasPGExcludedSessionID(tombstoneIDs, excludedIDs) {
 			continue
 		}
-		purgeIDs = append(purgeIDs, tombstoneIDs...)
+		scoped := true
+		for _, tombstoneID := range tombstoneIDs {
+			if isScoped, exists := excludedIDs[tombstoneID]; exists && !isScoped {
+				scoped = false
+				break
+			}
+		}
+		if scoped {
+			scopedIDs = append(scopedIDs, tombstoneIDs...)
+		} else {
+			purgeIDs = append(purgeIDs, tombstoneIDs...)
+		}
 		delete(sessionByID, id)
+	}
+	if err := deletePGScopedExcludedSessionRows(ctx, pg, scopedIDs); err != nil {
+		return err
 	}
 	purgeIDs = uniqueNonEmptyStrings(purgeIDs)
 	if len(purgeIDs) == 0 {
@@ -1880,24 +1883,22 @@ func purgePGExcludedPushSessions(
 	return deletePGExcludedSessionRows(ctx, pg, purgeIDs)
 }
 
-func reconcilePGProjectScopeMoves(
+func (s *Sync) reconcilePGProjectScopeMoves(
 	ctx context.Context,
-	pg *sql.DB,
 	ownerMarker string,
+	legacyMarkerMachines []string,
 	changedSessions []db.Session,
-	projects []string,
-	excludeProjects []string,
 ) ([]string, error) {
 	if len(changedSessions) == 0 {
 		return nil, nil
 	}
-	localProjects := make(map[string]string, len(changedSessions))
+	localSessions := make(map[string]db.Session, len(changedSessions))
 	changedIDs := make([]string, 0, len(changedSessions))
 	for _, session := range changedSessions {
-		localProjects[session.ID] = session.Project
+		localSessions[session.ID] = session
 		changedIDs = append(changedIDs, session.ID)
 	}
-	rows, err := pg.QueryContext(ctx, `
+	rows, err := s.pg.QueryContext(ctx, `
 		SELECT id, project
 		FROM sessions
 		WHERE owner_marker = $1 AND id = ANY($2)`,
@@ -1910,31 +1911,49 @@ func reconcilePGProjectScopeMoves(
 	defer rows.Close()
 
 	staleIDs := []string{}
+	var staleSessions []db.Session
 	for rows.Next() {
 		var id, project string
 		if err := rows.Scan(&id, &project); err != nil {
 			return nil, fmt.Errorf("scanning owned pg session for scope reconciliation: %w", err)
 		}
-		if !projectInPGSyncScope(project, projects, excludeProjects) {
+		if !db.ProjectMatchesPushScope(project, s.projects, s.excludeProjects) {
 			continue
 		}
-		if !projectInPGSyncScope(
-			localProjects[id], projects, excludeProjects,
+		if !db.ProjectMatchesPushScope(
+			localSessions[id].Project, s.projects, s.excludeProjects,
 		) {
 			staleIDs = append(staleIDs, id)
+			staleSessions = append(staleSessions, localSessions[id])
 		}
 	}
 	if err := rows.Err(); err != nil {
 		return nil, fmt.Errorf("iterating owned pg sessions for scope reconciliation: %w", err)
 	}
+	if err := rows.Close(); err != nil {
+		return nil, err
+	}
 	if len(staleIDs) == 0 {
 		return nil, nil
 	}
 	sort.Strings(staleIDs)
-	if _, err := pg.ExecContext(ctx, `
+	tx, err := s.pg.BeginTx(ctx, nil)
+	if err != nil {
+		return nil, fmt.Errorf("begin project-scope reconciliation: %w", err)
+	}
+	defer func() { _ = tx.Rollback() }()
+	// A legacy thread can still hold pins for an included page. Transfer
+	// them before the out-of-scope thread's deletion cascades to its curation.
+	if err := s.migrateCodexPages(ctx, tx, staleSessions, ownerMarker, legacyMarkerMachines); err != nil {
+		return nil, err
+	}
+	if _, err := tx.ExecContext(ctx, `
 		DELETE FROM sessions
 		WHERE owner_marker = $1 AND id = ANY($2)`, ownerMarker, staleIDs); err != nil {
 		return nil, fmt.Errorf("deleting pg sessions that moved out of scope: %w", err)
+	}
+	if err := tx.Commit(); err != nil {
+		return nil, fmt.Errorf("commit project-scope reconciliation: %w", err)
 	}
 	return staleIDs, nil
 }
@@ -1952,19 +1971,8 @@ func listPGProjectScopeMoveCandidates(
 	return local.ListSessionsForMirrorWindow(ctx, lastPush, nil, nil)
 }
 
-func projectInPGSyncScope(
-	project string,
-	projects []string,
-	excludeProjects []string,
-) bool {
-	if len(projects) > 0 && !slices.Contains(projects, project) {
-		return false
-	}
-	return !slices.Contains(excludeProjects, project)
-}
-
 func hasPGExcludedSessionID(
-	ids []string, excluded map[string]struct{},
+	ids []string, excluded map[string]bool,
 ) bool {
 	for _, id := range ids {
 		if _, ok := excluded[id]; ok {
@@ -1999,14 +2007,25 @@ func deletePGExcludedSessionRows(
 
 func deletePGSessionIfExcluded(
 	ctx context.Context, tx *sql.Tx, sess db.Session,
+	markerID, machine string, legacyMarkerMachines []string,
 ) (bool, error) {
 	ids := pgSessionTombstoneIDs(sess)
-	excluded, err := readPGExcludedSessionIDs(ctx, tx, ids)
+	excluded, err := readPGExcludedSessionIDs(ctx, tx, slices.Values([]db.Session{sess}), markerID, machine, legacyMarkerMachines)
 	if err != nil {
 		return false, err
 	}
 	if len(excluded) == 0 {
 		return false, nil
+	}
+	scoped := true
+	for _, isScoped := range excluded {
+		if !isScoped {
+			scoped = false
+			break
+		}
+	}
+	if scoped {
+		return true, deletePGScopedExcludedSessionRows(ctx, tx, ids)
 	}
 	if err := insertPGExcludedSessionIDs(ctx, tx, ids); err != nil {
 		return false, err
@@ -2019,7 +2038,7 @@ func deletePGSessionIfExcluded(
 
 // sessionPushFingerprint builds the change-detection fingerprint for a
 // session. pushedMachine is the value pushSession actually writes to PG
-// (pushedSessionMachine), not the raw sess.Machine: a "local"/empty sentinel
+// (db.MirroredSessionMachine), not the raw sess.Machine: a "local"/empty sentinel
 // row is written under the fallback machine, so the fingerprint must track the
 // fallback to force a re-push when s.machine changes.
 func sessionPushFingerprint(
@@ -2030,6 +2049,7 @@ func sessionPushFingerprint(
 	fields := []string{
 		sess.ID,
 		sess.Project,
+		strconv.FormatBool(sess.ProjectAssigned),
 		pushedMachine,
 		sourceArchiveID,
 		ownerMarker,
@@ -2038,6 +2058,8 @@ func sessionPushFingerprint(
 		sess.AgentLabel,
 		sess.Entrypoint,
 		sess.SessionKind,
+		db.EncodePRLinks(sess.PRLinks),
+		strconv.Itoa(len(sess.Labels)),
 		stringValue(sess.FirstMessage),
 		stringValue(sess.DisplayName),
 		stringValue(sess.SessionName),
@@ -2045,72 +2067,64 @@ func sessionPushFingerprint(
 		stringValue(sess.EndedAt),
 		stringValue(sess.DeletedAt),
 		stringValue(sess.DeletionCause),
-		fmt.Sprintf("%d", sess.MessageCount),
-		fmt.Sprintf("%d", sess.UserMessageCount),
-		fmt.Sprintf("%t", sess.IsAutomated),
-		fmt.Sprintf("%d", sess.TotalOutputTokens),
-		fmt.Sprintf("%d", sess.PeakContextTokens),
-		fmt.Sprintf("%t", sess.HasTotalOutputTokens),
-		fmt.Sprintf("%t", sess.HasPeakContextTokens),
+		strconv.FormatBool(sess.TrashIncludesCodexPages),
+		strconv.Itoa(sess.MessageCount),
+		strconv.Itoa(sess.UserMessageCount),
+		strconv.FormatBool(sess.IsAutomated),
+		strconv.Itoa(sess.TotalOutputTokens),
+		strconv.Itoa(sess.PeakContextTokens),
+		strconv.FormatBool(sess.HasTotalOutputTokens),
+		strconv.FormatBool(sess.HasPeakContextTokens),
 		stringValue(sess.ParentSessionID),
 		stringValue(sess.ParserParentSessionID),
 		sess.RelationshipType,
 		stringValue(sess.FilePath),
 		stringValue(sess.FileHash),
 		sess.CreatedAt,
-		fmt.Sprintf("%d", sess.ToolFailureSignalCount),
-		fmt.Sprintf("%d", sess.ToolRetryCount),
-		fmt.Sprintf("%d", sess.EditChurnCount),
-		fmt.Sprintf("%d", sess.ConsecutiveFailureMax),
+		strconv.Itoa(sess.ToolFailureSignalCount),
+		strconv.Itoa(sess.ToolRetryCount),
+		strconv.Itoa(sess.EditChurnCount),
+		strconv.Itoa(sess.ConsecutiveFailureMax),
 		sess.Outcome,
 		sess.OutcomeConfidence,
 		sess.EndedWithRole,
-		fmt.Sprintf("%d", sess.FinalFailureStreak),
+		strconv.Itoa(sess.FinalFailureStreak),
 		stringValue(sess.SignalsPendingSince),
-		fmt.Sprintf("%d", sess.CompactionCount),
-		fmt.Sprintf("%d", sess.MidTaskCompactionCount),
+		strconv.Itoa(sess.CompactionCount),
+		strconv.Itoa(sess.MidTaskCompactionCount),
 		float64Value(sess.ContextPressureMax),
 		intPtrValue(sess.HealthScore),
 		stringValue(sess.HealthGrade),
-		fmt.Sprintf("%t", sess.HasToolCalls),
-		fmt.Sprintf("%t", sess.HasContextData),
-		fmt.Sprintf("%d", sess.QualitySignalVersion),
-		fmt.Sprintf("%d", sess.ShortPromptCount),
-		fmt.Sprintf("%t", sess.UnstructuredStart),
-		fmt.Sprintf("%d", sess.MissingSuccessCriteriaCount),
-		fmt.Sprintf("%d", sess.MissingVerificationCount),
-		fmt.Sprintf("%d", sess.DuplicatePromptCount),
-		fmt.Sprintf("%d", sess.NoCodeContextCount),
-		fmt.Sprintf("%d", sess.RunawayToolLoopCount),
-		fmt.Sprintf("%d", sess.DataVersion),
+		strconv.FormatBool(sess.HasToolCalls),
+		strconv.FormatBool(sess.HasContextData),
+		strconv.Itoa(sess.QualitySignalVersion),
+		strconv.Itoa(sess.ShortPromptCount),
+		strconv.FormatBool(sess.UnstructuredStart),
+		strconv.Itoa(sess.MissingSuccessCriteriaCount),
+		strconv.Itoa(sess.MissingVerificationCount),
+		strconv.Itoa(sess.DuplicatePromptCount),
+		strconv.Itoa(sess.NoCodeContextCount),
+		strconv.Itoa(sess.RunawayToolLoopCount),
+		strconv.Itoa(sess.DataVersion),
 		sess.Cwd,
 		sess.GitBranch,
 		sess.SourceSessionID,
 		sess.SourceVersion,
-		sess.TranscriptFidelity,
+		sess.TranscriptFidelity, sess.GroupKey,
 		stringValue(sess.TranscriptRevision),
-		fmt.Sprintf("%d", sess.ParserMalformedLines),
-		fmt.Sprintf("%t", sess.IsTruncated),
+		strconv.Itoa(sess.ParserMalformedLines),
+		strconv.FormatBool(sess.IsTruncated),
 		stringValue(sess.TerminationStatus),
-		fmt.Sprintf("%d", sess.SecretLeakCount),
+		strconv.Itoa(sess.SecretLeakCount),
 		sess.SecretsRulesVersion,
 		usageEventFingerprint,
 	}
+	fields = append(fields, sess.Labels...)
 	var b strings.Builder
 	for _, f := range fields {
 		fmt.Fprintf(&b, "%d:%s", len(f), f)
 	}
 	return b.String()
-}
-
-// pushedSessionMachine resolves the machine field for a PG row. Old rows
-// pushed before this fix with machine="local" will be repaired gradually as
-// each session is modified (message count change, etc.) and re-fingerprinted.
-func pushedSessionMachine(sess db.Session, fallbackMachine string) string {
-	if sess.Machine != "" && sess.Machine != "local" {
-		return sess.Machine
-	}
-	return fallbackMachine
 }
 
 func sameSessionOwner(
@@ -2139,13 +2153,6 @@ func stringValue(value *string) string {
 	return *value
 }
 
-func transcriptRevisionValue(value *string) string {
-	if value == nil || *value == "" {
-		return "0"
-	}
-	return *value
-}
-
 func float64Value(value *float64) string {
 	if value == nil {
 		return ""
@@ -2157,7 +2164,7 @@ func intPtrValue(value *int) string {
 	if value == nil {
 		return ""
 	}
-	return fmt.Sprintf("%d", *value)
+	return strconv.Itoa(*value)
 }
 
 // nilStr converts a nil or empty *string to SQL NULL.
@@ -2174,17 +2181,17 @@ func nilStr(s *string) any {
 	return v
 }
 
-// nilStrTS converts a nil or empty *string timestamp to a
-// *time.Time for PG TIMESTAMPTZ columns.
-func nilStrTS(s *string) any {
-	if s == nil || *s == "" {
-		return nil
+// optionalSQLiteTimestamp converts an empty SQLite timestamp to SQL NULL and
+// rejects non-empty values that would otherwise be silently mirrored as NULL.
+func optionalSQLiteTimestamp(value string) (any, error) {
+	if value == "" {
+		return nil, nil
 	}
-	t, ok := ParseSQLiteTimestamp(*s)
+	t, ok := ParseSQLiteTimestamp(value)
 	if !ok {
-		return nil
+		return nil, fmt.Errorf("invalid SQLite timestamp %q", value)
 	}
-	return t
+	return t, nil
 }
 
 // pushSession upserts a single session into PG.
@@ -2195,9 +2202,43 @@ func (s *Sync) pushSession(
 	ctx context.Context, tx *sql.Tx, sess db.Session, markerID string,
 	legacyMarkerMachines []string,
 ) error {
-	createdAt, _ := ParseSQLiteTimestamp(sess.CreatedAt)
+	return writePGSession(ctx, tx, sess, markerID, legacyMarkerMachines, pgSessionWriteOptions{
+		Machine: s.machine, ArchiveID: s.archiveID, DatabaseGeneration: s.databaseGeneration, UsageOnly: s.local.ArchiveContent().UsageOnly(),
+	})
+}
+
+type pgSessionWriteOptions struct {
+	Machine, ArchiveID string
+	DatabaseGeneration string
+	UsageOnly          bool
+	SkipAliases        bool
+}
+
+// writePGSession is the shared transaction-owned row kernel. Mirror ownership
+// is passed explicitly; it never reads the source archive or global pool.
+func writePGSession(ctx context.Context, tx *sql.Tx, sess db.Session, markerID string, legacyMarkerMachines []string, options pgSessionWriteOptions) error {
+	sess.RelationshipType = db.SessionRelationship(sess)
+	createdAt, ok := ParseSQLiteTimestamp(sess.CreatedAt)
+	if !ok {
+		return fmt.Errorf(
+			"parsing session %s created_at: invalid SQLite timestamp %q",
+			sess.ID, sess.CreatedAt,
+		)
+	}
+	startedAt, err := optionalSQLiteTimestamp(stringValue(sess.StartedAt))
+	if err != nil {
+		return fmt.Errorf("parsing session %s started_at: %w", sess.ID, err)
+	}
+	endedAt, err := optionalSQLiteTimestamp(stringValue(sess.EndedAt))
+	if err != nil {
+		return fmt.Errorf("parsing session %s ended_at: %w", sess.ID, err)
+	}
+	deletedAt, err := optionalSQLiteTimestamp(stringValue(sess.DeletedAt))
+	if err != nil {
+		return fmt.Errorf("parsing session %s deleted_at: %w", sess.ID, err)
+	}
 	isAutomated := sess.IsAutomated
-	pushedMachine := pushedSessionMachine(sess, s.machine)
+	pushedMachine := db.MirroredSessionMachine(sess, options.Machine)
 	var existingMachine sql.NullString
 	var existingOwnerMarker sql.NullString
 	checkErr := tx.QueryRowContext(ctx,
@@ -2228,6 +2269,24 @@ func (s *Sync) pushSession(
 		return fmt.Errorf("encoding legacy marker machines: %w", err)
 	}
 	result, err := tx.ExecContext(ctx, `
+		WITH candidate AS (
+			SELECT $1::text AS id, $2::text AS machine, $3::text AS owner_marker, $5::text AS agent
+		), excluded_session AS (
+			SELECT scope.id FROM excluded_sessions scope CROSS JOIN candidate
+			WHERE scope.id = candidate.id OR (scope.include_codex_pages
+				AND left(right(candidate.id, 37), 1) = '_' AND scope.id = left(candidate.id, -37)
+				AND (scope.agent IS NULL OR scope.agent = candidate.agent)
+				AND (`+pgCodexScopeOwnerMatchSQL+`
+					OR (scope.owner_marker = '' AND scope.machine IN (SELECT jsonb_array_elements_text($69::jsonb)))))
+		), inherited_trash AS (
+			SELECT deleted_at FROM sessions
+			WHERE id = left($1, -37) AND left(right($1, 37), 1) = '_'
+			  AND agent = $5 AND provenance_kind = 'legacy'
+			  AND trash_includes_codex_pages AND deleted_at IS NOT NULL
+			  AND (owner_marker = $3 OR (owner_marker = '' AND (
+				machine = $2 OR machine IN ('', 'local')
+				OR machine IN (SELECT jsonb_array_elements_text($69::jsonb)))))
+		)
 		INSERT INTO sessions (
 			id, machine, owner_marker, project, agent,
 			first_message, display_name, source_display_name,
@@ -2259,11 +2318,14 @@ func (s *Sync) pushSession(
 			transcript_fidelity, transcript_revision,
 			agent_label, entrypoint, session_kind,
 			source_archive_id, source_database_generation, file_path,
-			updated_at
+			project_assigned, prompt_evidence_discarded, group_key,
+			trash_includes_codex_pages, source_trash_includes_codex_pages,
+			pr_links, labels, updated_at
 			)
 			SELECT
 				$1, $2, $3, $4, $5, $6, $7, $8,
-				$9, $10, $11, $12, $13, $14, $15,
+				$9, $10, $11, $12,
+				COALESCE($13, (SELECT deleted_at FROM inherited_trash)), $14, $15,
 				$16, $17, $18, $19,
 				$20, $21, $22, $23,
 				$24, $25, $26, $27, $28, $29, $30,
@@ -2276,10 +2338,10 @@ func (s *Sync) pushSession(
 				$46, $47, $48, $49,
 				$50, $51,
 				$52, $53, $54, $55, $56, $57, $58, $59, $60, $61,
-				$62, $63, $64, $65, $66, $67,
-				NOW()
+				$62, $63, $64, $65, $66, $67, $68,
+				$70, $71, $72, $72, $73, $74::text[], NOW()
 			WHERE NOT EXISTS (
-				SELECT 1 FROM excluded_sessions WHERE id = $1
+				SELECT 1 FROM excluded_session
 			)
 			ON CONFLICT (id) DO UPDATE SET
 			machine = EXCLUDED.machine,
@@ -2289,17 +2351,27 @@ func (s *Sync) pushSession(
 			agent_label = EXCLUDED.agent_label,
 			entrypoint = EXCLUDED.entrypoint,
 			session_kind = EXCLUDED.session_kind,
+			pr_links = EXCLUDED.pr_links,
+			labels = EXCLUDED.labels,
 			source_archive_id = EXCLUDED.source_archive_id,
 			source_database_generation = EXCLUDED.source_database_generation,
 			file_path = EXCLUDED.file_path,
+			project_assigned = EXCLUDED.project_assigned,
 			first_message = EXCLUDED.first_message,
 			display_name = CASE
+				WHEN EXCLUDED.prompt_evidence_discarded THEN NULL
 				WHEN sessions.display_name IS DISTINCT FROM
 					sessions.source_display_name THEN sessions.display_name
 				ELSE EXCLUDED.display_name
 			END,
-			source_display_name = EXCLUDED.display_name,
-			session_name = EXCLUDED.session_name,
+			source_display_name = CASE
+				WHEN EXCLUDED.prompt_evidence_discarded THEN NULL
+				ELSE EXCLUDED.display_name
+			END,
+			session_name = CASE
+				WHEN EXCLUDED.prompt_evidence_discarded THEN NULL
+				ELSE EXCLUDED.session_name
+			END,
 			created_at = EXCLUDED.created_at,
 			started_at = EXCLUDED.started_at,
 			ended_at = EXCLUDED.ended_at,
@@ -2313,7 +2385,15 @@ func (s *Sync) pushSession(
 					sessions.source_deleted_at THEN sessions.deletion_cause
 				ELSE EXCLUDED.deletion_cause
 			END,
-			source_deleted_at = EXCLUDED.deleted_at,
+			source_deleted_at = EXCLUDED.source_deleted_at,
+			trash_includes_codex_pages = CASE
+				WHEN sessions.deleted_at IS DISTINCT FROM sessions.source_deleted_at
+					OR sessions.trash_includes_codex_pages IS DISTINCT FROM
+						sessions.source_trash_includes_codex_pages
+				THEN sessions.trash_includes_codex_pages
+				ELSE EXCLUDED.trash_includes_codex_pages
+			END,
+			source_trash_includes_codex_pages = EXCLUDED.trash_includes_codex_pages,
 			message_count = EXCLUDED.message_count,
 			user_message_count = EXCLUDED.user_message_count,
 			total_output_tokens = EXCLUDED.total_output_tokens,
@@ -2321,11 +2401,13 @@ func (s *Sync) pushSession(
 			has_total_output_tokens = EXCLUDED.has_total_output_tokens,
 			has_peak_context_tokens = EXCLUDED.has_peak_context_tokens,
 			is_automated = EXCLUDED.is_automated,
+			prompt_evidence_discarded = EXCLUDED.prompt_evidence_discarded,
 			data_version = EXCLUDED.data_version,
 			cwd = EXCLUDED.cwd,
 			git_branch = EXCLUDED.git_branch,
 			source_session_id = EXCLUDED.source_session_id,
 			source_version = EXCLUDED.source_version,
+			group_key = EXCLUDED.group_key,
 			transcript_fidelity = EXCLUDED.transcript_fidelity,
 			transcript_revision = EXCLUDED.transcript_revision,
 			parser_malformed_lines = EXCLUDED.parser_malformed_lines,
@@ -2367,13 +2449,12 @@ func (s *Sync) pushSession(
 					OR sessions.machine = 'local'
 					OR sessions.machine = ''
 					OR sessions.machine IN (
-						SELECT jsonb_array_elements_text($68::jsonb)
+						SELECT jsonb_array_elements_text($69::jsonb)
 					))
 			)
 			OR sessions.owner_marker = EXCLUDED.owner_marker)
 			AND NOT EXISTS (
-				SELECT 1 FROM excluded_sessions
-				WHERE id = EXCLUDED.id
+				SELECT 1 FROM excluded_session
 			)
 			AND (
 			sessions.machine IS DISTINCT FROM EXCLUDED.machine
@@ -2383,17 +2464,27 @@ func (s *Sync) pushSession(
 			OR sessions.agent_label IS DISTINCT FROM EXCLUDED.agent_label
 			OR sessions.entrypoint IS DISTINCT FROM EXCLUDED.entrypoint
 			OR sessions.session_kind IS DISTINCT FROM EXCLUDED.session_kind
+			OR sessions.pr_links IS DISTINCT FROM EXCLUDED.pr_links
+			OR sessions.labels IS DISTINCT FROM EXCLUDED.labels
 			OR sessions.source_archive_id IS DISTINCT FROM EXCLUDED.source_archive_id
 			OR sessions.source_database_generation IS DISTINCT FROM
 				EXCLUDED.source_database_generation
 			OR sessions.file_path IS DISTINCT FROM EXCLUDED.file_path
+			OR sessions.project_assigned IS DISTINCT FROM EXCLUDED.project_assigned
 			OR sessions.first_message IS DISTINCT FROM EXCLUDED.first_message
+			OR (EXCLUDED.prompt_evidence_discarded AND (
+				sessions.display_name IS NOT NULL OR
+				sessions.source_display_name IS NOT NULL OR
+				sessions.session_name IS NOT NULL))
 			OR sessions.source_display_name IS DISTINCT FROM EXCLUDED.display_name
 			OR sessions.session_name IS DISTINCT FROM EXCLUDED.session_name
 			OR sessions.created_at IS DISTINCT FROM EXCLUDED.created_at
 			OR sessions.started_at IS DISTINCT FROM EXCLUDED.started_at
 			OR sessions.ended_at IS DISTINCT FROM EXCLUDED.ended_at
-			OR sessions.source_deleted_at IS DISTINCT FROM EXCLUDED.deleted_at
+			OR sessions.source_deleted_at IS DISTINCT FROM EXCLUDED.source_deleted_at
+			OR (sessions.deleted_at IS NOT DISTINCT FROM sessions.source_deleted_at
+				AND sessions.deleted_at IS DISTINCT FROM EXCLUDED.deleted_at)
+			OR sessions.source_trash_includes_codex_pages IS DISTINCT FROM EXCLUDED.trash_includes_codex_pages
 			OR sessions.deletion_cause IS DISTINCT FROM EXCLUDED.deletion_cause
 			OR sessions.message_count IS DISTINCT FROM EXCLUDED.message_count
 			OR sessions.user_message_count IS DISTINCT FROM EXCLUDED.user_message_count
@@ -2401,12 +2492,14 @@ func (s *Sync) pushSession(
 			OR sessions.peak_context_tokens IS DISTINCT FROM EXCLUDED.peak_context_tokens
 			OR sessions.has_total_output_tokens IS DISTINCT FROM EXCLUDED.has_total_output_tokens
 			OR sessions.has_peak_context_tokens IS DISTINCT FROM EXCLUDED.has_peak_context_tokens
+			OR sessions.prompt_evidence_discarded IS DISTINCT FROM EXCLUDED.prompt_evidence_discarded
 			OR sessions.is_automated IS DISTINCT FROM EXCLUDED.is_automated
 			OR sessions.data_version IS DISTINCT FROM EXCLUDED.data_version
 			OR sessions.cwd IS DISTINCT FROM EXCLUDED.cwd
 			OR sessions.git_branch IS DISTINCT FROM EXCLUDED.git_branch
 			OR sessions.source_session_id IS DISTINCT FROM EXCLUDED.source_session_id
 			OR sessions.source_version IS DISTINCT FROM EXCLUDED.source_version
+			OR sessions.group_key IS DISTINCT FROM EXCLUDED.group_key
 			OR sessions.transcript_fidelity IS DISTINCT FROM EXCLUDED.transcript_fidelity
 			OR sessions.transcript_revision IS DISTINCT FROM EXCLUDED.transcript_revision
 			OR sessions.parser_malformed_lines IS DISTINCT FROM EXCLUDED.parser_malformed_lines
@@ -2449,10 +2542,10 @@ func (s *Sync) pushSession(
 		nilStr(sess.DisplayName),
 		nilStr(sess.SessionName),
 		createdAt,
-		nilStrTS(sess.StartedAt),
-		nilStrTS(sess.EndedAt),
-		nilStrTS(sess.DeletedAt),
-		nilStrTS(sess.DeletedAt),
+		startedAt,
+		endedAt,
+		deletedAt,
+		deletedAt,
 		nilStr(sess.DeletionCause),
 		sess.MessageCount, sess.UserMessageCount,
 		sess.TotalOutputTokens, sess.PeakContextTokens,
@@ -2482,20 +2575,26 @@ func (s *Sync) pushSession(
 		sess.MissingVerificationCount, sess.DuplicatePromptCount,
 		sess.NoCodeContextCount, sess.RunawayToolLoopCount,
 		sanitizePG(sess.TranscriptFidelity),
-		transcriptRevisionValue(sess.TranscriptRevision),
+		db.TranscriptRevisionValue(sess.TranscriptRevision),
 		sanitizePG(sess.AgentLabel),
 		sanitizePG(sess.Entrypoint),
 		sanitizePG(sess.SessionKind),
-		s.archiveID,
-		s.databaseGeneration,
+		options.ArchiveID,
+		options.DatabaseGeneration,
 		sess.FilePath,
+		sess.ProjectAssigned,
 		string(legacyMarkerMachinesJSON),
+		options.UsageOnly,
+		sanitizePG(sess.GroupKey),
+		sess.TrashIncludesCodexPages,
+		db.EncodePRLinks(sess.PRLinks),
+		db.LabelsArg(sess.Labels),
 	)
 	if err != nil {
 		return err
 	}
 	if rowsAffected, rowsErr := result.RowsAffected(); rowsErr == nil && rowsAffected == 0 {
-		excluded, excludedErr := deletePGSessionIfExcluded(ctx, tx, sess)
+		excluded, excludedErr := deletePGSessionIfExcluded(ctx, tx, sess, markerID, options.Machine, legacyMarkerMachines)
 		if excludedErr != nil {
 			return excludedErr
 		}
@@ -2528,15 +2627,22 @@ func (s *Sync) pushSession(
 			return errSessionOwnershipConflict
 		}
 	}
-	excluded, excludedErr := deletePGSessionIfExcluded(ctx, tx, sess)
+	excluded, excludedErr := deletePGSessionIfExcluded(ctx, tx, sess, markerID, options.Machine, legacyMarkerMachines)
 	if excludedErr != nil {
 		return excludedErr
 	}
 	if excluded {
 		return errSessionExcluded
 	}
-	if err := replacePGSessionAliases(ctx, tx, sess); err != nil {
-		return err
+	if options.UsageOnly {
+		if err := clearSessionVectorsTx(ctx, tx, sess.ID); err != nil {
+			return err
+		}
+	}
+	if !options.SkipAliases {
+		if err := replacePGSessionAliases(ctx, tx, sess); err != nil {
+			return err
+		}
 	}
 	return nil
 }
@@ -2553,7 +2659,7 @@ func (s *Sync) pushMessages(
 	sessionUsageFingerprints map[string]string,
 	comparisons *pushMessageComparison,
 ) (int, error) {
-	localCount, err := s.local.MessageCount(sessionID)
+	localCount, err := s.local.MessageCount(ctx, sessionID)
 	if err != nil {
 		return 0, fmt.Errorf(
 			"counting local messages: %w", err,
@@ -2649,7 +2755,7 @@ func (s *Sync) pushMessages(
 	if !full && pgAgg.Count == localCount && pgAgg.Count > 0 {
 		localFP := pushLocalMessageFingerprint{}
 
-		localFP.Sum, localFP.Max, localFP.Min, err = s.local.MessageContentFingerprint(
+		localFP.Sum, localFP.Max, localFP.Min, err = s.local.MessageContentFingerprint(ctx,
 			sessionID,
 		)
 		if err != nil {
@@ -2658,7 +2764,7 @@ func (s *Sync) pushMessages(
 				err,
 			)
 		}
-		localFP.ContentHashFP, err = s.local.MessageContentHashFingerprint(
+		localFP.ContentHashFP, err = s.local.MessageContentHashFingerprint(ctx,
 			sessionID,
 		)
 		if err != nil {
@@ -2667,7 +2773,7 @@ func (s *Sync) pushMessages(
 				err,
 			)
 		}
-		localFP.RoleTimeFP, err = localMessageRoleTimePGFingerprint(
+		localFP.RoleTimeFP, err = localMessageRoleTimePGFingerprint(ctx,
 			s.local, sessionID,
 		)
 		if err != nil {
@@ -2676,26 +2782,26 @@ func (s *Sync) pushMessages(
 				err,
 			)
 		}
-		localFP.FlagsFP, err = s.local.MessageFlagsFingerprint(sessionID)
+		localFP.FlagsFP, err = s.local.MessageFlagsFingerprint(ctx, sessionID)
 		if err != nil {
 			return 0, fmt.Errorf(
 				"computing local message flags fingerprint: %w",
 				err,
 			)
 		}
-		localFP.SystemFP, err = s.local.SystemMessageFingerprint(sessionID)
+		localFP.SystemFP, err = s.local.SystemMessageFingerprint(ctx, sessionID)
 		if err != nil {
 			return 0, fmt.Errorf(
 				"computing local system message fingerprint: %w", err,
 			)
 		}
-		localFP.ToolCallCount, err = s.local.ToolCallCount(sessionID)
+		localFP.ToolCallCount, err = s.local.ToolCallCount(ctx, sessionID)
 		if err != nil {
 			return 0, fmt.Errorf(
 				"counting local tool_calls: %w", err,
 			)
 		}
-		localFP.ToolCallSum, err = s.local.ToolCallContentFingerprint(
+		localFP.ToolCallSum, err = s.local.ToolCallContentFingerprint(ctx,
 			sessionID,
 		)
 		if err != nil {
@@ -2704,13 +2810,13 @@ func (s *Sync) pushMessages(
 				err,
 			)
 		}
-		localFP.ToolCallFP, err = s.local.ToolCallFingerprint(sessionID)
+		localFP.ToolCallFP, err = s.local.ToolCallFingerprint(ctx, sessionID)
 		if err != nil {
 			return 0, fmt.Errorf(
 				"computing local tool_call fingerprint: %w", err,
 			)
 		}
-		localFP.ToolResultFP, err = localToolResultEventPGFingerprint(
+		localFP.ToolResultFP, err = localToolResultEventPGFingerprint(ctx,
 			s.local, sessionID,
 		)
 		if err != nil {
@@ -2718,7 +2824,7 @@ func (s *Sync) pushMessages(
 				"computing local tool_result_event fingerprint: %w", err,
 			)
 		}
-		localFP.TokenFP, err = s.local.MessageTokenFingerprint(sessionID)
+		localFP.TokenFP, err = s.local.MessageTokenFingerprint(ctx, sessionID)
 		if err != nil {
 			return 0, fmt.Errorf(
 				"computing local token fingerprint: %w",
@@ -2935,6 +3041,7 @@ func (s *Sync) replaceUsageEvents(
 
 type savedPostgresPin struct {
 	id                  int64
+	sessionID           string
 	ordinal             int
 	anchorOrdinal       int
 	sourceUUID          string
@@ -3089,6 +3196,7 @@ func snapshotPinnedMessages(
 	var pins []savedPostgresPin
 	for rows.Next() {
 		var pin savedPostgresPin
+		pin.sessionID = sessionID
 		if err := rows.Scan(
 			&pin.id, &pin.ordinal, &pin.anchorOrdinal,
 			&pin.note, &pin.createdAt,
@@ -3108,8 +3216,8 @@ func snapshotPinnedMessages(
 	return pins, nil
 }
 
-// restorePinnedMessages re-attaches the snapshotted pins to the new
-// message rows through the guarded identity rules; pins whose message
+// restorePinnedMessages moves the snapshotted pins from their saved session
+// to sessionID through the guarded message identity rules. Pins whose message
 // can no longer be identified are dropped.
 func restorePinnedMessages(
 	ctx context.Context, tx *sql.Tx, sessionID string,
@@ -3127,7 +3235,7 @@ func restorePinnedMessages(
 		if _, err := tx.ExecContext(ctx, `
 			DELETE FROM pinned_messages
 			WHERE session_id = $1 AND id = $2`,
-			sessionID, pin.id,
+			pin.sessionID, pin.id,
 		); err != nil {
 			return fmt.Errorf(
 				"clearing snapshotted pg pin id=%d: %w", pin.id, err,
@@ -3184,6 +3292,21 @@ func restorePinnedMessages(
 	return nil
 }
 
+// legacyDevinScopedSourceUUID maps a bare Devin node/step id stored
+// before the scope migration onto the session-scoped form the parser
+// now emits. It returns false for non-Devin sessions, remote ids
+// without a devin: raw part, empty uuids, and values that already
+// carry a scope.
+func legacyDevinScopedSourceUUID(sessionID, uuid string) (string, bool) {
+	_, rawID := parser.StripHostPrefix(sessionID)
+	if !strings.HasPrefix(rawID, "devin:") ||
+		uuid == "" ||
+		strings.Contains(uuid, ":") {
+		return "", false
+	}
+	return strings.TrimPrefix(rawID, "devin:") + ":" + uuid, true
+}
+
 func resolvePinnedMessageTarget(
 	ctx context.Context, tx *sql.Tx, sessionID string,
 	pin savedPostgresPin,
@@ -3192,20 +3315,36 @@ func resolvePinnedMessageTarget(
 		return 0, "", false, nil
 	}
 	if pin.sourceUUID != "" {
+		// The stored uuid is matched alongside its session-scoped
+		// form so a pin saved against a bare Devin node/step id
+		// re-attaches after the re-parse restamps rows. Passing the
+		// raw value twice when no scoped form applies keeps the
+		// query shape static. Every uniqueness and multiplicity
+		// count below measures the COMBINED {bare, scoped}
+		// candidate set, not just the form one candidate row
+		// carries: if a bare and a scoped row ever coexist, each
+		// per-row count would look unique and the pin would attach
+		// to whichever row the scan returned first.
+		scopedUUID := pin.sourceUUID
+		if scoped, ok := legacyDevinScopedSourceUUID(
+			sessionID, pin.sourceUUID,
+		); ok {
+			scopedUUID = scoped
+		}
 		if pin.sourceUUIDCount == 1 {
 			target, sourceUUID, ok, err := scanPinnedMessageTarget(
 				tx.QueryRowContext(ctx, `
 					SELECT m.ordinal, m.source_uuid
 					FROM messages m
 					WHERE m.session_id = $1
-						AND m.source_uuid = $2
+						AND m.source_uuid IN ($2, $3)
 						AND (
 							SELECT COUNT(*)
 							FROM messages same_uuid
 							WHERE same_uuid.session_id = m.session_id
-								AND same_uuid.source_uuid = m.source_uuid
+								AND same_uuid.source_uuid IN ($2, $3)
 						) = 1`,
-					sessionID, pin.sourceUUID,
+					sessionID, pin.sourceUUID, scopedUUID,
 				),
 			)
 			if err != nil {
@@ -3225,33 +3364,37 @@ func resolvePinnedMessageTarget(
 		// pinned occurrence across shifts caused by rows inserted
 		// before the group. A different count means duplicates were
 		// inserted or removed and the rank no longer identifies an
-		// occurrence, so the pin is dropped.
+		// occurrence, so the pin is dropped. Both counts measure the
+		// combined {bare, scoped} candidate set for the reason given
+		// above: coexisting forms inflate the group past the saved
+		// multiplicity, so the pin drops instead of attaching to an
+		// arbitrary row.
 		target, sourceUUID, ok, err := scanPinnedMessageTarget(
 			tx.QueryRowContext(ctx, `
 				SELECT m.ordinal, m.source_uuid
 				FROM messages m
 				WHERE m.session_id = $1
-					AND m.source_uuid = $2
-					AND m.role = $3
-					AND m.content = $4
+					AND m.source_uuid IN ($2, $3)
+					AND m.role = $4
+					AND m.content = $5
 					AND (
 						SELECT COUNT(*)
 						FROM messages same_identity
 						WHERE same_identity.session_id = m.session_id
-							AND same_identity.source_uuid = m.source_uuid
+							AND same_identity.source_uuid IN ($2, $3)
 							AND same_identity.role = m.role
 							AND same_identity.content = m.content
-					) = $5
+					) = $6
 					AND (
 						SELECT COUNT(*)
 						FROM messages identity_rank
 						WHERE identity_rank.session_id = m.session_id
-							AND identity_rank.source_uuid = m.source_uuid
+							AND identity_rank.source_uuid IN ($2, $3)
 							AND identity_rank.role = m.role
 							AND identity_rank.content = m.content
 							AND identity_rank.ordinal <= m.ordinal
-					) = $6`,
-				sessionID, pin.sourceUUID,
+					) = $7`,
+				sessionID, pin.sourceUUID, scopedUUID,
 				pin.role, pin.content,
 				pin.sourceIdentityCount, pin.sourceIdentityRank,
 			),
@@ -3340,7 +3483,7 @@ func pgMessageTokenFingerprint(
 	ctx context.Context, tx *sql.Tx, sessionID string,
 ) (string, error) {
 	rows, err := tx.QueryContext(ctx,
-		`SELECT ordinal, model, token_usage, context_tokens,
+		`SELECT ordinal, model, reasoning_effort, provider_id, token_usage, context_tokens,
 			output_tokens, has_context_tokens, has_output_tokens,
 			claude_message_id, claude_request_id,
 			source_type, source_subtype, prompt_source, source_uuid,
@@ -3358,13 +3501,13 @@ func pgMessageTokenFingerprint(
 	var b strings.Builder
 	for rows.Next() {
 		var ordinal, contextTokens, outputTokens int
-		var model, tokenUsage string
+		var model, reasoningEffort, providerID, tokenUsage string
 		var hasContextTokens, hasOutputTokens bool
 		var claudeMsgID, claudeReqID string
 		var srcType, srcSubtype, promptSource, srcUUID, srcParentUUID string
 		var isSidechain, isCompactBoundary bool
 		if err := rows.Scan(
-			&ordinal, &model, &tokenUsage, &contextTokens,
+			&ordinal, &model, &reasoningEffort, &providerID, &tokenUsage, &contextTokens,
 			&outputTokens, &hasContextTokens, &hasOutputTokens,
 			&claudeMsgID, &claudeReqID,
 			&srcType, &srcSubtype, &promptSource, &srcUUID, &srcParentUUID,
@@ -3373,10 +3516,12 @@ func pgMessageTokenFingerprint(
 			return "", err
 		}
 		fmt.Fprintf(&b,
-			"%d|%d:%s|%d:%s|%d|%d|%t|%t|%s|%s|"+
+			"%d|%d:%s|%d:%s|%d:%s|%d:%s|%d|%d|%t|%t|%s|%s|"+
 				"%d:%s|%d:%s|%d:%s|%d:%s|%d:%s|%t|%t;",
 			ordinal,
 			len(model), model,
+			len(reasoningEffort), reasoningEffort,
+			len(providerID), providerID,
 			len(tokenUsage), tokenUsage,
 			contextTokens, outputTokens,
 			hasContextTokens, hasOutputTokens,
@@ -3422,10 +3567,10 @@ func pgMessageContentHashFingerprint(
 	return b.String(), rows.Err()
 }
 
-func localMessageRoleTimePGFingerprint(
+func localMessageRoleTimePGFingerprint(ctx context.Context,
 	local *db.DB, sessionID string,
 ) (string, error) {
-	return local.MessageRoleTimeFingerprintWithTimestampNormalizer(
+	return local.MessageRoleTimeFingerprintWithTimestampNormalizer(ctx,
 		sessionID,
 		pgPushTimestampFingerprintText,
 	)
@@ -3520,7 +3665,7 @@ func pgToolCallFingerprint(
 			COALESCE(skill_name, ''), COALESCE(subagent_session_id, ''),
 			COALESCE(result_content_length, 0),
 			COALESCE(result_content, ''),
-			COALESCE(file_path, '')
+			COALESCE(file_path, ''), COALESCE(observed_outcome, ''), COALESCE(observed_repeat, ''), COALESCE(sequence_ending, '')
 		 FROM tool_calls
 		 WHERE session_id = $1
 		 ORDER BY message_ordinal ASC, call_index ASC`,
@@ -3536,10 +3681,11 @@ func pgToolCallFingerprint(
 		var messageOrdinal, callIndex, resultContentLength int
 		var toolName, category, toolUseID, inputJSON string
 		var skillName, subagentSessionID, resultContent, filePath string
+		var observedOutcome, observedRepeat, sequenceEnding string
 		if err := rows.Scan(
 			&messageOrdinal, &callIndex, &toolName, &category,
 			&toolUseID, &inputJSON, &skillName, &subagentSessionID,
-			&resultContentLength, &resultContent, &filePath,
+			&resultContentLength, &resultContent, &filePath, &observedOutcome, &observedRepeat, &sequenceEnding,
 		); err != nil {
 			return "", err
 		}
@@ -3556,6 +3702,7 @@ func pgToolCallFingerprint(
 			len(resultContent), resultContent,
 			len(filePath), filePath,
 		)
+		fmt.Fprintf(&b, "%d:%s|%d:%s|%d:%s;", len(observedOutcome), observedOutcome, len(observedRepeat), observedRepeat, len(sequenceEnding), sequenceEnding)
 	}
 	return b.String(), rows.Err()
 }
@@ -3564,7 +3711,7 @@ func pgUsageEventFingerprint(
 	ctx context.Context, tx *sql.Tx, sessionID string,
 ) (string, error) {
 	rows, err := tx.QueryContext(ctx,
-		`SELECT message_ordinal, source, model,
+		`SELECT message_ordinal, source, model, provider_id,
 			input_tokens, output_tokens,
 			cache_creation_input_tokens, cache_read_input_tokens,
 			reasoning_tokens, cost_microdollars, cost_status, cost_source,
@@ -3582,7 +3729,7 @@ func pgUsageEventFingerprint(
 	var b strings.Builder
 	for rows.Next() {
 		var ordinal sql.NullInt64
-		var source, model, costStatus, costSource string
+		var source, model, providerID, costStatus, costSource string
 		var inputTokens, outputTokens int
 		var cacheCreationInputTokens, cacheReadInputTokens int
 		var reasoningTokens int
@@ -3590,7 +3737,7 @@ func pgUsageEventFingerprint(
 		var occurredAt sql.NullTime
 		var dedupKey sql.NullString
 		if err := rows.Scan(
-			&ordinal, &source, &model,
+			&ordinal, &source, &model, &providerID,
 			&inputTokens, &outputTokens,
 			&cacheCreationInputTokens, &cacheReadInputTokens,
 			&reasoningTokens, &cost, &costStatus, &costSource,
@@ -3603,11 +3750,12 @@ func pgUsageEventFingerprint(
 			occurred = FormatISO8601(occurredAt.Time)
 		}
 		fmt.Fprintf(&b,
-			"%t|%d|%d:%s|%d:%s|%d|%d|%d|%d|%d|%t|%d|%d:%s|%d:%s|%d:%s|%d:%s;",
+			"%t|%d|%d:%s|%d:%s|%d:%s|%d|%d|%d|%d|%d|%t|%d|%d:%s|%d:%s|%d:%s|%d:%s;",
 			ordinal.Valid,
 			ordinal.Int64,
 			len(source), source,
 			len(model), model,
+			len(providerID), providerID,
 			inputTokens,
 			outputTokens,
 			cacheCreationInputTokens,
@@ -3639,34 +3787,34 @@ func bulkInsertMessages(
 		b.WriteString(`INSERT INTO messages (
 			session_id, ordinal, role, content, thinking_text,
 			timestamp, has_thinking, has_tool_use,
-			content_length, is_system, model, token_usage,
+			content_length, is_system, model, reasoning_effort, token_usage,
 			context_tokens, output_tokens,
+			provider_id,
 			has_context_tokens, has_output_tokens,
 			claude_message_id, claude_request_id,
 			source_type, source_subtype, prompt_source, source_uuid,
 			source_parent_uuid, is_sidechain,
 			is_compact_boundary) VALUES `)
-		args := make([]any, 0, len(batch)*25)
+		args := make([]any, 0, len(batch)*27)
 		for j, m := range batch {
 			if j > 0 {
 				b.WriteByte(',')
 			}
-			p := j*25 + 1
+			p := j*27 + 1
 			fmt.Fprintf(&b,
-				"($%d,$%d,$%d,$%d,$%d,$%d,$%d,$%d,$%d,$%d,$%d,$%d,$%d,$%d,$%d,$%d,$%d,$%d,$%d,$%d,$%d,$%d,$%d,$%d,$%d)",
+				"($%d,$%d,$%d,$%d,$%d,$%d,$%d,$%d,$%d,$%d,$%d,$%d,$%d,$%d,$%d,$%d,$%d,$%d,$%d,$%d,$%d,$%d,$%d,$%d,$%d,$%d,$%d)",
 				p, p+1, p+2, p+3, p+4,
 				p+5, p+6, p+7, p+8, p+9,
 				p+10, p+11, p+12, p+13, p+14, p+15,
 				p+16, p+17, p+18, p+19, p+20,
-				p+21, p+22, p+23, p+24,
+				p+21, p+22, p+23, p+24, p+25, p+26,
 			)
-			var ts any
-			if m.Timestamp != "" {
-				if t, ok := ParseSQLiteTimestamp(
-					m.Timestamp,
-				); ok {
-					ts = t
-				}
+			ts, err := optionalSQLiteTimestamp(m.Timestamp)
+			if err != nil {
+				return fmt.Errorf(
+					"parsing message %s ordinal %d timestamp: %w",
+					sessionID, m.Ordinal, err,
+				)
 			}
 			// Sanitize every parser-derived string, not just
 			// content: model and source fields come from
@@ -3680,8 +3828,10 @@ func bulkInsertMessages(
 				m.HasThinking,
 				m.HasToolUse, m.ContentLength, m.IsSystem,
 				sanitizePG(m.Model),
+				sanitizePG(m.ReasoningEffort),
 				sanitizePG(string(m.TokenUsage)),
 				m.ContextTokens, m.OutputTokens,
+				sanitizePG(m.ProviderID),
 				m.HasContextTokens, m.HasOutputTokens,
 				sanitizePG(m.ClaudeMessageID),
 				sanitizePG(m.ClaudeRequestID),
@@ -3720,25 +3870,27 @@ func bulkInsertUsageEvents(
 		b.WriteString(`INSERT INTO usage_events (
 			session_id, message_ordinal, source, model,
 			input_tokens, output_tokens,
+			provider_id,
 			cache_creation_input_tokens, cache_read_input_tokens,
 			reasoning_tokens, cost_microdollars, cost_status, cost_source,
 			occurred_at, dedup_key) VALUES `)
-		args := make([]any, 0, len(batch)*14)
+		args := make([]any, 0, len(batch)*15)
 		for j, ev := range batch {
 			if j > 0 {
 				b.WriteByte(',')
 			}
-			p := j*14 + 1
+			p := j*15 + 1
 			fmt.Fprintf(&b,
-				"($%d,$%d,$%d,$%d,$%d,$%d,$%d,$%d,$%d,$%d,$%d,$%d,$%d,$%d)",
+				"($%d,$%d,$%d,$%d,$%d,$%d,$%d,$%d,$%d,$%d,$%d,$%d,$%d,$%d,$%d)",
 				p, p+1, p+2, p+3, p+4, p+5, p+6,
-				p+7, p+8, p+9, p+10, p+11, p+12, p+13,
+				p+7, p+8, p+9, p+10, p+11, p+12, p+13, p+14,
 			)
-			var occurred any
-			if ev.OccurredAt != "" {
-				if t, ok := ParseSQLiteTimestamp(ev.OccurredAt); ok {
-					occurred = t
-				}
+			occurred, err := optionalSQLiteTimestamp(ev.OccurredAt)
+			if err != nil {
+				return fmt.Errorf(
+					"parsing usage event %s occurred_at: %w",
+					ev.SessionID, err,
+				)
 			}
 			var ordinal any
 			if ev.MessageOrdinal != nil {
@@ -3755,6 +3907,7 @@ func bulkInsertUsageEvents(
 				sanitizePG(ev.Model),
 				ev.InputTokens,
 				ev.OutputTokens,
+				sanitizePG(ev.ProviderID),
 				ev.CacheCreationInputTokens,
 				ev.CacheReadInputTokens,
 				ev.ReasoningTokens,
@@ -3864,18 +4017,18 @@ func bulkInsertToolCalls(
 			call_index, tool_use_id, input_json,
 			skill_name, result_content_length,
 			result_content, subagent_session_id,
-			message_ordinal, file_path) VALUES `)
-		args := make([]any, 0, len(batch)*12)
+			message_ordinal, file_path, observed_outcome, observed_repeat, sequence_ending) VALUES `)
+		args := make([]any, 0, len(batch)*15)
 		for j, r := range batch {
 			if j > 0 {
 				b.WriteByte(',')
 			}
-			p := j*12 + 1
+			p := j*15 + 1
 			fmt.Fprintf(&b,
 				"($%d,$%d,$%d,$%d,$%d,$%d,"+
-					"$%d,$%d,$%d,$%d,$%d,$%d)",
+					"$%d,$%d,$%d,$%d,$%d,$%d,$%d,$%d,$%d)",
 				p, p+1, p+2, p+3, p+4, p+5,
-				p+6, p+7, p+8, p+9, p+10, p+11,
+				p+6, p+7, p+8, p+9, p+10, p+11, p+12, p+13, p+14,
 			)
 			args = append(args,
 				sessionID,
@@ -3885,11 +4038,13 @@ func bulkInsertToolCalls(
 				sanitizePG(r.tc.ToolUseID),
 				nilIfEmpty(r.tc.InputJSON),
 				nilIfEmpty(r.tc.SkillName),
-				nilIfZero(r.tc.ResultContentLength),
-				nilIfEmpty(r.tc.ResultContent),
+				db.NilIfZero(r.tc.ResultContentLength),
+				nilIfEmpty(db.DedupToolCallResultSummary(
+					r.tc.ResultContent, r.tc.ResultEvents,
+				)),
 				nilIfEmpty(r.tc.SubagentSessionID),
 				r.ordinal,
-				nilIfEmpty(r.tc.FilePath),
+				nilIfEmpty(r.tc.FilePath), r.tc.ObservedOutcome, r.tc.ObservedRepeat, r.tc.SequenceEnding,
 			)
 		}
 		if _, err := tx.ExecContext(
@@ -3947,11 +4102,12 @@ func bulkInsertToolResultEvents(
 				p, p+1, p+2, p+3, p+4, p+5,
 				p+6, p+7, p+8, p+9, p+10, p+11,
 			)
-			var ts any
-			if r.ev.Timestamp != "" {
-				if t, ok := ParseSQLiteTimestamp(r.ev.Timestamp); ok {
-					ts = t
-				}
+			ts, err := optionalSQLiteTimestamp(r.ev.Timestamp)
+			if err != nil {
+				return fmt.Errorf(
+					"parsing tool result event %s ordinal %d timestamp: %w",
+					sessionID, r.ordinal, err,
+				)
 			}
 			args = append(args,
 				sessionID,
@@ -4016,6 +4172,13 @@ func (s *Sync) pushSecretFindings(
 		return deleted > 0, nil
 	}
 
+	if err := bulkInsertSecretFindings(ctx, tx, sessionID, findings); err != nil {
+		return false, err
+	}
+	return true, nil
+}
+
+func bulkInsertSecretFindings(ctx context.Context, tx *sql.Tx, sessionID string, findings []db.SecretFinding) error {
 	const sfBatch = 50
 	for i := 0; i < len(findings); i += sfBatch {
 		end := min(i+sfBatch, len(findings))
@@ -4052,13 +4215,13 @@ func (s *Sync) pushSecretFindings(
 		if _, err := tx.ExecContext(
 			ctx, b.String(), args...,
 		); err != nil {
-			return false, fmt.Errorf(
+			return fmt.Errorf(
 				"bulk inserting secret_findings for %s: %w",
 				sessionID, err,
 			)
 		}
 	}
-	return true, nil
+	return nil
 }
 
 // normalizeSyncTimestamps ensures schema exists and normalizes
@@ -4071,7 +4234,7 @@ func (s *Sync) normalizeSyncTimestamps(
 	if err := s.ensureSchemaLocked(ctx); err != nil {
 		return err
 	}
-	return NormalizeLocalSyncStateTimestamps(s.effectiveSyncState())
+	return NormalizeLocalSyncStateTimestamps(ctx, s.effectiveSyncState())
 }
 
 // sanitizePG strips null bytes and replaces invalid UTF-8
@@ -4089,13 +4252,6 @@ func nilIfEmpty(s string) any {
 		return nil
 	}
 	return s
-}
-
-func nilIfZero(n int) any {
-	if n == 0 {
-		return nil
-	}
-	return n
 }
 
 func (s *Sync) syncCursorUsageEvents(ctx context.Context) error {

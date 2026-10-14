@@ -4,14 +4,19 @@ package parser
 
 import (
 	"bytes"
-	"encoding/json"
+	"encoding/json/jsontext"
+	"encoding/json/v2"
+	"errors"
 	"fmt"
 	"os"
+	"path/filepath"
 	"strings"
 	"time"
 
 	"github.com/tidwall/gjson"
 )
+
+var errGeminiMissingSessionID = errors.New("missing sessionId")
 
 // geminiTokens holds token usage counts from a Gemini message.
 type geminiTokens struct {
@@ -40,13 +45,13 @@ func extractGeminiTokens(msg gjson.Result) geminiTokens {
 // Anthropic-style shape used by usage and cost queries. Thoughts
 // tokens are billed at the output rate, so they fold into
 // output_tokens here.
-func normalizedGeminiTokenUsage(tok geminiTokens) json.RawMessage {
+func normalizedGeminiTokenUsage(tok geminiTokens) jsontext.Value {
 	payload := map[string]int{
 		"input_tokens":            tok.Input,
 		"output_tokens":           tok.Output + tok.Thoughts,
 		"cache_read_input_tokens": tok.Cached,
 	}
-	raw, err := json.Marshal(payload)
+	raw, err := json.Marshal(payload, json.Deterministic(true))
 	if err != nil {
 		return nil
 	}
@@ -82,7 +87,8 @@ func (p *geminiProvider) parseSession(
 			)
 		}
 	}
-	if bytes.IndexByte(data, '\n') >= 0 {
+	if strings.EqualFold(filepath.Ext(path), ".jsonl") ||
+		bytes.IndexByte(data, '\n') >= 0 {
 		return parseGeminiJSONL(
 			path, project, machine, info, data,
 		)
@@ -98,7 +104,7 @@ func parseGeminiJSONObject(
 	sessionID := root.Get("sessionId").Str
 	if sessionID == "" {
 		return nil, nil, fmt.Errorf(
-			"missing sessionId in %s", path,
+			"%w in %s", errGeminiMissingSessionID, path,
 		)
 	}
 
@@ -134,7 +140,7 @@ func parseGeminiJSONObject(
 	return buildGeminiSession(
 		path, project, machine, info,
 		sessionID, startTime, lastUpdated,
-		firstMessage, messages,
+		firstMessage, root.Get("summary").Str, messages,
 	), messages, nil
 }
 
@@ -148,6 +154,7 @@ func parseGeminiJSONL(
 		startTime    time.Time
 		lastUpdated  time.Time
 		firstMessage string
+		summary      string
 		records      = make([]gjson.Result, 0)
 		recordIDs    = make(map[string]int)
 	)
@@ -180,11 +187,18 @@ func parseGeminiJSONL(
 			); ts.After(lastUpdated) {
 				lastUpdated = ts
 			}
+			if value := rec.Get("summary"); value.Exists() {
+				summary = value.Str
+			}
 		}
 		if ts := parseTimestamp(
 			rec.Get("$set.lastUpdated").Str,
 		); ts.After(lastUpdated) {
 			lastUpdated = ts
+		}
+		// saveSummary appends {"$set":{"summary":...}}; the latest wins.
+		if value := rec.Get("$set.summary"); value.Exists() {
+			summary = value.Str
 		}
 
 		msgType := rec.Get("type").Str
@@ -207,7 +221,7 @@ func parseGeminiJSONL(
 	}
 	if sessionID == "" {
 		return nil, nil, fmt.Errorf(
-			"missing sessionId in %s", path,
+			"%w in %s", errGeminiMissingSessionID, path,
 		)
 	}
 
@@ -228,7 +242,7 @@ func parseGeminiJSONL(
 	return buildGeminiSession(
 		path, project, machine, info,
 		sessionID, startTime, lastUpdated,
-		firstMessage, messages,
+		firstMessage, summary, messages,
 	), messages, nil
 }
 
@@ -244,14 +258,13 @@ func parseGeminiMessage(
 	if msgType == "gemini" {
 		role = RoleAssistant
 	}
-	content, hasThinking, hasToolUse, tcs, trs :=
-		extractGeminiContent(msg)
+	content, hasThinking, hasToolUse, tcs, trs := extractGeminiContent(msg)
 	if strings.TrimSpace(content) == "" {
 		return ParsedMessage{}, false
 	}
 
 	tok := extractGeminiTokens(msg)
-	var tokenUsage json.RawMessage
+	var tokenUsage jsontext.Value
 	tokResult := msg.Get("tokens")
 	if tokResult.Exists() {
 		tokenUsage = normalizedGeminiTokenUsage(tok)
@@ -311,7 +324,7 @@ func applyGeminiCumulativeDeltas(messages []ParsedMessage) {
 				"output_tokens":           usage.Output,
 				"cache_read_input_tokens": cachedDelta,
 			}
-			if raw, err := json.Marshal(payload); err == nil {
+			if raw, err := json.Marshal(payload, json.Deterministic(true)); err == nil {
 				messages[i].TokenUsage = raw
 			}
 		}
@@ -326,10 +339,15 @@ func buildGeminiSession(
 	info os.FileInfo,
 	sessionID string,
 	startTime, lastUpdated time.Time,
-	firstMessage string,
+	firstMessage, summary string,
 	messages []ParsedMessage,
 ) *ParsedSession {
 	applyGeminiCumulativeDeltas(messages)
+	// Gemini CLI shows its generated summary as the session's name.
+	sessionName := strings.TrimSpace(summary)
+	if firstMessage == "" {
+		firstMessage = truncate(sessionName, 300)
+	}
 	var userCount int
 	for _, m := range messages {
 		if m.Role == RoleUser && m.Content != "" {
@@ -343,6 +361,7 @@ func buildGeminiSession(
 		Machine:          machine,
 		Agent:            AgentGemini,
 		FirstMessage:     firstMessage,
+		SessionName:      sessionName,
 		StartedAt:        startTime,
 		EndedAt:          lastUpdated,
 		MessageCount:     len(messages),
@@ -417,12 +436,14 @@ func extractGeminiContent(
 			hasToolUse = true
 			name := tc.Get("name").Str
 			tcID := tc.Get("id").Str
+			rendering := formatGeminiToolCall(tc)
 			if name != "" {
 				parsed = append(parsed, ParsedToolCall{
 					ToolName:  name,
 					Category:  NormalizeToolCategory(name),
 					ToolUseID: tcID,
 					InputJSON: tc.Get("args").Raw,
+					Rendering: rendering,
 				})
 				// Extract inline tool results from
 				// result[].functionResponse.response.output
@@ -447,7 +468,7 @@ func extractGeminiContent(
 					},
 				)
 			}
-			parts = append(parts, formatGeminiToolCall(tc))
+			parts = append(parts, rendering)
 			return true
 		})
 	}
@@ -476,7 +497,7 @@ func formatGeminiToolCall(tc gjson.Result) string {
 		)
 	case "run_command", "execute_command", "run_shell_command":
 		cmd := args.Get("command").Str
-		return fmt.Sprintf("[Bash]\n$ %s", cmd)
+		return "[Bash]\n$ " + cmd
 	case "list_directory":
 		return fmt.Sprintf(
 			"[List: %s]", args.Get("dir_path").Str,

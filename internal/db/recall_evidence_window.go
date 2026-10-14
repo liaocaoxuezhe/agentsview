@@ -5,7 +5,7 @@ import (
 	"crypto/sha256"
 	"database/sql"
 	"encoding/hex"
-	"encoding/json"
+	"encoding/json/v2"
 	"errors"
 	"fmt"
 	"log"
@@ -28,8 +28,8 @@ func invalidRecallEvidencef(format string, args ...any) error {
 }
 
 func isRecallEvidenceValidationError(err error) bool {
-	var validationErr *recallEvidenceValidationError
-	return errors.As(err, &validationErr)
+	_, hasValidationErr := errors.AsType[*recallEvidenceValidationError](err)
+	return hasValidationErr
 }
 
 const (
@@ -107,7 +107,7 @@ type RecallEvidenceWindowToolCall struct {
 	ToolUseID           string `json:"tool_use_id,omitempty"`
 	InputJSON           string `json:"input_json,omitempty"`
 	SkillName           string `json:"skill_name,omitempty"`
-	ResultContentLength int    `json:"result_content_length,omitempty"`
+	ResultContentLength int    `json:"result_content_length,omitzero"`
 	ResultContent       string `json:"result_content,omitempty"`
 	SubagentSessionID   string `json:"subagent_session_id,omitempty"`
 }
@@ -130,12 +130,6 @@ type RecallEvidenceSelectionMetadata struct {
 	MessageEndSourceUUID   string   `json:"message_end_source_uuid,omitempty"`
 	ContentDigest          string   `json:"content_digest"`
 	ToolUseIDs             []string `json:"tool_use_ids,omitempty"`
-}
-
-type recallEvidenceQueryer interface {
-	QueryContext(
-		context.Context, string, ...any,
-	) (*sql.Rows, error)
 }
 
 // BuildRecallEvidenceWindow loads an exact, gap-free transcript range and
@@ -173,7 +167,7 @@ func (db *DB) BuildRecallEvidenceWindow(
 
 func buildRecallEvidenceWindow(
 	ctx context.Context,
-	queryer recallEvidenceQueryer,
+	queryer messageRowsQuerier,
 	sessionID string,
 	messageStartOrdinal int,
 	messageEndOrdinal int,
@@ -213,6 +207,7 @@ func buildRecallEvidenceWindow(
 			err,
 		)
 	}
+	defer rows.Close()
 	for rows.Next() {
 		var message RecallEvidenceWindowMessage
 		if err := rows.Scan(
@@ -264,7 +259,7 @@ func buildRecallEvidenceWindow(
 		       COALESCE(tc.input_json, ''),
 		       COALESCE(tc.skill_name, ''),
 		       COALESCE(tc.result_content_length, 0),
-		       COALESCE(tc.result_content, ''),
+		       `+ToolCallResultContentSQL("tc", "m.ordinal")+`,
 		       COALESCE(tc.subagent_session_id, '')
 		FROM tool_calls tc
 		JOIN messages m ON m.id = tc.message_id
@@ -283,6 +278,7 @@ func buildRecallEvidenceWindow(
 			err,
 		)
 	}
+	defer toolRows.Close()
 	allowedToolUseIDs := make(map[string]struct{})
 	for toolRows.Next() {
 		var ordinal int
@@ -504,12 +500,11 @@ func recallEvidenceAuthorizationDigest(
 }
 
 func digestRecallEvidenceCanonical(value any) (string, error) {
-	encoded, err := json.Marshal(value)
-	if err != nil {
+	digest := sha256.New()
+	if err := json.MarshalWrite(digest, value); err != nil {
 		return "", fmt.Errorf("encoding canonical recall evidence: %w", err)
 	}
-	digest := sha256.Sum256(encoded)
-	return hex.EncodeToString(digest[:]), nil
+	return hex.EncodeToString(digest.Sum(nil)), nil
 }
 
 func normalizeRecallEvidenceToolUseIDs(values []string) ([]string, error) {
@@ -866,6 +861,7 @@ func reconcileAllRecallEvidenceTx(
 	if err != nil {
 		return fmt.Errorf("querying recall evidence sessions: %w", err)
 	}
+	defer rows.Close()
 	var sessionIDs []string
 	for rows.Next() {
 		var sessionID string

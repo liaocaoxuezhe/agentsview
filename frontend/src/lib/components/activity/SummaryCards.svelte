@@ -10,12 +10,19 @@
     return v.toLocaleString();
   }
 
-  // Sessions card detail line: surface the automation split only when there
-  // are automated sessions, so the common all-interactive view stays clean,
-  // and keep the untimed count. interactive + automated == sessions.
+  // Subagents are separate from interactive and automated conversation counts.
   function sessionsSub(t: Report["totals"]): string {
     const parts: string[] = [];
-    if (t.automated_sessions > 0) {
+    if (t.subagent_sessions > 0) {
+      parts.push(
+        m.activity_session_kind_split({
+          interactive: fmtInt(t.interactive_sessions),
+          subagents: t.subagent_sessions,
+          subagentsLabel: fmtInt(t.subagent_sessions),
+          automated: fmtInt(t.automated_sessions),
+        }),
+      );
+    } else if (t.automated_sessions > 0) {
       parts.push(
         m.activity_interactive_automated_split({ interactive: fmtInt(t.interactive_sessions), automated: fmtInt(t.automated_sessions) }),
       );
@@ -36,9 +43,7 @@
     return `${h}h ${m}m`;
   }
 
-  // RFC3339 -> "HH:MM" in the viewer's local zone. The report's
-  // day window is already local-timezone-aligned server-side, so
-  // local formatting keeps the clock label consistent with it.
+  // Keep the clock label in the same timezone as the report and timeline.
   function fmtClock(ts: string | null): string {
     if (!ts) return "";
     const d = new Date(ts);
@@ -47,11 +52,11 @@
       hour: "2-digit",
       minute: "2-digit",
       hourCycle: "h23",
+      timeZone: report.timezone,
     });
   }
 
-  const peakAt = $derived(fmtClock(report.peak.at));
-  const asOf = $derived(fmtClock(report.as_of));
+  const peakAt = $derived(fmtClock(report.interactive_peak.at));
 
   interface SummaryCard {
     label: string;
@@ -64,8 +69,8 @@
     const t = report.totals;
     return [
       {
-        label: m.activity_peak_concurrency(),
-        value: String(report.peak.agents),
+        label: m.activity_interactive_peak(),
+        value: fmtInt(report.interactive_peak.agents),
         sub: peakAt ? m.activity_at_time({ time: peakAt }) : "",
         featured: true,
       },
@@ -117,10 +122,6 @@
   {/each}
 </div>
 
-{#if report.partial && asOf}
-  <div class="partial-note">{m.activity_in_progress_as_of({ time: asOf })}</div>
-{/if}
-
 <style>
   .summary-cards {
     display: flex;
@@ -163,11 +164,5 @@
     font-size: 10px;
     color: var(--text-muted);
     margin-top: 2px;
-  }
-
-  .partial-note {
-    margin-top: 8px;
-    font-size: 11px;
-    color: var(--accent-amber);
   }
 </style>

@@ -3,6 +3,19 @@
 Read this file before changing build commands, toolchain setup, CI build tags,
 or frontend dependencies. Use the `Makefile` as the command reference.
 
+## CI runner policy
+
+All CI jobs use standard GitHub-hosted runners, including fork pull requests,
+scheduled checks, and desktop builds. Select labels from
+[GitHub's supported runners](https://docs.github.com/en/actions/reference/runners/github-hosted-runners).
+Keep the explicit architecture labels for Linux ARM64 and macOS desktop builds.
+
+Use the built-in Go cache in `actions/setup-go` and npm caching in
+`actions/setup-node`. Set `cache-dependency-path` to the lockfiles for the
+packages the job installs. Desktop jobs cache Rust dependencies through
+`Swatinem/rust-cache` with the GitHub cache backend. Playwright jobs install
+browsers and system dependencies on each run.
+
 ## Go and SQLite
 
 - Build with `CGO_ENABLED=1`; the SQLite driver requires CGO.

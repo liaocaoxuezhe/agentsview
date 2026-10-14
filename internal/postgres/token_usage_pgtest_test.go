@@ -4,13 +4,14 @@ package postgres
 
 import (
 	"context"
-	"encoding/json"
+	"encoding/json/jsontext"
 	"testing"
 
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
 
 	"go.kenn.io/agentsview/internal/db"
+	"go.kenn.io/agentsview/internal/storage"
 )
 
 func TestStoreSessionAndMessageTokenUsage(t *testing.T) {
@@ -83,7 +84,7 @@ func TestPushTokenUsageToPostgres(t *testing.T) {
 	t.Cleanup(func() { cleanPGSchema(t, pgURL) })
 
 	local := testDB(t)
-	ps, err := New(pgURL, "agentsview", local, "test-machine", true, SyncOptions{})
+	ps, err := New(pgURL, "agentsview", local, "test-machine", true, storage.PusherOptions{})
 	require.NoError(t, err, "creating sync")
 	defer ps.Close()
 
@@ -102,15 +103,15 @@ func TestPushTokenUsageToPostgres(t *testing.T) {
 		HasTotalOutputTokens: true,
 		HasPeakContextTokens: true,
 	}
-	require.NoError(t, local.UpsertSession(sess), "UpsertSession")
-	require.NoError(t, local.InsertMessages([]db.Message{{
+	require.NoError(t, local.UpsertSession(t.Context(), sess), "UpsertSession")
+	require.NoError(t, local.InsertMessages(t.Context(), []db.Message{{
 		SessionID:        "token-push-001",
 		Ordinal:          0,
 		Role:             "assistant",
 		Content:          "hello",
 		ContentLength:    5,
 		Model:            "claude-sonnet-4-20250514",
-		TokenUsage:       json.RawMessage(`{"output_tokens":200}`),
+		TokenUsage:       jsontext.Value(`{"output_tokens":200}`),
 		ContextTokens:    900,
 		OutputTokens:     200,
 		HasContextTokens: true,

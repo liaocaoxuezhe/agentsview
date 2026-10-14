@@ -2,7 +2,6 @@ package db
 
 import (
 	"context"
-	"database/sql"
 	"fmt"
 )
 
@@ -26,19 +25,26 @@ type SecretFinding struct {
 
 // ReplaceSessionSecretFindings atomically replaces all secret findings for a
 // session and updates the summary columns on the sessions row.
-func (db *DB) ReplaceSessionSecretFindings(
+func (db *DB) ReplaceSessionSecretFindings(ctx context.Context,
 	sessionID string, findings []SecretFinding, leakCount int, rulesVersion string,
 ) error {
 	db.mu.Lock()
 	defer db.mu.Unlock()
 
-	tx, err := db.getWriter().Begin()
+	tx, err := db.getWriter().Begin(ctx)
 	if err != nil {
 		return fmt.Errorf("beginning tx: %w", err)
 	}
 	defer func() { _ = tx.Rollback() }()
 
-	if err := replaceSecretFindingsTx(tx, sessionID, findings, leakCount, rulesVersion); err != nil {
+	if db.usageOnlyStorage() {
+		err = settleUsageOnlySignalsTx(tx, sessionID)
+	} else {
+		err = replaceSecretFindingsTx(
+			tx, sessionID, findings, leakCount, rulesVersion,
+		)
+	}
+	if err != nil {
 		return err
 	}
 	return tx.Commit()
@@ -48,7 +54,7 @@ func (db *DB) ReplaceSessionSecretFindings(
 // inserts the new set, and updates the sessions summary columns. Caller owns
 // the lock and transaction lifecycle.
 func replaceSecretFindingsTx(
-	tx *sql.Tx,
+	tx transactionQueries,
 	sessionID string,
 	findings []SecretFinding,
 	leakCount int,
@@ -175,7 +181,11 @@ func resultEventContent(events []ToolResultEvent, idx *int) (string, bool) {
 func (db *DB) SessionSecretFindings(
 	ctx context.Context, sessionID string,
 ) ([]SecretFinding, error) {
-	rows, err := db.getReader().QueryContext(ctx, `
+	return sessionSecretFindingsWithQuerier(ctx, db.getReader(), sessionID)
+}
+
+func sessionSecretFindingsWithQuerier(ctx context.Context, q messageRowsQuerier, sessionID string) ([]SecretFinding, error) {
+	rows, err := q.QueryContext(ctx, `
 		SELECT session_id, rule_name, confidence,
 		       location_kind, message_ordinal, call_index, event_index,
 		       match_start, match_end, match_index,

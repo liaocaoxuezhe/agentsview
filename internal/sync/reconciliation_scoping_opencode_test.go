@@ -1,7 +1,6 @@
 package sync_test
 
 import (
-	"context"
 	"testing"
 
 	"github.com/stretchr/testify/assert"
@@ -61,11 +60,16 @@ func TestReconcileProviderRootsOpenCodeContainerSyncsAndTombstonesMembers(
 	assertMessageContent(t, env.db, "opencode:oc-container-kept",
 		"updated question", "updated answer")
 	removed, err := env.db.GetSession(
-		context.Background(), "opencode:oc-container-removed",
+		t.Context(), "opencode:oc-container-removed",
 	)
 	require.NoError(t, err)
-	assert.Nil(t, removed,
-		"a container-scoped pass reclaims a removed member")
+	assert.NotNil(t, removed,
+		"a container-scoped pass leaves a removed member browsable")
+	archived, err := env.db.GetSessionFull(
+		t.Context(), "opencode:oc-container-removed",
+	)
+	require.NoError(t, err)
+	assertSourceMissingState(t, archived)
 }
 
 // TestReconcileProviderRootsOpenCodeMemberPassCannotTrustPartialMembership

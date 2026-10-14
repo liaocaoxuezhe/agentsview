@@ -1,7 +1,8 @@
 package parser
 
 import (
-	"encoding/json"
+	"context"
+	"encoding/json/v2"
 	"errors"
 	"fmt"
 	"net/url"
@@ -16,20 +17,21 @@ import (
 )
 
 type grokSummaryFields struct {
-	Summary            string
-	FirstPrompt        string
-	ModelID            string
-	CreatedAt          string
-	UpdatedAt          string
-	LastActiveAt       string
-	Hostname           string
-	NumMessages        int
-	WorktreeLabel      string
-	GitRootDir         string
-	Cwd                string
-	HeadBranch         string
-	ParentSessionID    string
-	SourceWorkspaceDir string
+	Summary             string
+	FirstPrompt         string
+	ModelID             string
+	CreatedAt           string
+	UpdatedAt           string
+	LastActiveAt        string
+	Hostname            string
+	NumMessages         int
+	WorktreeLabel       string
+	GitRootDir          string
+	Cwd                 string
+	HeadBranch          string
+	ParentSessionID     string
+	SourceWorkspaceDir  string
+	ProducerSessionKind string
 }
 
 type grokSignalMetrics struct {
@@ -37,6 +39,10 @@ type grokSignalMetrics struct {
 	PeakContextTokens int
 	UserMessageCount  int
 	HasUserMessages   bool
+}
+
+type grokPromptContext struct {
+	IsNonInteractive bool `json:"is_non_interactive"`
 }
 
 func ParseGrokSummary(
@@ -64,13 +70,35 @@ func ParseGrokSummary(
 	if err != nil {
 		return ParseResult{}, err
 	}
+	promptContext, err := parseGrokPromptContext(
+		filepath.Join(sessionDir, "prompt_context.json"),
+	)
+	if err != nil {
+		return ParseResult{}, err
+	}
+	sessionKind := ""
+	if promptContext.IsNonInteractive {
+		sessionKind = SessionKindNonInteractive
+	}
 
 	project, cwd := grokProjectAndCwd(summary, projectHint)
 	startedAt := grokParseTime(summary.CreatedAt)
 	endedAt := grokEndedAt(summary)
 	parentSessionID := strings.TrimSpace(summary.ParentSessionID)
 	relationshipType := RelNone
-	if parentSessionID != "" {
+	if subagentParent, _, ok := grokSubagentParentFromDisk(
+		sessionDir, summary.ProducerSessionKind,
+	); ok {
+		parentSessionID = "grok:" + subagentParent
+		relationshipType = RelSubagent
+	} else if grokIsSubagentKind(summary.ProducerSessionKind) {
+		if summary.ProducerSessionKind == "subagent_fork" && parentSessionID != "" {
+			parentSessionID = "grok:" + parentSessionID
+		} else {
+			parentSessionID = ""
+		}
+		relationshipType = RelSubagent
+	} else if parentSessionID != "" {
 		parentSessionID = "grok:" + parentSessionID
 		relationshipType = RelFork
 	}
@@ -81,6 +109,15 @@ func ParseGrokSummary(
 	if transcriptErr != nil && !os.IsNotExist(transcriptErr) {
 		return ParseResult{}, transcriptErr
 	}
+	timestampAnchors, timestampErr := parseGrokUpdateTimestampAnchors(
+		filepath.Join(sessionDir, "updates.jsonl"),
+	)
+	if timestampErr != nil && !errors.Is(timestampErr, os.ErrNotExist) {
+		return ParseResult{}, timestampErr
+	}
+	enrichGrokMessageTimestamps(messages, timestampAnchors)
+	enrichGrokToolResultEvents(messages, timestampAnchors)
+	grokAttachSpawnedSubagents(messages)
 
 	firstPrompt := ""
 	for _, msg := range messages {
@@ -141,6 +178,7 @@ func ParseGrokSummary(
 			Project:            project,
 			Machine:            machine,
 			Agent:              AgentGrok,
+			SessionKind:        sessionKind,
 			ParentSessionID:    parentSessionID,
 			RelationshipType:   relationshipType,
 			Cwd:                cwd,
@@ -191,6 +229,21 @@ func ParseGrokSummary(
 		result.Session.HasTotalOutputTokens ||
 			result.Session.HasPeakContextTokens
 	return result, nil
+}
+
+func parseGrokPromptContext(path string) (grokPromptContext, error) {
+	data, err := os.ReadFile(path)
+	if errors.Is(err, os.ErrNotExist) {
+		return grokPromptContext{}, nil
+	}
+	if err != nil {
+		return grokPromptContext{}, fmt.Errorf("read %s: %w", path, err)
+	}
+	var context grokPromptContext
+	if err := json.Unmarshal(data, &context); err != nil {
+		return grokPromptContext{}, fmt.Errorf("decode %s: %w", path, err)
+	}
+	return context, nil
 }
 
 // Grok Build writes one usage payload per completed turn, and those
@@ -489,6 +542,245 @@ func parseGrokChatHistory(path string) ([]ParsedMessage, int, error) {
 	return messages, malformed, nil
 }
 
+type grokTimestampAnchor struct {
+	role         RoleType
+	content      string
+	timestamp    time.Time
+	toolCallIDs  []string
+	toolResultID string
+	toolStatus   string
+}
+
+type grokTimestampAnchorBuilder struct {
+	anchors     []grokTimestampAnchor
+	role        RoleType
+	content     strings.Builder
+	timestamp   time.Time
+	toolCallIDs []string
+}
+
+func (b *grokTimestampAnchorBuilder) flush() {
+	if b.role == "" {
+		return
+	}
+	b.anchors = append(b.anchors, grokTimestampAnchor{
+		role:        b.role,
+		content:     b.content.String(),
+		timestamp:   b.timestamp,
+		toolCallIDs: append([]string(nil), b.toolCallIDs...),
+	})
+	b.role = ""
+	b.content.Reset()
+	b.timestamp = time.Time{}
+	b.toolCallIDs = b.toolCallIDs[:0]
+}
+
+func (b *grokTimestampAnchorBuilder) start(role RoleType, timestamp time.Time) {
+	if b.role != role {
+		b.flush()
+		b.role = role
+	}
+	if b.timestamp.IsZero() && !timestamp.IsZero() {
+		b.timestamp = timestamp
+	}
+}
+
+func (b *grokTimestampAnchorBuilder) addUserText(text string) {
+	if text == "" {
+		return
+	}
+	if b.content.Len() > 0 {
+		b.content.WriteByte('\n')
+	}
+	b.content.WriteString(text)
+}
+
+func parseGrokUpdateTimestampAnchors(
+	path string,
+) ([]grokTimestampAnchor, error) {
+	var builder grokTimestampAnchorBuilder
+	_, err := readJSONLFrom(path, 0, func(line string) {
+		if !gjson.Valid(line) {
+			return
+		}
+		root := gjson.Parse(line)
+		update := root.Get("params.update")
+		if !update.Exists() {
+			update = root.Get("update")
+		}
+		if !update.Exists() {
+			return
+		}
+		timestamp := hermesUnixTime(root.Get("timestamp").Float())
+		switch update.Get("sessionUpdate").Str {
+		case "user_message_chunk":
+			if update.Get("_meta.hostTurn").Bool() {
+				builder.flush()
+				return
+			}
+			builder.start(RoleUser, timestamp)
+			if update.Get("content.type").Str == "text" {
+				builder.addUserText(update.Get("content.text").Str)
+			}
+
+		case "agent_message_chunk":
+			if update.Get("_meta.hostTurn").Bool() {
+				builder.flush()
+				return
+			}
+			builder.start(RoleAssistant, timestamp)
+			if update.Get("content.type").Str == "text" {
+				builder.content.WriteString(update.Get("content.text").Str)
+			}
+
+		case "tool_call":
+			builder.flush()
+			anchor := grokTimestampAnchor{
+				role:      RoleAssistant,
+				timestamp: timestamp,
+			}
+			if id := strings.TrimSpace(update.Get("toolCallId").Str); id != "" {
+				anchor.toolCallIDs = []string{id}
+			}
+			builder.anchors = append(builder.anchors, anchor)
+
+		case "tool_call_update":
+			status := update.Get("status").Str
+			if status != "completed" && status != "failed" {
+				return
+			}
+			builder.flush()
+			if id := strings.TrimSpace(update.Get("toolCallId").Str); id != "" {
+				if status == "failed" {
+					status = "errored"
+				}
+				builder.anchors = append(builder.anchors, grokTimestampAnchor{
+					timestamp:    timestamp,
+					toolResultID: id,
+					toolStatus:   status,
+				})
+			}
+
+		case "compaction_checkpoint":
+			builder = grokTimestampAnchorBuilder{}
+		}
+	})
+	builder.flush()
+	return builder.anchors, err
+}
+
+func enrichGrokMessageTimestamps(
+	messages []ParsedMessage, anchors []grokTimestampAnchor,
+) {
+	anchorIndex := 0
+	for i := range messages {
+		for j := anchorIndex; j < len(anchors); j++ {
+			if !grokTimestampAnchorMatches(messages[i], anchors[j]) {
+				continue
+			}
+			messages[i].Timestamp = anchors[j].timestamp
+			anchorIndex = j + 1
+			break
+		}
+	}
+}
+
+func enrichGrokToolResultEvents(
+	messages []ParsedMessage, anchors []grokTimestampAnchor,
+) {
+	calls := make(map[string]*ParsedToolCall)
+	results := make(map[string]string)
+	for i := range messages {
+		for j := range messages[i].ToolCalls {
+			call := &messages[i].ToolCalls[j]
+			if id := strings.TrimSpace(call.ToolUseID); id != "" {
+				calls[id] = call
+			}
+		}
+		for _, result := range messages[i].ToolResults {
+			if id := strings.TrimSpace(result.ToolUseID); id != "" {
+				results[id] = DecodeContent(result.ContentRaw)
+			}
+		}
+	}
+	for _, anchor := range anchors {
+		for _, id := range anchor.toolCallIDs {
+			call := calls[id]
+			if call == nil {
+				continue
+			}
+			call.ResultEvents = append(call.ResultEvents, ParsedToolResultEvent{
+				ToolUseID: id,
+				Source:    "tool_execution",
+				Status:    "started",
+				Timestamp: anchor.timestamp,
+			})
+		}
+		if anchor.toolResultID == "" {
+			continue
+		}
+		call := calls[anchor.toolResultID]
+		if call == nil {
+			continue
+		}
+		call.ResultEvents = append(call.ResultEvents, ParsedToolResultEvent{
+			ToolUseID: anchor.toolResultID,
+			Source:    "tool_execution",
+			Status:    anchor.toolStatus,
+			Content:   results[anchor.toolResultID],
+			Timestamp: anchor.timestamp,
+		})
+	}
+}
+
+func grokTimestampAnchorMatches(
+	message ParsedMessage, anchor grokTimestampAnchor,
+) bool {
+	if message.Role != anchor.role {
+		return false
+	}
+	if len(message.ToolResults) > 0 {
+		for _, result := range message.ToolResults {
+			if result.ToolUseID != "" && result.ToolUseID == anchor.toolResultID {
+				return true
+			}
+		}
+		return false
+	}
+	if len(message.ToolCalls) > 0 && len(anchor.toolCallIDs) > 0 {
+		hasComparableIDs := false
+		for _, call := range message.ToolCalls {
+			for _, id := range anchor.toolCallIDs {
+				if call.ToolUseID == "" || id == "" {
+					continue
+				}
+				hasComparableIDs = true
+				if call.ToolUseID == id {
+					return true
+				}
+			}
+		}
+		if hasComparableIDs {
+			return false
+		}
+	}
+	switch message.Role {
+	case RoleUser:
+		return message.Content == grokNormalizeUserText(anchor.content)
+	case RoleAssistant:
+		content := message.Content
+		if message.HasThinking {
+			content = strings.TrimPrefix(
+				content,
+				"[Thinking]\n"+message.ThinkingText+"\n[/Thinking]\n",
+			)
+		}
+		return content == strings.TrimSpace(anchor.content)
+	default:
+		return false
+	}
+}
+
 func grokChatRowKind(root gjson.Result) string {
 	switch kind := strings.TrimSpace(root.Get("type").Str); kind {
 	case "system", "user", "reasoning", "backend_tool_call", "assistant", "tool_result":
@@ -549,6 +841,9 @@ func grokBackendToolMessage(
 		ToolName:  toolName,
 		Category:  NormalizeToolCategory(toolName),
 		InputJSON: inputJSON,
+		// The summary is the message text, so storage policies that drop
+		// tool inputs can replace it verbatim.
+		Rendering: content,
 	}
 	return ParsedMessage{
 		Ordinal:       ordinal,
@@ -638,6 +933,10 @@ func grokUserContent(content gjson.Result) string {
 	default:
 		return ""
 	}
+	return grokNormalizeUserText(text)
+}
+
+func grokNormalizeUserText(text string) string {
 	text = strings.TrimSpace(text)
 	if text == "" {
 		return ""
@@ -675,18 +974,18 @@ func grokStripMetaUserBlocks(text string) string {
 // unclosed opening tag drops the remainder of the string from that point.
 func grokStripXMLTagBlock(text, tag string) string {
 	open := "<" + tag + ">"
-	close := "</" + tag + ">"
+	closing := "</" + tag + ">"
 	for {
 		start := strings.Index(text, open)
 		if start < 0 {
 			return text
 		}
 		rest := text[start+len(open):]
-		endRel := strings.Index(rest, close)
+		endRel := strings.Index(rest, closing)
 		if endRel < 0 {
 			return strings.TrimSpace(text[:start])
 		}
-		end := start + len(open) + endRel + len(close)
+		end := start + len(open) + endRel + len(closing)
 		text = text[:start] + text[end:]
 	}
 }
@@ -753,7 +1052,7 @@ func grokToolCalls(arr gjson.Result) []ParsedToolCall {
 			ToolName:  name,
 			Category:  NormalizeToolCategory(name),
 			InputJSON: inputJSON,
-			SkillName: inferToolSkillName(name, inputJSON),
+			SkillName: inferToolSkillName(context.Background(), name, inputJSON),
 		})
 		return true
 	})
@@ -850,6 +1149,9 @@ func decodeGrokSummary(data []byte) grokSummaryFields {
 		),
 		SourceWorkspaceDir: strings.TrimSpace(
 			root.Get("source_workspace_dir").String(),
+		),
+		ProducerSessionKind: strings.TrimSpace(
+			root.Get("session_kind").String(),
 		),
 	}
 }

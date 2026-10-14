@@ -1,11 +1,4 @@
-import {
-  allFromDate,
-  daysAgo,
-  localDateStr,
-  presetRange,
-  todayStr,
-  type DateRange,
-} from "./dateRangeSelector.js";
+import { localDateStr, presetRange, type DateRange } from "./dateRangeSelector.js";
 import { m } from "../../i18n/index.js";
 
 /**
@@ -36,10 +29,7 @@ export interface CustomSelection {
   from: string;
   to: string;
 }
-export type RangeSelection =
-  | RelativeSelection
-  | CalendarSelection
-  | CustomSelection;
+export type RangeSelection = RelativeSelection | CalendarSelection | CustomSelection;
 
 export interface RelativePreset {
   /** Compact pill label. */
@@ -96,10 +86,7 @@ export function periodBounds(unit: CalendarUnit, anchor: string): DateRange {
   return { from: localDateStr(first), to: localDateStr(last) };
 }
 
-function selectionFromCalendarRange(
-  from: string,
-  to: string,
-): CalendarSelection | null {
+function selectionFromCalendarRange(from: string, to: string): CalendarSelection | null {
   if (from > to || !isValidLocalDate(from) || !isValidLocalDate(to)) {
     return null;
   }
@@ -121,10 +108,7 @@ function selectionFromCalendarRange(
 }
 
 /** Turn any selection into the concrete {from, to} the stores consume. */
-export function resolveRange(
-  sel: RangeSelection,
-  earliestSession?: string | null,
-): DateRange {
+export function resolveRange(sel: RangeSelection, earliestSession?: string | null): DateRange {
   switch (sel.mode) {
     case "relative":
       return presetRange(sel.days, earliestSession);

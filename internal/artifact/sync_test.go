@@ -82,14 +82,13 @@ func TestArtifactSyncTwoNodeFolderRoundTripAndReplay(t *testing.T) {
 	assert.Zero(t, replay.ImportedSessions)
 	assert.Zero(t, replay.ImportedMessages)
 	assert.False(t, replay.More)
-	assert.Equal(
-		t,
+	assert.Equal(t,
 		journalSequenceBeforeReplay,
 		readTestFolderJournalSequence(t, target),
 		"an unchanged authoritative head must not replay its closure",
 	)
 
-	require.NoError(t, databaseA.ReplaceSessionMessages("one", []db.Message{
+	require.NoError(t, databaseA.ReplaceSessionMessages(t.Context(), "one", []db.Message{
 		{
 			SessionID: "one", Ordinal: 0, Role: "user",
 			Content: "updated prompt", ContentLength: 14,
@@ -196,6 +195,7 @@ func TestArtifactSyncFullRepairRejournalsMissingObjectForAdvancedPeer(
 
 func readTestFolderJournalSequence(t *testing.T, target string) int64 {
 	t.Helper()
+
 	root, err := os.OpenRoot(filepath.Join(target, folderJournalDirectory))
 	require.NoError(t, err)
 	head, err := readFolderJournalHead(root)
@@ -235,7 +235,7 @@ func TestArtifactSyncDoesNotIngestOrRepublishSpoofedLocalOrigin(
 	_, err = SyncWithRepository(t.Context(), database, repository, opts)
 	require.NoError(t, err)
 	_, err = repository.Content().Stat(t.Context(), spoofedRef)
-	assert.ErrorIs(t, err, ErrArtifactNotFound)
+	require.ErrorIs(t, err, ErrArtifactNotFound)
 
 	targetB := t.TempDir()
 	opts.Target = targetB
@@ -302,6 +302,7 @@ func TestArtifactSyncValidatesBeforeCreatingOwnedStorage(t *testing.T) {
 	t.Parallel()
 
 	t.Run("missing target", func(t *testing.T) {
+		t.Parallel()
 		dataDir := t.TempDir()
 		_, err := Sync(
 			t.Context(),
@@ -313,6 +314,8 @@ func TestArtifactSyncValidatesBeforeCreatingOwnedStorage(t *testing.T) {
 	})
 
 	t.Run("invalid origin", func(t *testing.T) {
+		t.Parallel()
+
 		target := filepath.Join(t.TempDir(), "target")
 		repository, err := OpenRepository(t.Context(), t.TempDir())
 		require.NoError(t, err)
@@ -474,7 +477,7 @@ func TestDrainArtifactSyncExportsReturnsMoreAtRoundBudget(t *testing.T) {
 
 	database := testDB(t)
 	origin := "local-a1b2c3"
-	require.NoError(t, AdoptOrigin(database, origin))
+	require.NoError(t, AdoptOrigin(t.Context(), database, origin))
 	for index := range artifactExportBatchSize + 1 {
 		seedSession(t, database, fmt.Sprintf("session-%03d", index), "alpha")
 	}
@@ -551,4 +554,23 @@ func TestDrainArtifactSyncImportsReturnsMoreAtRoundBudget(t *testing.T) {
 	assert.Equal(t, 3, finalizer.calls)
 	assert.Equal(t, 3, result.ImportedSessions)
 	assert.Equal(t, 6, result.ImportedMessages)
+}
+
+func TestArchiveOnlyRefusesArtifactExchange(t *testing.T) {
+	database := testDB(t)
+	seedSession(t, database, "archived", "project")
+	require.NoError(t, database.EnableArchiveOnly(t.Context()))
+	target := t.TempDir()
+	dataDir := t.TempDir()
+	_, err := Sync(t.Context(), database, SyncOptions{DataDir: dataDir, Target: target})
+	require.ErrorIs(t, err, db.ErrArchiveOnly)
+	assert.NoDirExists(t, filepath.Join(dataDir, "artifacts"))
+	repository, err := OpenRepository(t.Context(), dataDir)
+	require.NoError(t, err)
+	defer repository.Close()
+	_, err = SyncWithRepository(t.Context(), database, repository, SyncOptions{Target: target})
+	require.ErrorIs(t, err, db.ErrArchiveOnly)
+	entries, err := os.ReadDir(target)
+	require.NoError(t, err)
+	assert.Empty(t, entries)
 }

@@ -3,10 +3,11 @@ package server
 import "github.com/danielgtaylor/huma/v2"
 
 func (s *Server) registerTypedAPIRoutes() {
-	s.api.UseMiddleware(humaRequestInfoMiddleware)
+	s.api.UseMiddleware(s.humaRequestInfoMiddleware)
 
 	s.registerHealthRoutes()
 	s.registerSessionRoutes()
+	s.registerSessionAnnotationRoutes()
 	s.registerOpenersRoutes()
 	s.registerAnalyticsRoutes()
 	s.registerActivityRoutes()
@@ -16,36 +17,28 @@ func (s *Server) registerTypedAPIRoutes() {
 	s.registerUsageRoutes()
 	s.registerInsightsRoutes()
 	s.registerSearchRoutes()
+	s.registerRecallRoutes()
+	s.describeTransferRoutes()
+	s.describeStartupProbe()
 	s.registerSecretsRoutes()
 	s.registerMetadataRoutes()
 	s.registerSyncRoutes()
 	s.registerRemoteSyncRoutes()
+	s.registerRawSyncRoutes()
 	s.registerPushRoutes()
 	s.registerConfigRoutes()
 	s.registerSettingsRoutes()
 	s.registerStarredRoutes()
 	s.registerPinRoutes()
 	s.registerImportRoutes()
+	s.registerConversationExportRoutes()
 	s.registerAssetRoutes()
 	s.registerEmbeddingsRoutes()
 }
 
-type routeGroup struct {
-	api    huma.API
-	prefix string
-}
-
-func newRouteGroup(api huma.API, prefix string, tag string) routeGroup {
-	group := huma.NewGroup(api, prefix)
+func configureRouteGroup(group *huma.Group, tag string) {
 	group.UseSimpleModifier(func(op *huma.Operation) {
 		op.Tags = []string{tag}
+		op.OperationID = operationID(op.Method, op.Path)
 	})
-	return routeGroup{
-		api:    group,
-		prefix: prefix,
-	}
-}
-
-func (g routeGroup) fullPath(path string) string {
-	return g.prefix + path
 }

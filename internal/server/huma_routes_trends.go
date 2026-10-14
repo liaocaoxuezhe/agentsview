@@ -5,12 +5,15 @@ import (
 	"net/http"
 
 	"go.kenn.io/agentsview/internal/db"
+
+	"github.com/danielgtaylor/huma/v2"
 )
 
 func (s *Server) registerTrendsRoutes() {
-	group := newRouteGroup(s.api, "/api/v1/trends", "Trends")
+	group := huma.NewGroup(s.api, "/api/v1/trends")
+	configureRouteGroup(group, "Trends")
 
-	get(s, group, "/terms", "Get trend terms", s.humaTrendsTerms)
+	s.get(group, "/terms", "Get trend terms", s.humaTrendsTerms)
 }
 
 type trendsTermsInput struct {
@@ -23,7 +26,7 @@ func (s *Server) humaTrendsTerms(
 	ctx context.Context,
 	in *trendsTermsInput,
 ) (*jsonOutput[db.TrendsTermsResponse], error) {
-	f, err := analyticsFilterFromInput(in.AnalyticsFilterInput)
+	f, err := s.analyticsFilterFromInput(ctx, in.AnalyticsFilterInput)
 	if err != nil {
 		return nil, err
 	}

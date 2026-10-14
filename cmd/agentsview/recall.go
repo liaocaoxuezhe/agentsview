@@ -2,7 +2,9 @@ package main
 
 import (
 	"context"
-	"encoding/json"
+	"encoding/json/jsontext"
+	"encoding/json/v2"
+	"errors"
 	"fmt"
 	"io"
 	"os"
@@ -18,6 +20,8 @@ import (
 	"go.kenn.io/agentsview/internal/pathutil"
 	corerecall "go.kenn.io/agentsview/internal/recall"
 	"go.kenn.io/agentsview/internal/service"
+	"go.kenn.io/agentsview/internal/servicehttp"
+	"go.kenn.io/agentsview/internal/stringutil"
 )
 
 func newRecallCommand() *cobra.Command {
@@ -63,7 +67,7 @@ func resolveRecallEntryService(
 	if err != nil {
 		return nil, nil, err
 	}
-	return service.NewHTTPBackend(remote, token, false), func() {}, nil
+	return servicehttp.NewHTTPBackend(remote, token, false, ""), func() {}, nil
 }
 
 // resolveWritableRecallEntryService is the write-capable counterpart of
@@ -82,7 +86,7 @@ func resolveWritableRecallEntryService(
 	if err != nil {
 		return nil, nil, err
 	}
-	return service.NewHTTPBackend(remote, token, false), func() {}, nil
+	return servicehttp.NewHTTPBackend(remote, token, false, ""), func() {}, nil
 }
 
 func newRecallListCommand() *cobra.Command {
@@ -101,7 +105,7 @@ func newRecallListCommand() *cobra.Command {
 				return err
 			}
 			defer cleanup()
-			if err := applyRecallEntryCurrentScope(
+			if err := applyRecallEntryCurrentScope(cmd.Context(),
 				&f.CWD, &f.GitBranch, currentCWD, currentGitBranch,
 				currentWorktree,
 			); err != nil {
@@ -112,7 +116,7 @@ func newRecallListCommand() *cobra.Command {
 				return err
 			}
 			if outputFormat(cmd) == "json" {
-				return json.NewEncoder(cmd.OutOrStdout()).Encode(list)
+				return json.MarshalEncode(jsontext.NewEncoder(cmd.OutOrStdout()), list)
 			}
 			out := cmd.OutOrStdout()
 			printRecallEntryTrustedOnlyHuman(out, list.TrustedOnly)
@@ -162,7 +166,7 @@ func newRecallStatsCommand() *cobra.Command {
 				return err
 			}
 			defer cleanup()
-			if err := applyRecallEntryCurrentScope(
+			if err := applyRecallEntryCurrentScope(cmd.Context(),
 				&f.CWD, &f.GitBranch, currentCWD, currentGitBranch,
 				currentWorktree,
 			); err != nil {
@@ -178,7 +182,7 @@ func newRecallStatsCommand() *cobra.Command {
 			stats := buildRecallStats(list.RecallEntries, f.Limit)
 			stats.TrustedOnly = list.TrustedOnly
 			if outputFormat(cmd) == "json" {
-				return json.NewEncoder(cmd.OutOrStdout()).Encode(stats)
+				return json.MarshalEncode(jsontext.NewEncoder(cmd.OutOrStdout()), stats)
 			}
 			return printRecallStatsHuman(cmd.OutOrStdout(), stats)
 		},
@@ -323,7 +327,7 @@ func newRecallGetCommand() *cobra.Command {
 				return fmt.Errorf("recall entry %s not found", args[0])
 			}
 			if outputFormat(cmd) == "json" {
-				return json.NewEncoder(cmd.OutOrStdout()).Encode(recall)
+				return json.MarshalEncode(jsontext.NewEncoder(cmd.OutOrStdout()), recall)
 			}
 			if err := printRecallEntryHuman(cmd.OutOrStdout(), recall); err != nil {
 				return err
@@ -364,7 +368,7 @@ func newRecallQueryCommand() *cobra.Command {
 			defer cleanup()
 			req.Query = args[0]
 			req.Surface = db.RecallQuerySurfaceQuery
-			if err := applyRecallEntryCurrentScope(
+			if err := applyRecallEntryCurrentScope(cmd.Context(),
 				&req.CWD, &req.GitBranch, currentCWD, currentGitBranch,
 				currentWorktree,
 			); err != nil {
@@ -375,7 +379,7 @@ func newRecallQueryCommand() *cobra.Command {
 				return err
 			}
 			if outputFormat(cmd) == "json" {
-				return json.NewEncoder(cmd.OutOrStdout()).Encode(result)
+				return json.MarshalEncode(jsontext.NewEncoder(cmd.OutOrStdout()), result)
 			}
 			out := cmd.OutOrStdout()
 			printRecallEntryTrustedOnlyHuman(out, result.TrustedOnly)
@@ -529,7 +533,7 @@ func newRecallBriefCommand() *cobra.Command {
 			req.Query = args[0]
 			req.Surface = db.RecallQuerySurfaceBrief
 			req.IncludeContext = true
-			if err := applyRecallEntryCurrentScope(
+			if err := applyRecallEntryCurrentScope(cmd.Context(),
 				&req.CWD, &req.GitBranch, currentCWD, currentGitBranch,
 				currentWorktree,
 			); err != nil {
@@ -557,7 +561,7 @@ func newRecallBriefCommand() *cobra.Command {
 				RecallEntries:  result.RecallEntries,
 			}
 			if outputFormat(cmd) == "json" {
-				return json.NewEncoder(cmd.OutOrStdout()).Encode(brief)
+				return json.MarshalEncode(jsontext.NewEncoder(cmd.OutOrStdout()), brief)
 			}
 			if err := printRecallBriefHuman(cmd.OutOrStdout(), brief); err != nil {
 				return err
@@ -886,7 +890,7 @@ func newRecallImportCommand() *cobra.Command {
 	var yes bool
 	var allowRemoteImport bool
 	var allowProductionImport bool
-	var requireExistingSessions = true
+	requireExistingSessions := true
 	var allowPlaceholderSessions bool
 	cmd := &cobra.Command{
 		Use:          "import <accepted-recall.jsonl>",
@@ -895,17 +899,15 @@ func newRecallImportCommand() *cobra.Command {
 		SilenceUsage: true,
 		RunE: func(cmd *cobra.Command, args []string) error {
 			if !dryRun && !yes {
-				return fmt.Errorf(
-					"recall import writes to the active agentsview database; " +
-						"run --dry-run first, then pass --yes to import",
+				return errors.New("recall import writes to the active agentsview database; " +
+					"run --dry-run first, then pass --yes to import",
 				)
 			}
 			remote, _ := cmd.Flags().GetString("server")
 			if strings.TrimSpace(remote) != "" && !dryRun && !allowRemoteImport {
-				return fmt.Errorf(
-					"recall import --server writes to a remote daemon; " +
-						"run --dry-run first, then pass --yes " +
-						"--allow-remote-import to import",
+				return errors.New("recall import --server writes to a remote daemon; " +
+					"run --dry-run first, then pass --yes " +
+					"--allow-remote-import to import",
 				)
 			}
 			if strings.TrimSpace(remote) == "" && !allowProductionImport {
@@ -940,7 +942,7 @@ func newRecallImportCommand() *cobra.Command {
 				return err
 			}
 			if outputFormat(cmd) == "json" {
-				return json.NewEncoder(cmd.OutOrStdout()).Encode(result)
+				return json.MarshalEncode(jsontext.NewEncoder(cmd.OutOrStdout()), result)
 			}
 			fmt.Fprintf(cmd.OutOrStdout(), "Imported: %d\n", result.Imported)
 			if dryRun {
@@ -1155,7 +1157,7 @@ func addRecallEntryCurrentWorktreeFlag(cmd *cobra.Command, currentWorktree *bool
 	)
 }
 
-func applyRecallEntryCurrentScope(
+func applyRecallEntryCurrentScope(ctx context.Context,
 	cwd *string,
 	gitBranch *string,
 	currentCWD bool,
@@ -1167,16 +1169,15 @@ func applyRecallEntryCurrentScope(
 			strings.TrimSpace(*cwd) != "" ||
 			currentGitBranch ||
 			strings.TrimSpace(*gitBranch) != "" {
-			return fmt.Errorf(
-				"use --current-worktree without --cwd, --current-cwd, " +
-					"--git-branch, or --current-git-branch",
+			return errors.New("use --current-worktree without --cwd, --current-cwd, " +
+				"--git-branch, or --current-git-branch",
 			)
 		}
-		root, err := currentGitRoot()
+		root, err := currentGitRoot(ctx)
 		if err != nil {
 			return err
 		}
-		branch, err := currentGitBranchName()
+		branch, err := currentGitBranchName(ctx)
 		if err != nil {
 			return err
 		}
@@ -1187,7 +1188,7 @@ func applyRecallEntryCurrentScope(
 	if err := applyRecallEntryCurrentCWD(cwd, currentCWD); err != nil {
 		return err
 	}
-	return applyRecallEntryCurrentGitBranch(gitBranch, currentGitBranch)
+	return applyRecallEntryCurrentGitBranch(ctx, gitBranch, currentGitBranch)
 }
 
 func applyRecallEntryCurrentCWD(cwd *string, currentCWD bool) error {
@@ -1195,7 +1196,7 @@ func applyRecallEntryCurrentCWD(cwd *string, currentCWD bool) error {
 		return nil
 	}
 	if strings.TrimSpace(*cwd) != "" {
-		return fmt.Errorf("use either --cwd or --current-cwd, not both")
+		return errors.New("use either --cwd or --current-cwd, not both")
 	}
 	wd, err := os.Getwd()
 	if err != nil {
@@ -1205,14 +1206,14 @@ func applyRecallEntryCurrentCWD(cwd *string, currentCWD bool) error {
 	return nil
 }
 
-func applyRecallEntryCurrentGitBranch(gitBranch *string, currentGitBranch bool) error {
+func applyRecallEntryCurrentGitBranch(ctx context.Context, gitBranch *string, currentGitBranch bool) error {
 	if !currentGitBranch {
 		return nil
 	}
 	if strings.TrimSpace(*gitBranch) != "" {
-		return fmt.Errorf("use either --git-branch or --current-git-branch, not both")
+		return errors.New("use either --git-branch or --current-git-branch, not both")
 	}
-	branch, err := currentGitBranchName()
+	branch, err := currentGitBranchName(ctx)
 	if err != nil {
 		return err
 	}
@@ -1220,25 +1221,25 @@ func applyRecallEntryCurrentGitBranch(gitBranch *string, currentGitBranch bool) 
 	return nil
 }
 
-func currentGitBranchName() (string, error) {
-	cmd := exec.Command("git", "symbolic-ref", "--quiet", "--short", "HEAD")
+func currentGitBranchName(ctx context.Context) (string, error) {
+	cmd := exec.CommandContext(ctx, "git", "symbolic-ref", "--quiet", "--short", "HEAD")
 	out, err := cmd.Output()
 	if err != nil {
 		return "", fmt.Errorf("resolving current git branch: %w", err)
 	}
 	branch := strings.TrimSpace(string(out))
 	if branch == "" {
-		return "", fmt.Errorf("resolving current git branch: empty branch name")
+		return "", errors.New("resolving current git branch: empty branch name")
 	}
 	return branch, nil
 }
 
-func currentGitRoot() (string, error) {
+func currentGitRoot(ctx context.Context) (string, error) {
 	wd, err := os.Getwd()
 	if err != nil {
 		return "", fmt.Errorf("resolving current git root: %w", err)
 	}
-	cmd := exec.Command("git", "rev-parse", "--show-prefix")
+	cmd := exec.CommandContext(ctx, "git", "rev-parse", "--show-prefix")
 	out, err := cmd.Output()
 	if err != nil {
 		return "", fmt.Errorf("resolving current git root: %w", err)
@@ -1482,11 +1483,7 @@ func printRecallEvidenceDetailsHuman(w io.Writer, evidence []db.RecallEvidence) 
 
 func recallEvidenceSnippet(snippet string) string {
 	snippet = strings.Join(strings.Fields(snippet), " ")
-	if len([]rune(snippet)) <= recallEvidenceSnippetMaxChars {
-		return snippet
-	}
-	runes := []rune(snippet)
-	return string(runes[:recallEvidenceSnippetMaxChars]) + "..."
+	return stringutil.TruncateRunes(snippet, recallEvidenceSnippetMaxChars, "...")
 }
 
 func formatRecallEntryMatchedTerms(terms []string) string {

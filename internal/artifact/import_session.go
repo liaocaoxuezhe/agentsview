@@ -6,6 +6,7 @@ import (
 	"strings"
 
 	"go.kenn.io/agentsview/internal/db"
+	"go.kenn.io/agentsview/internal/ingest"
 )
 
 type importClosureOutcome uint8
@@ -29,13 +30,13 @@ func loadImportedSession(
 		return db.SessionBatchWrite{}, importClosureInvalid, nil
 	}
 	if err := validateHashHex(manifestHash); err != nil {
-		return db.SessionBatchWrite{}, importClosureInvalid, nil
+		return db.SessionBatchWrite{}, importClosureInvalid, nil //nolint:nilerr // Malformed manifest references are reported through importClosureInvalid.
 	}
 	manifestRef, err := NewRef(
 		origin, KindManifests, manifestHash+".json",
 	)
 	if err != nil {
-		return db.SessionBatchWrite{}, importClosureInvalid, nil
+		return db.SessionBatchWrite{}, importClosureInvalid, nil //nolint:nilerr // Malformed manifest references are reported through importClosureInvalid.
 	}
 	manifestEntry, found, err := statImportDependency(ctx, store, manifestRef)
 	if err != nil {
@@ -143,6 +144,7 @@ func loadImportedSession(
 				ctx, store, segmentRef, "invalid import segment",
 			)
 		}
+		downgradeImportedAssetReferences(segmentMessages)
 		messages = append(messages, segmentMessages...)
 		decodedBytes += int64(len(segmentData))
 		nested.toolCalls += preflight.nested.toolCalls
@@ -154,6 +156,32 @@ func loadImportedSession(
 		)
 	}
 	return rewriteManifestForImport(m, messages), importClosureComplete, nil
+}
+
+// Artifact transport carries transcript rows but no local asset files, so
+// imported asset references become readable image placeholders.
+func downgradeImportedAssetReferences(messages []db.Message) {
+	for i := range messages {
+		for j := range messages[i].ToolCalls {
+			call := &messages[i].ToolCalls[j]
+			call.ResultContent = downgradeImportedAssetContent(call.ResultContent)
+			call.ResultContentLength = db.ResolveResultContentLength(
+				call.ResultContent, call.ResultContentLength,
+			)
+			for k := range call.ResultEvents {
+				event := &call.ResultEvents[k]
+				event.Content = downgradeImportedAssetContent(event.Content)
+				event.ContentLength = db.ResolveResultContentLength(
+					event.Content, event.ContentLength,
+				)
+			}
+		}
+	}
+}
+
+func downgradeImportedAssetContent(content string) string {
+	projected, _ := db.DowngradeOffloadedToolResultImages(content)
+	return projected
 }
 
 func validateImportedManifest(
@@ -302,11 +330,13 @@ func rewriteManifestForImport(
 			}
 		}
 	}
+	signals := signalsFromImportedSession(session)
+	signals.ToolObservations = ingest.ComputeToolObservations(session, ingest.ExtractToolCallRows(messages))
 	return db.SessionBatchWrite{
 		Session:         session,
 		Messages:        messages,
 		UsageEvents:     importedUsageEvents(m.UsageEvents, importedID),
-		Signals:         signalsFromImportedSession(session),
+		Signals:         signals,
 		DataVersion:     m.DataVersion,
 		ReplaceMessages: true,
 	}
@@ -338,6 +368,7 @@ func importedUsageEvents(
 		out[i] = db.UsageEvent{
 			SessionID: sessionID, MessageOrdinal: event.MessageOrdinal,
 			Source: event.Source, Model: event.Model,
+			ProviderID:  event.ProviderID,
 			InputTokens: event.InputTokens, OutputTokens: event.OutputTokens,
 			CacheCreationInputTokens: event.CacheCreationInputTokens,
 			CacheReadInputTokens:     event.CacheReadInputTokens,

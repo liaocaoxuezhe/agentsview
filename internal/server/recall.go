@@ -1,12 +1,11 @@
 package server
 
 import (
-	"bytes"
 	"context"
 	"crypto/sha256"
 	"encoding/base64"
 	"encoding/hex"
-	"encoding/json"
+	"encoding/json/v2"
 	"errors"
 	"net/http"
 	"strings"
@@ -29,15 +28,14 @@ func handleContextError(w http.ResponseWriter, err error) bool {
 	return false
 }
 
-func handleReadOnly(w http.ResponseWriter, err error) bool {
+func (s *Server) handleReadOnly(w http.ResponseWriter, err error) bool {
 	if errors.Is(err, db.ErrReadOnly) {
 		writeError(w, http.StatusNotImplemented, "not available in remote mode")
 		return true
 	}
 	if errors.Is(err, db.ErrWriterClosed) {
-		w.Header().Set("Retry-After", writerClosedRetryAfterSeconds)
-		writeError(w, http.StatusServiceUnavailable,
-			"archive is briefly read-only for a maintenance pass; retry shortly")
+		response := writerClosedResponse(w.Header().Add, s.archiveStale())
+		writeError(w, response.Status, response.Message)
 		return true
 	}
 	return false
@@ -137,7 +135,7 @@ func (s *Server) handleListRecallEntries(
 		if handleInvalidRecallQuery(w, err) {
 			return
 		}
-		if handleReadOnly(w, err) {
+		if s.handleReadOnly(w, err) {
 			return
 		}
 		if errors.Is(err, errStaleRecallPagination) {
@@ -316,9 +314,9 @@ func decodeRecallListCursor(raw string) (recallListCursor, error) {
 	if err != nil {
 		return cursor, err
 	}
-	decoder := json.NewDecoder(bytes.NewReader(data))
-	decoder.DisallowUnknownFields()
-	if err := decoder.Decode(&cursor); err != nil {
+	if err := json.Unmarshal(
+		data, &cursor, json.RejectUnknownMembers(true),
+	); err != nil {
 		return cursor, err
 	}
 	if cursor.FilterHash == "" {
@@ -418,8 +416,8 @@ type recallExtractionStatusResponse struct {
 	Fingerprint         string                          `json:"fingerprint,omitempty"`
 	Generations         []recallExtractGenerationStatus `json:"generations,omitempty"`
 	SourceRuns          []string                        `json:"source_runs,omitempty"`
-	Stats               db.ExtractProgressStats         `json:"stats"`
-	EligibleBacklog     int                             `json:"eligible_backlog"`
+	Stats               db.ExtractProgressStats         `json:"stats" required:"false"`
+	EligibleBacklog     int                             `json:"eligible_backlog" required:"false"`
 }
 
 func (s *Server) recallExtractionLifecycleController(
@@ -473,7 +471,7 @@ func (s *Server) handleRecallExtractionRetire(
 func (s *Server) handleRecallExtractionLifecycleError(
 	w http.ResponseWriter, err error,
 ) {
-	if handleContextError(w, err) || handleReadOnly(w, err) {
+	if handleContextError(w, err) || s.handleReadOnly(w, err) {
 		return
 	}
 	if errors.Is(err, db.ErrExtractActivationBlocked) ||
@@ -510,7 +508,7 @@ type recallExtractProgressCursor struct {
 type recallExtractProgressItem struct {
 	SessionID             string `json:"session_id"`
 	GenerationFingerprint string `json:"generation_fingerprint"`
-	State                 string `json:"state"`
+	State                 string `json:"state" enum:"pending,partial,failed"`
 	UnitCursor            int    `json:"unit_cursor"`
 	UnitsTotal            int    `json:"units_total"`
 	LastError             string `json:"last_error,omitempty"`
@@ -656,9 +654,9 @@ func decodeRecallExtractProgressCursor(
 	if err != nil {
 		return cursor, err
 	}
-	decoder := json.NewDecoder(bytes.NewReader(data))
-	decoder.DisallowUnknownFields()
-	if err := decoder.Decode(&cursor); err != nil {
+	if err := json.Unmarshal(
+		data, &cursor, json.RejectUnknownMembers(true),
+	); err != nil {
 		return recallExtractProgressCursor{}, err
 	}
 	if cursor.GenerationFingerprint == "" || cursor.UpdatedAt == "" ||
@@ -685,7 +683,7 @@ func (s *Server) handleGetRecallEntry(
 		if handleContextError(w, err) {
 			return
 		}
-		if handleReadOnly(w, err) {
+		if s.handleReadOnly(w, err) {
 			return
 		}
 		writeError(w, http.StatusInternalServerError, err.Error())
@@ -702,7 +700,7 @@ func (s *Server) handleQueryRecallEntries(
 	w http.ResponseWriter, r *http.Request,
 ) {
 	var req service.RecallQuery
-	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+	if err := json.UnmarshalRead(r.Body, &req); err != nil {
 		writeError(w, http.StatusBadRequest, "invalid JSON body")
 		return
 	}
@@ -730,7 +728,7 @@ func (s *Server) handleQueryRecallEntries(
 		if handleInvalidRecallQuery(w, err) {
 			return
 		}
-		if handleReadOnly(w, err) {
+		if s.handleReadOnly(w, err) {
 			return
 		}
 		if errors.Is(err, db.ErrSemanticTransient) {
@@ -790,7 +788,7 @@ func (s *Server) handleImportRecallEntries(
 		if handleContextError(w, err) {
 			return
 		}
-		if handleReadOnly(w, err) {
+		if s.handleReadOnly(w, err) {
 			return
 		}
 		writeError(w, http.StatusBadRequest, err.Error())

@@ -1,8 +1,11 @@
 package postgres
 
 import (
+	"context"
 	"fmt"
 	"time"
+
+	"go.kenn.io/agentsview/internal/storage"
 )
 
 // Common timestamp formats found in SQLite data.
@@ -10,6 +13,8 @@ var sqliteFormats = []string{
 	time.RFC3339Nano,
 	"2006-01-02T15:04:05.000Z",
 	"2006-01-02T15:04:05Z",
+	"2006-01-02 15:04:05.999999999Z07:00",
+	"2006-01-02 15:04:05.999999999Z07",
 	"2006-01-02 15:04:05",
 }
 
@@ -76,21 +81,13 @@ func NormalizeLocalSyncTimestamp(
 	return ts.UTC().Format(LocalSyncTimestampLayout), nil
 }
 
-// SyncStateStore is the interface needed for normalizing local
-// sync timestamps stored in SQLite.
-type SyncStateStore interface {
-	GetSyncState(key string) (string, error)
-	SetSyncState(key, value string) error
-	GetOrCreateSyncState(key, defaultValue string) (string, error)
-}
-
 // NormalizeLocalSyncStateTimestamps normalizes the last_push_at
 // watermark in the local SQLite sync state to millisecond
 // precision.
-func NormalizeLocalSyncStateTimestamps(
-	local SyncStateStore,
+func NormalizeLocalSyncStateTimestamps(ctx context.Context,
+	local storage.SyncStateStore,
 ) error {
-	value, err := local.GetSyncState("last_push_at")
+	value, err := local.GetSyncState(ctx, "last_push_at")
 	if err != nil {
 		return fmt.Errorf("reading last_push_at: %w", err)
 	}
@@ -106,7 +103,7 @@ func NormalizeLocalSyncStateTimestamps(
 	if normalized == value {
 		return nil
 	}
-	if err := local.SetSyncState(
+	if err := local.SetSyncState(ctx,
 		"last_push_at", normalized,
 	); err != nil {
 		return fmt.Errorf("writing last_push_at: %w", err)

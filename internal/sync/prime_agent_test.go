@@ -1,7 +1,6 @@
 package sync
 
 import (
-	"context"
 	"os"
 	"path/filepath"
 	"testing"
@@ -16,14 +15,14 @@ import (
 func TestEngineSyncPrimeAgentLateAttributionForceReplacesUsage(t *testing.T) {
 	database := openTestDB(t)
 	root := t.TempDir()
-	engine := NewEngine(database, EngineConfig{
+	engine := NewEngine(t.Context(), database, EngineConfig{
 		AgentDirs: map[parser.AgentType][]string{
 			parser.AgentPrimeAgent: {root},
 		},
 		Machine: "local",
 	})
 	require.NoError(t, database.UpsertModelPricing([]db.ModelPricing{{
-		ModelPattern:         "gpt-5.4-mini",
+		ModelPattern:         "late-attribution-model",
 		InputPerMTok:         money.Money{Microdollars: 1_000_000},
 		OutputPerMTok:        money.Money{Microdollars: 2_000_000},
 		CacheCreationPerMTok: money.Money{Microdollars: 3_000_000},
@@ -33,14 +32,14 @@ func TestEngineSyncPrimeAgentLateAttributionForceReplacesUsage(t *testing.T) {
 	path := filepath.Join(root, "transcript-file-id.jsonl")
 	initial := `{"type":"session","version":3,"id":"session-header-id","timestamp":"2026-08-06T12:00:00Z","cwd":"/work/project"}
 {"type":"message","id":"user-1","parentId":null,"timestamp":"2026-08-06T12:00:01Z","message":{"role":"user","content":"hello"}}
-{"type":"message","id":"assistant-1","parentId":"user-1","timestamp":"2026-08-06T12:00:02Z","message":{"role":"assistant","content":"hi","model":"gpt-5.4-mini","usage":{"input":10,"output":1}}}
+{"type":"message","id":"assistant-1","parentId":"user-1","timestamp":"2026-08-06T12:00:02Z","message":{"role":"assistant","content":"hi","model":"late-attribution-model","usage":{"input":10,"output":1}}}
 `
 	require.NoError(t, os.WriteFile(path, []byte(initial), 0o600))
 
-	stats := engine.SyncAll(context.Background(), nil)
+	stats := engine.SyncAll(t.Context(), nil)
 	require.False(t, stats.Aborted)
 	messages, err := database.GetAllMessages(
-		context.Background(), "prime-agent:session-header-id",
+		t.Context(), "prime-agent:session-header-id",
 	)
 	require.NoError(t, err)
 	require.Len(t, messages, 2)
@@ -57,7 +56,7 @@ func TestEngineSyncPrimeAgentLateAttributionForceReplacesUsage(t *testing.T) {
 
 	engine.SyncPaths([]string{path})
 	messages, err = database.GetAllMessages(
-		context.Background(), "prime-agent:session-header-id",
+		t.Context(), "prime-agent:session-header-id",
 	)
 	require.NoError(t, err)
 	require.Len(t, messages, 2)
@@ -70,14 +69,14 @@ func TestEngineSyncPrimeAgentLateAttributionForceReplacesUsage(t *testing.T) {
 		"cache_creation_input_tokens": 2
 	}`, string(messages[1].TokenUsage))
 	session, err := database.GetSessionFull(
-		context.Background(), "prime-agent:session-header-id",
+		t.Context(), "prime-agent:session-header-id",
 	)
 	require.NoError(t, err)
 	require.NotNil(t, session)
 	assert.Equal(t, 37, session.PeakContextTokens)
 	assert.Equal(t, 7, session.TotalOutputTokens)
 	usage, err := database.GetSessionUsage(
-		context.Background(), "prime-agent:session-header-id", true,
+		t.Context(), "prime-agent:session-header-id", true,
 	)
 	require.NoError(t, err)
 	require.NotNil(t, usage)
@@ -88,7 +87,7 @@ func TestEngineSyncPrimeAgentLateAttributionForceReplacesUsage(t *testing.T) {
 func TestEngineSyncPrimeAgentStoresForkRelationship(t *testing.T) {
 	database := openTestDB(t)
 	root := t.TempDir()
-	engine := NewEngine(database, EngineConfig{
+	engine := NewEngine(t.Context(), database, EngineConfig{
 		AgentDirs: map[parser.AgentType][]string{
 			parser.AgentPrimeAgent: {root},
 		},
@@ -120,7 +119,7 @@ func TestEngineSyncPrimeAgentStoresForkRelationship(t *testing.T) {
 func TestEngineSyncPrimeAgentSingleSessionResyncsResolvedPath(t *testing.T) {
 	database := openTestDB(t)
 	root := t.TempDir()
-	engine := NewEngine(database, EngineConfig{
+	engine := NewEngine(t.Context(), database, EngineConfig{
 		AgentDirs: map[parser.AgentType][]string{
 			parser.AgentPrimeAgent: {root},
 		},

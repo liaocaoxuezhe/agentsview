@@ -4,7 +4,10 @@ package parser
 
 import (
 	"crypto/sha256"
+	"encoding/hex"
+	"encoding/json/v2"
 	"fmt"
+	"hash/crc32"
 	"os"
 	"path/filepath"
 	"strings"
@@ -41,6 +44,34 @@ func StatOpenCodeStorageSessionState(sessionPath string) (string, bool) {
 		"session", filepath.Base(sessionPath),
 		info.Size(), info.ModTime().UnixNano(),
 	)
+	var session struct {
+		Directory string `json:"directory"`
+	}
+	raw, err := os.ReadFile(sessionPath)
+	if err != nil || json.Unmarshal(raw, &session) != nil {
+		return "", false
+	}
+	if !openCodeUsableWorktree(strings.TrimSpace(session.Directory)) {
+		projectPath := openCodeProjectPath(sessionPath)
+		projectInfo, projectErr := os.Stat(projectPath)
+		if projectErr == nil {
+			if !projectInfo.Mode().IsRegular() {
+				return "", false
+			}
+			projectRaw, err := os.ReadFile(projectPath)
+			if err != nil {
+				return "", false
+			}
+			record("project", filepath.Base(projectPath),
+				projectInfo.Size(), projectInfo.ModTime().UnixNano())
+			record("project-content", filepath.Base(projectPath),
+				int64(len(projectRaw)), int64(crc32.ChecksumIEEE(projectRaw)))
+		} else if !os.IsNotExist(projectErr) {
+			return "", false
+		} else {
+			record("project-missing", filepath.Base(projectPath), 0, 0)
+		}
+	}
 
 	root := filepath.Dir(filepath.Dir(filepath.Dir(
 		filepath.Dir(sessionPath),
@@ -52,7 +83,7 @@ func StatOpenCodeStorageSessionState(sessionPath string) (string, bool) {
 	msgEntries, err := os.ReadDir(messageDir)
 	if err != nil {
 		if os.IsNotExist(err) {
-			return fmt.Sprintf("%x", h.Sum(nil)), true
+			return hex.EncodeToString(h.Sum(nil)), true
 		}
 		return "", false
 	}
@@ -94,5 +125,5 @@ func StatOpenCodeStorageSessionState(sessionPath string) (string, bool) {
 			)
 		}
 	}
-	return fmt.Sprintf("%x", h.Sum(nil)), true
+	return hex.EncodeToString(h.Sum(nil)), true
 }

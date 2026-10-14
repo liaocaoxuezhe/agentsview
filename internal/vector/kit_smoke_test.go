@@ -12,11 +12,11 @@ import (
 )
 
 func TestKitSqlitevecRoundTrip(t *testing.T) {
-	sqlitevec.Register()
+	registerVecOnce.Do(registerVec)
 	db, err := sql.Open(vectorDriverName, vectorDSN(filepath.Join(t.TempDir(), "v.db"), false))
 	require.NoError(t, err)
 	defer db.Close()
-	ctx := context.Background()
+	ctx := t.Context()
 	_, err = db.ExecContext(ctx, `CREATE TABLE docs (
         doc_key TEXT PRIMARY KEY, content TEXT NOT NULL,
         content_hash TEXT NOT NULL, embed_gen TEXT)`)
@@ -40,8 +40,7 @@ func TestKitSqlitevecRoundTrip(t *testing.T) {
 		}
 		return out, nil
 	}
-	stats, err := kitvec.Fill[string, string](ctx, store, fp, enc,
-		kitvec.FillOptions[string]{})
+	stats, err := kitvec.Fill[string, string](ctx, store, fp, enc)
 	require.NoError(t, err)
 	require.Equal(t, 1, stats.Documents)
 	hits, err := store.QueryGeneration(ctx, fp, kitvec.Vector{1, 0, 0}, 5)

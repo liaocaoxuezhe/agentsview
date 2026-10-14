@@ -17,6 +17,10 @@ describe("RecallPage", () => {
     router.route = "recall";
     router.params = {};
     sync.serverVersion = {
+      api_version: 1,
+      data_version: 1,
+      session_stats_available: false,
+      insight_generation_available: false,
       version: "dev",
       commit: "unknown",
       build_date: "",
@@ -43,9 +47,9 @@ describe("RecallPage", () => {
     await tick();
 
     expect(document.body.textContent).toContain("Corpus");
-    const generated = Array.from(
-      document.querySelectorAll<HTMLButtonElement>("button"),
-    ).find((button) => button.textContent?.trim() === "Generated insights");
+    const generated = Array.from(document.querySelectorAll<HTMLButtonElement>("button")).find(
+      (button) => button.textContent?.trim() === "Generated insights",
+    );
     expect(generated).toBeDefined();
 
     generated!.click();
@@ -65,6 +69,10 @@ describe("RecallPage", () => {
 
   it("shows only Generated insights for a read-only backend", async () => {
     sync.serverVersion = {
+      api_version: 1,
+      data_version: 1,
+      session_stats_available: false,
+      insight_generation_available: false,
       version: "dev",
       commit: "unknown",
       build_date: "",

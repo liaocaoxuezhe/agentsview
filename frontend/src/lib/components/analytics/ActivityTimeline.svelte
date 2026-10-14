@@ -1,104 +1,247 @@
 <script lang="ts">
+  import { Bar, BarChart } from "layerchart";
+  import { Button } from "@kenn-io/kit-ui";
+  import { scaleUtc } from "d3-scale";
+  import {
+    utcDay,
+    utcMonday,
+    utcMonth,
+    type TimeInterval,
+  } from "d3-time";
   import { analytics } from "../../stores/analytics.svelte.js";
-  import { addDays, endOfMonth } from "../../utils/dates.js";
-  import { m } from "../../i18n/index.js";
-
-  const BAR_HEIGHT = 120;
-  const LABEL_HEIGHT = 20;
-  const TOP_PAD = 20;
-  const SVG_HEIGHT = BAR_HEIGHT + LABEL_HEIGHT + TOP_PAD + 4;
-  const MIN_BAR_WIDTH = 6;
-  const BAR_GAP = 2;
+  import {
+    addDays,
+    endOfMonth,
+    localDateStr,
+    parseLocalDate,
+    startOfIsoWeek,
+    startOfMonth,
+  } from "../../utils/dates.js";
+  import {
+    formatDateTime,
+    getLocale,
+    m,
+  } from "../../i18n/index.js";
 
   type Metric = "messages" | "sessions";
+  type ScaleMode = "absolute" | "percent";
+  const MAX_DAY_RANGE = 120;
   interface Props {
-    onDateRangeChange?: (from: string, to: string) => void;
+    deferInitialFetch?: boolean;
+    onRangeSelect?: (from: string, to: string) => void;
+    onRangeClear?: () => void;
   }
 
-  let { onDateRangeChange }: Props = $props();
+  let { onRangeSelect, onRangeClear, deferInitialFetch = false }: Props = $props();
 
   let metric = $state<Metric>("messages");
+  let scaleMode = $state<ScaleMode>("absolute");
+  let chartAreaWidth = $state(0);
+  let keyboardAnchorIndex = $state<number | null>(null);
+  const selectedRange = $derived(analytics.selectedActivityRange);
+  const percentScale = $derived(
+    metric === "messages" && scaleMode === "percent",
+  );
 
-  let containerEl = $state<HTMLDivElement | null>(null);
-  let containerWidth = $state(600);
+  const dayRangeCount = $derived.by(() => {
+    const from = Date.parse(`${analytics.from}T00:00:00Z`);
+    const to = Date.parse(`${analytics.to}T00:00:00Z`);
+    if (Number.isNaN(from) || Number.isNaN(to) || to < from) return 0;
+    return Math.floor((to - from) / 86_400_000) + 1;
+  });
+  const dayViewDisabled = $derived(dayRangeCount > MAX_DAY_RANGE);
 
   $effect(() => {
-    if (!containerEl) return;
-    const obs = new ResizeObserver((entries) => {
-      for (const entry of entries) {
-        containerWidth = entry.contentRect.width;
+    if (dayViewDisabled && analytics.granularity === "day") {
+      if (deferInitialFetch) {
+        analytics.granularity = "week";
+        // Clear day data until the parent releases the initial analytics load.
+        analytics.activity = null;
+        analytics.errors.activity = null;
+      } else {
+        analytics.setGranularity("week");
       }
-    });
-    obs.observe(containerEl);
-    return () => obs.disconnect();
+    }
+  });
+
+  function bucketStart(date: string): string {
+    if (analytics.granularity === "week") {
+      return startOfIsoWeek(date);
+    }
+    if (analytics.granularity === "month") {
+      return startOfMonth(date);
+    }
+    return date;
+  }
+
+  function nextBucket(date: string): string {
+    if (analytics.granularity === "week") {
+      return addDays(date, 7);
+    }
+    if (analytics.granularity === "month") {
+      const parsed = parseLocalDate(date);
+      if (!parsed) return "";
+      return localDateStr(
+        new Date(parsed.getFullYear(), parsed.getMonth() + 1, 1),
+      );
+    }
+    return addDays(date, 1);
+  }
+
+  function bucketDates(): string[] {
+    const start = bucketStart(analytics.from);
+    const end = bucketStart(analytics.to);
+    if (!start || !end || start > end) return [];
+    const dates: string[] = [];
+    for (let date = start; date && date <= end; date = nextBucket(date)) {
+      dates.push(date);
+    }
+    return dates;
+  }
+
+  const xInterval = $derived.by((): TimeInterval => {
+    if (analytics.granularity === "week") return utcMonday;
+    if (analytics.granularity === "month") return utcMonth;
+    return utcDay;
   });
 
   const chart = $derived.by(() => {
-    const series = analytics.activity?.series;
-    if (!series || series.length === 0) {
-      return { bars: [], maxVal: 0, labels: [] };
+    const activitySeries = analytics.activity?.series;
+    if (!activitySeries || activitySeries.length === 0) {
+      return { bars: [] };
     }
 
-    const values = series.map((e) =>
-      metric === "messages" ? e.messages : e.sessions,
+    const byDate = new Map(
+      activitySeries.map((entry) => [entry.date, entry]),
     );
-    const maxVal = Math.max(...values, 1);
-
-    const barWidth = Math.max(
-      MIN_BAR_WIDTH,
-      Math.floor(
-        (containerWidth - series.length * BAR_GAP) /
-          series.length,
-      ),
-    );
-
-    const bars = series.map((entry, i) => {
-      const val = values[i]!;
-      const height = (val / maxVal) * BAR_HEIGHT;
+    const dates = bucketDates();
+    const series = dates.length > 0
+      ? dates.map((date) => byDate.get(date) ?? {
+          date,
+          sessions: 0,
+          messages: 0,
+          user_messages: 0,
+          assistant_messages: 0,
+        })
+      : activitySeries;
+    const bars = series.map((entry) => {
+      const userMessages = entry.user_messages;
+      const assistantMessages = entry.assistant_messages;
+      const splitTotal = userMessages + assistantMessages;
+      const total = metric === "messages" ? entry.messages : entry.sessions;
+      // The message total also counts tool-result carrier rows and
+      // system-injected rows that belong to neither role segment.
+      const otherMessages = metric === "messages"
+        ? Math.max(0, total - splitTotal)
+        : 0;
+      let value: number;
+      let userRange: [number, number];
+      let assistantRange: [number, number];
+      let otherRange: [number, number];
+      if (metric === "messages") {
+        if (percentScale) {
+          const toPct = (part: number) =>
+            total > 0 ? (part / total) * 100 : 0;
+          const userPct = toPct(userMessages);
+          const assistantPct = toPct(assistantMessages);
+          value = 100;
+          userRange = [0, userPct];
+          assistantRange = [userPct, userPct + assistantPct];
+          otherRange = [userPct + assistantPct, total > 0 ? 100 : 0];
+        } else {
+          value = total;
+          userRange = [0, userMessages];
+          assistantRange = [userMessages, splitTotal];
+          otherRange = [splitTotal, total];
+        }
+      } else {
+        value = total;
+        userRange = [0, 0];
+        assistantRange = [0, 0];
+        otherRange = [0, 0];
+      }
       return {
-        x: i * (barWidth + BAR_GAP),
-        y: TOP_PAD + BAR_HEIGHT - height,
-        width: barWidth,
-        height,
-        value: val,
+        value,
+        total,
         date: entry.date,
-        userMessages: entry.user_messages,
-        assistantMessages: entry.assistant_messages,
+        instant: new Date(`${entry.date}T00:00:00Z`),
+        userMessages,
+        assistantMessages,
+        otherMessages,
+        userRange,
+        assistantRange,
+        otherRange,
       };
     });
 
-    // Generate sparse x-axis labels
-    const labelStep = Math.max(
-      1,
-      Math.floor(series.length / 8),
-    );
-    const labels = series
-      .filter((_, i) => i % labelStep === 0)
-      .map((entry, _, arr) => {
-        const idx = series.indexOf(entry);
-        return {
-          x: idx * (barWidth + BAR_GAP) + barWidth / 2,
-          text: formatDateLabel(entry.date),
-        };
-      });
-
-    return { bars, maxVal, labels };
+    // Each day's focus and hover target spans the tallest column, so days
+    // with no messages or no user messages stay reachable.
+    const top = Math.max(0, ...bars.map((bar) => bar.value));
+    return {
+      bars: bars.map((bar) => ({
+        ...bar,
+        columnRange: [0, top] as [number, number],
+      })),
+    };
   });
-
-  const svgWidth = $derived(
-    chart.bars.length > 0
-      ? chart.bars[chart.bars.length - 1]!.x +
-          chart.bars[0]!.width +
-          4
-      : containerWidth,
+  const xDomain = $derived.by((): [Date, Date] | undefined => {
+    const first = chart.bars[0];
+    const last = chart.bars.at(-1);
+    if (!first || !last) return undefined;
+    return [first.instant, xInterval.offset(last.instant, 1)];
+  });
+  const barInset = $derived.by(() => {
+    if (chart.bars.length === 0 || chartAreaWidth === 0) return 0;
+    const plotWidth = Math.max(chartAreaWidth - 48, 0);
+    const bucketWidth = plotWidth / chart.bars.length;
+    return Math.max(0, Math.min(1, (bucketWidth - 0.75) / 2));
+  });
+  const selectedBrushDomain = $derived.by(():
+    | [Date, Date]
+    | undefined => {
+    if (!selectedRange) return undefined;
+    const first = new Date(`${bucketStart(selectedRange.from)}T00:00:00Z`);
+    const last = new Date(`${bucketStart(selectedRange.to)}T00:00:00Z`);
+    return [first, xInterval.offset(last, 1)];
+  });
+  const selectionCoversChart = $derived(
+    selectedRange?.from === analytics.from &&
+      selectedRange?.to === analytics.to,
   );
 
-  function formatDateLabel(date: string): string {
-    const d = new Date(date + "T00:00:00");
-    return d.toLocaleDateString("en", {
+  function formatDateLabel(date: Date): string {
+    return formatDateTime(date, {
       month: "short",
       day: "numeric",
+      timeZone: "UTC",
     });
+  }
+
+  function barClass(
+    bar: (typeof chart.bars)[number],
+    segment?: "user" | "assistant" | "other",
+  ): string {
+    const inSelection = isSelected(bar);
+    const dimmed = selectedRange !== null && !inSelection;
+    return `bar${bar.total === 0 ? " empty" : ""}${inSelection ? " selected" : ""}${dimmed ? " dimmed" : ""}${segment ? ` bar-${segment}` : ""}`;
+  }
+
+  function splitPercent(bar: (typeof chart.bars)[number]): {
+    user: string;
+    assistant: string;
+    other: string;
+  } {
+    const format = new Intl.NumberFormat(getLocale(), {
+      style: "percent",
+      maximumFractionDigits: 1,
+    });
+    const toPct = (part: number) =>
+      format.format(bar.total > 0 ? part / bar.total : 0);
+    return {
+      user: toPct(bar.userMessages),
+      assistant: toPct(bar.assistantMessages),
+      other: toPct(bar.otherMessages),
+    };
   }
 
   let tooltip = $state<{
@@ -107,15 +250,11 @@
     text: string;
   } | null>(null);
 
-  function handleBarHover(
-    e: MouseEvent,
+  function describeBar(
     bar: (typeof chart.bars)[number],
-  ) {
-    const rect = (
-      e.currentTarget as SVGElement
-    ).getBoundingClientRect();
-    const d = new Date(bar.date + "T00:00:00");
-    const label = d.toLocaleDateString("en", {
+    asPercent: boolean,
+  ): string[] {
+    const label = formatDateTime(`${bar.date}T00:00:00`, {
       month: "short",
       day: "numeric",
       year: "numeric",
@@ -123,51 +262,177 @@
     const lines = [
       m.analytics_activity_timeline_tooltip_value({
         label,
-        value: bar.value.toLocaleString(),
+        value: bar.total.toLocaleString(getLocale()),
         metric: metric === "messages"
           ? m.analytics_metric_messages()
           : m.analytics_metric_sessions(),
       }),
     ];
     if (metric === "messages") {
+      const split = asPercent
+        ? splitPercent(bar)
+        : {
+            user: bar.userMessages.toLocaleString(getLocale()),
+            assistant: bar.assistantMessages.toLocaleString(getLocale()),
+            other: bar.otherMessages.toLocaleString(getLocale()),
+          };
       lines.push(
         m.analytics_activity_timeline_tooltip_messages({
-          user: bar.userMessages,
-          assistant: bar.assistantMessages,
+          user: split.user,
+          assistant: split.assistant,
+          other: split.other,
         }),
       );
     }
+    return lines;
+  }
+
+  function isSelected(bar: (typeof chart.bars)[number]): boolean {
+    return selectedRange !== null &&
+      bar.date >= bucketStart(selectedRange.from) &&
+      bar.date <= bucketStart(selectedRange.to);
+  }
+
+  function handleBarHover(
+    e: MouseEvent,
+    bar: (typeof chart.bars)[number],
+  ) {
+    const rect = (
+      e.currentTarget as SVGElement
+    ).getBoundingClientRect();
     tooltip = {
       x: rect.left + rect.width / 2,
       y: rect.top - 4,
-      text: lines.join(" | "),
+      text: describeBar(bar, percentScale).join(" | "),
     };
   }
 
-  function handleBarClick(
-    bar: (typeof chart.bars)[number],
-  ) {
-    if (bar.value === 0) return;
-    const g = analytics.granularity;
-    if (g === "day") {
-      analytics.selectDate(bar.date);
-    } else if (g === "week") {
-      commitDateRange(bar.date, addDays(bar.date, 6));
-    } else if (g === "month") {
-      commitDateRange(bar.date, endOfMonth(bar.date));
+  function commitDateRange(from: string, to: string) {
+    if (onRangeSelect) {
+      onRangeSelect(from, to);
+    } else {
+      analytics.setActivitySelection(from, to);
     }
   }
 
-  function commitDateRange(from: string, to: string) {
-    if (onDateRangeChange) {
-      onDateRangeChange(from, to);
+  function clearDateRange() {
+    if (onRangeClear) {
+      onRangeClear();
+    } else {
+      analytics.clearActivitySelection();
+    }
+    keyboardAnchorIndex = null;
+  }
+
+  function commitIndexRange(firstIndex: number, lastIndex: number) {
+    const start = Math.min(firstIndex, lastIndex);
+    const end = Math.max(firstIndex, lastIndex);
+    const first = chart.bars[start];
+    const last = chart.bars[end];
+    if (!first || !last) return;
+    const from = first.date < analytics.from ? analytics.from : first.date;
+    let to = last.date;
+    if (analytics.granularity === "week") {
+      to = addDays(to, 6);
+    } else if (analytics.granularity === "month") {
+      to = endOfMonth(to);
+    }
+    if (to > analytics.to) to = analytics.to;
+    commitDateRange(from, to);
+  }
+
+  function focusBar(index: number) {
+    document.querySelector<SVGElement>(
+      `[data-activity-bar-index="${index}"]`,
+    )?.focus();
+  }
+
+  function handleBarKeydown(event: KeyboardEvent, index: number) {
+    if (event.key === "Escape" && selectedRange) {
+      event.preventDefault();
+      clearDateRange();
       return;
     }
-    analytics.setDateRange(from, to);
+    if (event.key === "Enter" || event.key === " ") {
+      event.preventDefault();
+      keyboardAnchorIndex = index;
+      commitIndexRange(index, index);
+      return;
+    }
+    if (event.key !== "ArrowLeft" && event.key !== "ArrowRight") return;
+    event.preventDefault();
+    const next = Math.max(
+      0,
+      Math.min(
+        chart.bars.length - 1,
+        index + (event.key === "ArrowRight" ? 1 : -1),
+      ),
+    );
+    if (event.shiftKey) {
+      const anchor = keyboardAnchorIndex ?? index;
+      keyboardAnchorIndex = anchor;
+      commitIndexRange(anchor, next);
+    } else {
+      keyboardAnchorIndex = next;
+    }
+    queueMicrotask(() => focusBar(next));
   }
 
   function handleBarLeave() {
     tooltip = null;
+  }
+
+  function brushDate(value: unknown): Date | null {
+    if (value instanceof Date && !Number.isNaN(value.getTime())) {
+      return value;
+    }
+    if (typeof value === "number") {
+      const date = new Date(value);
+      return Number.isNaN(date.getTime()) ? null : date;
+    }
+    return null;
+  }
+
+  function snapBrush(selection: {
+    x: Array<number | Date | string | null>;
+    y: Array<number | Date | string | null>;
+  }) {
+    const from = brushDate(selection.x[0]);
+    const to = brushDate(selection.x[1]);
+    if (!from || !to) return selection;
+    const start = xInterval.floor(from);
+    let end = xInterval.ceil(to);
+    if (end.getTime() <= start.getTime()) {
+      end = xInterval.offset(start, 1);
+    }
+    return { ...selection, x: [start, end] };
+  }
+
+  function handleBrushEnd(event: {
+    brush: {
+      active: boolean | undefined;
+      x: Array<number | Date | string | null>;
+    };
+  }) {
+    if (!event.brush.active) return;
+    const start = brushDate(event.brush.x[0]);
+    const end = brushDate(event.brush.x[1]);
+    if (!start || !end) return;
+
+    const firstBucket = xInterval.floor(start);
+    const endBoundary = xInterval.ceil(end);
+    const lastBucket = xInterval.offset(endBoundary, -1);
+    const firstDate = firstBucket.toISOString().slice(0, 10);
+    const lastDate = lastBucket.toISOString().slice(0, 10);
+    const from = firstDate < analytics.from ? analytics.from : firstDate;
+    let to = lastDate;
+    if (analytics.granularity === "week") {
+      to = addDays(lastDate, 6);
+    } else if (analytics.granularity === "month") {
+      to = endOfMonth(lastDate);
+    }
+    if (to > analytics.to) to = analytics.to;
+    if (from <= to) commitDateRange(from, to);
   }
 </script>
 
@@ -194,6 +459,7 @@
         <button
           class="toggle-btn"
           class:active={analytics.granularity === "day"}
+          disabled={dayViewDisabled}
           onclick={() => analytics.setGranularity("day")}
         >
           {m.analytics_granularity_day()}
@@ -213,6 +479,48 @@
           {m.analytics_granularity_month()}
         </button>
       </div>
+      {#if metric === "messages"}
+        <div class="scale-toggle">
+          <button
+            class="toggle-btn"
+            class:active={scaleMode === "absolute"}
+            onclick={() => (scaleMode = "absolute")}
+          >
+            {m.analytics_activity_timeline_mode_absolute()}
+          </button>
+          <button
+            class="toggle-btn"
+            class:active={scaleMode === "percent"}
+            onclick={() => (scaleMode = "percent")}
+          >
+            {m.analytics_activity_timeline_mode_percent()}
+          </button>
+        </div>
+      {/if}
+      {#if selectedRange}
+        <Button
+          size="sm"
+          surface="soft"
+          label={m.sidebar_clear_selection()}
+          onclick={clearDateRange}
+        />
+      {/if}
+      {#if metric === "messages"}
+        <div class="segment-legend">
+          <span class="legend-item">
+            <span class="legend-swatch user" aria-hidden="true"></span>
+            {m.message_content_role_user()}
+          </span>
+          <span class="legend-item">
+            <span class="legend-swatch assistant" aria-hidden="true"></span>
+            {m.message_content_role_assistant()}
+          </span>
+          <span class="legend-item">
+            <span class="legend-swatch other" aria-hidden="true"></span>
+            {m.shared_other()}
+          </span>
+        </div>
+      {/if}
     </div>
   </div>
 
@@ -227,61 +535,108 @@
       </button>
     </div>
   {:else if chart.bars.length > 0}
-    <div class="chart-area" bind:this={containerEl}>
-      <svg
-        width={svgWidth}
-        height={SVG_HEIGHT}
-        class="timeline-svg"
+    <div class="chart-area" bind:clientWidth={chartAreaWidth}>
+      <BarChart
+        data={chart.bars}
+        x="instant"
+        y="value"
+        xScale={scaleUtc()}
+        {xInterval}
+        {xDomain}
+        yDomain={[0, null]}
+        yNice
+        padding={{ top: 20, right: 24, bottom: 20, left: 24 }}
+        height={164}
+        class="timeline-chart"
+        axis="x"
+        grid={{ class: "grid-line" }}
+        rule={false}
+        highlight={false}
+        tooltipContext={false}
+        brush={{
+          axis: "x",
+          zoomOnBrush: false,
+          x: selectedBrushDomain,
+          clickToReset: false,
+          constrain: snapBrush,
+          onBrushEnd: handleBrushEnd,
+          classes: { range: "activity-brush-range" },
+        }}
+        props={{
+          xAxis: {
+            tickSpacing: 96,
+            format: (date) => formatDateLabel(date as Date),
+            tickMarks: false,
+            rule: false,
+            classes: { tickLabel: "x-label" },
+          },
+        }}
       >
-        <!-- Y-axis guide lines -->
-        {#each [0.25, 0.5, 0.75, 1] as frac}
-          <line
-            x1="0"
-            y1={TOP_PAD + BAR_HEIGHT * (1 - frac)}
-            x2={svgWidth}
-            y2={TOP_PAD + BAR_HEIGHT * (1 - frac)}
-            class="grid-line"
-          />
-        {/each}
-
-        <!-- Bars -->
-        {#each chart.bars as bar}
-          <rect
-            x={bar.x}
-            y={bar.y}
-            width={bar.width}
-            height={Math.max(bar.height, 1)}
-            rx="1"
-            class="bar"
-            class:empty={bar.value === 0}
-            class:selected={analytics.selectedDate === bar.date}
-            class:dimmed={analytics.selectedDate !== null && analytics.selectedDate !== bar.date}
-            role="button"
-            tabindex="0"
-            onclick={() => handleBarClick(bar)}
-            onkeydown={(e) => {
-              if (e.key === "Enter" || e.key === " ") {
-                e.preventDefault();
-                handleBarClick(bar);
-              }
-            }}
-            onmouseenter={(e) => handleBarHover(e, bar)}
-            onmouseleave={handleBarLeave}
-          />
-        {/each}
-
-        <!-- X-axis labels -->
-        {#each chart.labels as label}
-          <text
-            x={label.x}
-            y={TOP_PAD + BAR_HEIGHT + LABEL_HEIGHT - 4}
-            class="x-label"
-            text-anchor="middle"
-          >
-            {label.text}
-          </text>
-        {/each}
-      </svg>
+        {#snippet marks()}
+          {#each chart.bars as bar, index (bar.date)}
+            <g
+              class="day-column"
+              role="button"
+              tabindex={0}
+              data-activity-bar-index={index}
+              aria-pressed={isSelected(bar)}
+              aria-label={describeBar(bar, false).join(", ")}
+              onpointerenter={(event) => handleBarHover(event, bar)}
+              onpointerleave={handleBarLeave}
+              onkeydown={(event) => handleBarKeydown(event, index)}
+            >
+              <Bar
+                data={bar}
+                x="instant"
+                y="columnRange"
+                radius={1}
+                insets={{ left: barInset, right: barInset }}
+                class="bar-target"
+              />
+              {#if metric === "messages"}
+                <Bar
+                  data={bar}
+                  x="instant"
+                  y="userRange"
+                  radius={1}
+                  insets={{ left: barInset, right: barInset }}
+                  class={barClass(bar, "user")}
+                />
+                <Bar
+                  data={bar}
+                  x="instant"
+                  y="assistantRange"
+                  radius={1}
+                  insets={{ left: barInset, right: barInset }}
+                  class={barClass(bar, "assistant")}
+                />
+                <Bar
+                  data={bar}
+                  x="instant"
+                  y="otherRange"
+                  radius={1}
+                  insets={{ left: barInset, right: barInset }}
+                  class={barClass(bar, "other")}
+                />
+              {:else}
+                <Bar
+                  data={bar}
+                  x="instant"
+                  radius={1}
+                  insets={{ left: barInset, right: barInset }}
+                  class={barClass(bar)}
+                />
+              {/if}
+            </g>
+          {/each}
+        {/snippet}
+      </BarChart>
+      {#if selectionCoversChart}
+        <div
+          class="activity-selection-overlay"
+          aria-hidden="true"
+        ></div>
+      {/if}
     </div>
 
     {#if tooltip}
@@ -289,7 +644,7 @@
         class="tooltip"
         style="left: {tooltip.x}px; top: {tooltip.y}px;"
       >
-        {tooltip.text}
+        <span>{tooltip.text}</span>
       </div>
     {/if}
   {:else}
@@ -312,11 +667,15 @@
 
   .controls {
     display: flex;
+    flex: 1;
+    flex-wrap: wrap;
     gap: 8px;
+    min-width: 0;
   }
 
   .metric-toggle,
-  .granularity-toggle {
+  .granularity-toggle,
+  .scale-toggle {
     display: flex;
     gap: 2px;
   }
@@ -337,55 +696,142 @@
     color: var(--text-secondary);
   }
 
+  .toggle-btn:disabled {
+    opacity: var(--opacity-disabled);
+    cursor: not-allowed;
+  }
+
   .toggle-btn.active {
     background: var(--bg-inset);
     color: var(--text-primary);
   }
 
-  .chart-area {
-    overflow-x: auto;
-    padding-bottom: 4px;
+  .segment-legend {
+    display: flex;
+    align-items: center;
+    gap: var(--space-5);
+    margin-left: auto;
   }
 
-  .timeline-svg {
+  .legend-item {
+    display: flex;
+    align-items: center;
+    gap: 4px;
+    font-size: 10px;
+    color: var(--text-muted);
+  }
+
+  .legend-swatch {
+    width: 8px;
+    height: 8px;
+    border-radius: 2px;
+  }
+
+  .legend-swatch.user {
+    background: var(--accent-green);
+  }
+
+  .legend-swatch.assistant {
+    background: var(--accent-blue);
+  }
+
+  .legend-swatch.other {
+    background: var(--chart-series-other);
+  }
+
+  .chart-area {
+    position: relative;
+    padding-bottom: 4px;
+    min-width: 0;
+  }
+
+  .timeline-container :global(.timeline-chart) {
     display: block;
   }
 
-  .grid-line {
+  .timeline-container :global(.grid-line) {
     stroke: var(--border-muted);
     stroke-width: 0.5;
     stroke-dasharray: 2 2;
+    stroke-opacity: 0.4;
   }
 
-  .bar {
+  .timeline-container :global(.bar) {
     fill: var(--accent-blue);
     opacity: 0.8;
-    cursor: pointer;
     transition: opacity 0.15s;
   }
 
-  .bar:hover {
+  .timeline-container :global(.bar-user) {
+    fill: var(--accent-green);
+  }
+
+  .timeline-container :global(.bar-assistant) {
+    fill: var(--accent-blue);
+  }
+
+  .timeline-container :global(.bar-other) {
+    fill: var(--chart-series-other);
+  }
+
+  .timeline-container :global(.day-column) {
+    outline: none;
+  }
+
+  .timeline-container :global(.bar-target) {
+    fill: transparent;
+  }
+
+  .timeline-container :global(.day-column:focus-visible .bar-target) {
+    stroke: var(--accent-blue);
+    stroke-width: 1;
+  }
+
+  .timeline-container :global(.day-column:hover .bar),
+  .timeline-container :global(.day-column:focus-visible .bar) {
     opacity: 1;
   }
 
-  .bar.selected {
+  .timeline-container :global(.bar.selected) {
     opacity: 1;
   }
 
-  .bar.dimmed {
+  .timeline-container :global(.bar.dimmed) {
     opacity: 0.2;
   }
 
-  .bar.dimmed:hover {
+  .timeline-container :global(.day-column:hover .bar.dimmed) {
     opacity: 0.5;
   }
 
-  .bar.empty {
+  .timeline-container :global(.bar.empty) {
     opacity: 0.2;
-    cursor: default;
   }
 
-  .x-label {
+  .timeline-container :global(.activity-brush-range) {
+    background: color-mix(
+      in srgb,
+      var(--accent-blue) 16%,
+      transparent
+    );
+    border-left: 1px solid var(--accent-blue);
+    border-right: 1px solid var(--accent-blue);
+  }
+
+  .activity-selection-overlay {
+    position: absolute;
+    inset: 20px 24px 24px;
+    pointer-events: none;
+    background: color-mix(
+      in srgb,
+      var(--accent-blue) 16%,
+      transparent
+    );
+    border-left: 1px solid var(--accent-blue);
+    border-right: 1px solid var(--accent-blue);
+  }
+
+  .timeline-container :global(.x-label) {
     font-size: 9px;
     fill: var(--text-muted);
     font-family: var(--font-sans);

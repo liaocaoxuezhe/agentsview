@@ -2,7 +2,8 @@ package server
 
 import (
 	"context"
-	"encoding/json"
+	"encoding/json/jsontext"
+	"encoding/json/v2"
 	"errors"
 	"io"
 	"log"
@@ -43,32 +44,41 @@ type bytesOutput struct {
 	Body               []byte
 }
 
-type apiErrorResponse struct {
-	Status  int    `json:"-"`
-	Code    string `json:"code,omitempty"`
-	Message string `json:"error"`
+type apiResponseError struct {
+	Variants            []string `json:"variants,omitempty"`
+	IdentityState       string   `json:"state,omitempty"`
+	Status              int      `json:"-"`
+	Code                string   `json:"code,omitempty"`
+	Message             string   `json:"error"`
+	CurrentManifestID   string   `json:"current_manifest_id,omitempty"`
+	CurrentReceipt      string   `json:"current_receipt,omitempty"`
+	CurrentGeneration   int64    `json:"current_generation,omitzero"`
+	CurrentUploadOffset *int64   `json:"upload_offset,omitempty"`
 }
 
-func (e *apiErrorResponse) Error() string {
+func (e *apiResponseError) Error() string {
 	return e.Message
 }
 
-func (e *apiErrorResponse) GetStatus() int {
+func (e *apiResponseError) GetStatus() int {
 	return e.Status
 }
 
 func apiError(status int, message string) error {
-	return &apiErrorResponse{Status: status, Message: message}
+	return &apiResponseError{Status: status, Message: message}
 }
 
 func apiErrorWithCode(status int, code, message string) error {
-	return &apiErrorResponse{Status: status, Code: code, Message: message}
+	return &apiResponseError{Status: status, Code: code, Message: message}
 }
 
-var configureHumaErrorsOnce stdsync.Once
+var configureHumaOnce stdsync.Once
 
-func configureHumaErrors() {
-	configureHumaErrorsOnce.Do(func() {
+func configureHuma() {
+	configureHumaOnce.Do(func() {
+		// AgentsView uses encoding/json/v2, which encodes nil slices as empty
+		// arrays. Keep Huma's schemas aligned with that wire contract.
+		huma.DefaultArrayNullable = false
 		huma.NewError = func(status int, message string, errs ...error) huma.StatusError {
 			if status == http.StatusUnprocessableEntity {
 				status = http.StatusBadRequest
@@ -88,17 +98,23 @@ func configureHumaErrors() {
 			if strings.Contains(message, "(query.type:") {
 				message = "invalid type: " + message
 			}
-			return &apiErrorResponse{
+			return &apiResponseError{
 				Status:  status,
 				Message: message,
 			}
 		}
 		huma.NewErrorWithContext = func(
-			_ huma.Context,
+			ctx huma.Context,
 			status int,
 			message string,
 			errs ...error,
 		) huma.StatusError {
+			for _, err := range errs {
+				if errors.Is(err, db.ErrWriterClosed) {
+					server, ok := ctx.Context().Value(ctxKeyHumaServer).(*Server)
+					return writerClosedResponse(ctx.AppendHeader, ok && server.archiveStale())
+				}
+			}
 			return huma.NewError(status, message, errs...)
 		}
 	})
@@ -109,6 +125,7 @@ type requestInfo struct {
 	Forwarded  bool
 }
 
+//nolint:recvcheck // Huma discovers Schema on values and mutates parameters through pointers.
 type optionalIntParam struct {
 	Value int
 	IsSet bool
@@ -135,6 +152,8 @@ func optionalIntValue(p optionalIntParam) *int {
 
 // optionalBoolParam distinguishes an omitted query param from an explicit
 // false, so a sort key's canonical direction is used unless ?descending is set.
+//
+//nolint:recvcheck // Huma discovers Schema on values and mutates parameters through pointers.
 type optionalBoolParam struct {
 	Value bool
 	IsSet bool
@@ -159,15 +178,19 @@ func optionalBoolValue(p optionalBoolParam) *bool {
 	return &p.Value
 }
 
-const ctxKeyHumaRequestInfo contextKey = 100
+const (
+	ctxKeyHumaRequestInfo contextKey = 100
+	ctxKeyHumaServer      contextKey = 101
+)
 
-func humaRequestInfoMiddleware(ctx huma.Context, next func(huma.Context)) {
+func (s *Server) humaRequestInfoMiddleware(ctx huma.Context, next func(huma.Context)) {
 	info := requestInfo{
 		RemoteAddr: ctx.RemoteAddr(),
 		Forwarded: ctx.Header("X-Forwarded-For") != "" ||
 			ctx.Header("X-Real-IP") != "" ||
 			ctx.Header("Forwarded") != "",
 	}
+	ctx = huma.WithValue(ctx, ctxKeyHumaServer, s)
 	next(huma.WithValue(ctx, ctxKeyHumaRequestInfo, info))
 }
 
@@ -185,6 +208,10 @@ func isLocalhostContext(ctx context.Context) bool {
 }
 
 func agentsViewSchemaNamer(t reflect.Type, hint string) string {
+	if schemaNamedType(t) == reflect.TypeFor[apiResponseError]() {
+		// Keep the published schema name independent of the Go error type name.
+		return "ApiErrorResponse"
+	}
 	name := huma.DefaultSchemaNamer(t, hint)
 	base := schemaNamedType(t)
 	pkgPath := base.PkgPath()
@@ -218,57 +245,57 @@ func pascalASCII(s string) string {
 	return string(s[0]-('a'-'A')) + s[1:]
 }
 
-func get[I, O any](
-	s *Server, group routeGroup, path, summary string,
+func (s *Server) get[I, O any](
+	group *huma.Group, path, summary string,
 	handler func(context.Context, *I) (*O, error),
 ) {
 	registerRoute(group, http.MethodGet, path, summary, handler, s.humaTimeout())
 }
 
-func getLong[I, O any](
-	_ *Server, group routeGroup, path, summary string,
+func (*Server) getLong[I, O any](
+	group *huma.Group, path, summary string,
 	handler func(context.Context, *I) (*O, error),
 ) {
 	registerRoute(group, http.MethodGet, path, summary, handler)
 }
 
-func post[I, O any](
-	s *Server, group routeGroup, path, summary string,
+func (s *Server) post[I, O any](
+	group *huma.Group, path, summary string,
 	handler func(context.Context, *I) (*O, error),
 ) {
 	registerRoute(group, http.MethodPost, path, summary, handler, s.humaTimeout())
 }
 
-func postLong[I, O any](
-	_ *Server, group routeGroup, path, summary string,
+func (*Server) postLong[I, O any](
+	group *huma.Group, path, summary string,
 	handler func(context.Context, *I) (*O, error),
 ) {
 	registerRoute(group, http.MethodPost, path, summary, handler)
 }
 
-func put[I, O any](
-	s *Server, group routeGroup, path, summary string,
+func (s *Server) put[I, O any](
+	group *huma.Group, path, summary string,
 	handler func(context.Context, *I) (*O, error),
 ) {
 	registerRoute(group, http.MethodPut, path, summary, handler, s.humaTimeout())
 }
 
-func patch[I, O any](
-	s *Server, group routeGroup, path, summary string,
+func (s *Server) patch[I, O any](
+	group *huma.Group, path, summary string,
 	handler func(context.Context, *I) (*O, error),
 ) {
 	registerRoute(group, http.MethodPatch, path, summary, handler, s.humaTimeout())
 }
 
-func deleteRoute[I, O any](
-	s *Server, group routeGroup, path, summary string,
+func (s *Server) deleteRoute[I, O any](
+	group *huma.Group, path, summary string,
 	handler func(context.Context, *I) (*O, error),
 ) {
 	registerRoute(group, http.MethodDelete, path, summary, handler, s.humaTimeout())
 }
 
-func stream[I any](
-	_ *Server, group routeGroup, method, path, summary string,
+func (*Server) stream[I any](
+	group *huma.Group, method, path, summary string,
 	handler func(context.Context, *I) (*huma.StreamResponse, error),
 	options ...func(*huma.Operation),
 ) {
@@ -276,11 +303,17 @@ func stream[I any](
 	registerRoute(group, method, path, summary, handler, routeOptions...)
 }
 
-func raw[I any](
-	_ *Server, group routeGroup, method, path, summary string,
+func (*Server) raw[I any](
+	group *huma.Group, method, path, summary, contentType string,
 	handler func(context.Context, *I) (*bytesOutput, error),
 ) {
-	registerRoute(group, method, path, summary, handler)
+	registerRoute(group, method, path, summary, handler, func(op *huma.Operation) {
+		op.Responses = map[string]*huma.Response{
+			"200": {Description: "OK", Content: map[string]*huma.MediaType{
+				contentType: {Schema: &huma.Schema{Type: "string", Format: "binary"}},
+			}},
+		}
+	})
 }
 
 func operationID(method, path string) string {
@@ -305,13 +338,13 @@ func operationID(method, path string) string {
 	return strings.Trim(b.String(), "-")
 }
 
-func registerRoute[I, O any](
-	group routeGroup, method, path, summary string,
+func registerRoute[I, O any](group *huma.Group,
+	method, path, summary string,
 	handler func(context.Context, *I) (*O, error),
 	options ...func(*huma.Operation),
 ) {
 	op := huma.Operation{
-		OperationID: operationID(method, group.fullPath(path)),
+		OperationID: operationID(method, path),
 		Method:      method,
 		Path:        path,
 		Summary:     summary,
@@ -331,7 +364,13 @@ func registerRoute[I, O any](
 	for _, option := range options {
 		option(&op)
 	}
-	huma.Register(group.api, op, handler)
+	huma.Register(group, op, handler)
+}
+
+func maxBodyBytes(limit int64) func(*huma.Operation) {
+	return func(op *huma.Operation) {
+		op.MaxBodyBytes = limit
+	}
 }
 
 func streamResponse() func(*huma.Operation) {
@@ -417,6 +456,26 @@ func (s *Server) humaTimeout() func(*huma.Operation) {
 	}
 }
 
+func (s *Server) humaReadDeadline(timeout time.Duration) func(*huma.Operation) {
+	return func(op *huma.Operation) {
+		op.Middlewares = append(op.Middlewares, func(ctx huma.Context, next func(huma.Context)) {
+			_, writer := humago.Unwrap(ctx)
+			err := http.NewResponseController(writer).SetReadDeadline(
+				time.Now().Add(timeout),
+			)
+			if err != nil && !errors.Is(err, http.ErrNotSupported) {
+				log.Printf("extending request read deadline: %v", err)
+				_ = huma.WriteErr(
+					s.api, ctx, http.StatusInternalServerError,
+					"Unable to prepare request upload",
+				)
+				return
+			}
+			next(ctx)
+		})
+	}
+}
+
 func handleHumaContextError(err error) error {
 	if errors.Is(err, context.Canceled) {
 		return nil
@@ -443,21 +502,29 @@ func handleHumaReadOnly(err error) error {
 		return apiError(http.StatusNotImplemented, "not available in remote mode")
 	}
 	if errors.Is(err, db.ErrWriterClosed) {
-		return writerClosedError()
+		return err
 	}
 	return nil
 }
 
 // writerClosedError is the 503 + Retry-After response for a write rejected while
 // the archive writer is closed for a maintenance pass.
-func writerClosedError() error {
-	return huma.ErrorWithHeaders(
-		apiError(
-			http.StatusServiceUnavailable,
-			"archive is briefly read-only for a maintenance pass; retry shortly",
-		),
-		http.Header{"Retry-After": []string{writerClosedRetryAfterSeconds}},
-	)
+func writerClosedError(stale bool) error {
+	headers := http.Header{}
+	response := writerClosedResponse(headers.Add, stale)
+	return huma.ErrorWithHeaders(response, headers)
+}
+
+func writerClosedResponse(appendHeader func(string, string), stale bool) *apiResponseError {
+	appendHeader("Retry-After", writerClosedRetryAfterSeconds)
+	message := "archive is briefly read-only for a maintenance pass; retry shortly"
+	if stale {
+		message = "archive is read-only while it rebuilds"
+	}
+	return &apiResponseError{
+		Status:  http.StatusServiceUnavailable,
+		Message: message,
+	}
 }
 
 // rejectWriterClosedWrite fails a write endpoint before its stream body opens
@@ -466,7 +533,7 @@ func writerClosedError() error {
 // 500 (mirrors the push handlers' pre-stream gate).
 func (s *Server) rejectWriterClosedWrite() error {
 	if local, ok := s.db.(*db.DB); ok && local.WriterClosed() {
-		return writerClosedError()
+		return writerClosedError(s.archiveStale())
 	}
 	return nil
 }
@@ -474,26 +541,53 @@ func (s *Server) rejectWriterClosedWrite() error {
 // serializeArchiveWrite runs work under the daemon engine's exclusive lock —
 // the same mutex a worker pass holds while the writer is closed — so a write
 // that passed the pre-stream writer gate cannot race a maintenance pass
-// closing the writer mid-operation. Servers without a daemon engine have no
-// worker passes to serialize with, so work runs directly.
-func (s *Server) serializeArchiveWrite(work func() error) error {
+// closing the writer mid-operation. Local servers without a daemon engine
+// share the on-demand sync engine's lock.
+func (s *Server) serializeArchiveWrite(ctx context.Context, work func() error) error {
 	if s.engine != nil {
 		return s.engine.RunExclusive(work)
+	}
+	if local, ok := s.db.(*db.DB); ok {
+		return s.syncEngineForLocal(ctx, local).RunExclusive(work)
+	}
+	return work()
+}
+
+// tryArchiveWrite runs user-triggered archive maintenance under the daemon
+// engine's exclusive lock without waiting for it, which is the barrier
+// newForegroundCompactRunner puts compaction behind. Background work keeps
+// serializeArchiveWrite so scheduled obligations are not lost. Local servers
+// without a daemon engine share the on-demand sync engine's lock.
+func (s *Server) tryArchiveWrite(ctx context.Context, work func() error) error {
+	if s.engine != nil {
+		return s.engine.TryRunExclusive(work)
+	}
+	if local, ok := s.db.(*db.DB); ok {
+		return s.syncEngineForLocal(ctx, local).TryRunExclusive(work)
 	}
 	return work()
 }
 
 func serverError(err error) error {
+	if handled := hostedIdentityHTTPError(err); handled != nil {
+		return handled
+	}
 	if errors.Is(err, context.Canceled) {
 		return nil
 	}
 	if handled := handleHumaContextError(err); handled != nil {
 		return handled
 	}
+	if errors.Is(err, db.ErrWriterClosed) {
+		return err
+	}
 	return apiError(http.StatusInternalServerError, err.Error())
 }
 
 func internalError(logPrefix string, err error) error {
+	if handled := hostedIdentityHTTPError(err); handled != nil {
+		return handled
+	}
 	if errors.Is(err, context.Canceled) {
 		return nil
 	}
@@ -502,6 +596,9 @@ func internalError(logPrefix string, err error) error {
 	}
 	if err != nil {
 		log.Printf("%s: %v", logPrefix, err)
+	}
+	if errors.Is(err, db.ErrWriterClosed) {
+		return err
 	}
 	return apiError(http.StatusInternalServerError, "internal error")
 }
@@ -562,5 +659,25 @@ func writeHumaJSON(ctx huma.Context, status int, value any) {
 }
 
 func sjson(w io.Writer, value any) error {
-	return json.NewEncoder(w).Encode(value)
+	return json.MarshalEncode(jsontext.NewEncoder(w), value)
+}
+
+// handleHTTP registers handlers that own streaming and response serialization
+// through the same Huma adapter as the typed API operations.
+func (s *Server) handleHTTP(op *huma.Operation, handler http.HandlerFunc) {
+	s.api.Adapter().Handle(op, func(ctx huma.Context) {
+		r, w := humago.Unwrap(ctx)
+		handler(w, r)
+	})
+}
+
+func hostedIdentityHTTPError(err error) error {
+	if identity, ok := errors.AsType[*db.SessionIdentityError](err); ok {
+		status := http.StatusNotFound
+		if identity.State == "ambiguous" {
+			status = http.StatusConflict
+		}
+		return &apiResponseError{Status: status, Message: identity.Error(), IdentityState: identity.State, Variants: identity.Variants}
+	}
+	return nil
 }

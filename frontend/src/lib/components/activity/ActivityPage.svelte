@@ -1,5 +1,5 @@
 <script lang="ts">
-  import { m } from "../../i18n/index.js";
+  import { formatDateTime, m } from "../../i18n/index.js";
   import { onMount, untrack } from "svelte";
   import {
     activity,
@@ -8,6 +8,7 @@
   } from "../../stores/activity.svelte.js";
   import type { ActivityReportProgress } from "../../api/activity-report.js";
   import { sync } from "../../stores/sync.svelte.js";
+  import { sessions } from "../../stores/sessions.svelte.js";
   import { router } from "../../stores/router.svelte.js";
   import {
     yokedDates,
@@ -33,6 +34,7 @@
   import ConcurrencyTimeline from "./ConcurrencyTimeline.svelte";
   import SessionsTable from "./SessionsTable.svelte";
   import Breakdowns from "./Breakdowns.svelte";
+  import { shortenId } from "../../utils/shortId.js";
   import ActivityInsight from "./ActivityInsight.svelte";
 
   // Date-only (local) bounds for the inline insight panel, derived from the
@@ -49,38 +51,63 @@
       ? localDateStr(new Date(new Date(activity.report.range_end).getTime() - 1))
       : "",
   );
+  // The report's last data point while its period is still in progress, in the
+  // report's timezone so it matches the timeline clock labels.
+  const inProgressAsOf = $derived.by(() => {
+    const report = activity.report;
+    if (!report?.partial || !report.as_of) return "";
+    const d = new Date(report.as_of);
+    if (Number.isNaN(d.getTime())) return "";
+    return formatDateTime(d, {
+      hour: "2-digit",
+      minute: "2-digit",
+      hourCycle: "h23",
+      timeZone: report.timezone,
+    });
+  });
   const activityPanelDate = $derived(currentActivityPanelDate());
   const activityDateSignature = $derived(dateSignature(activityPanelDate));
   let activityYokeReady = $state(false);
   let lastActivityDateSignature = "";
 
-  // Page-local drill-down: clicking a Concurrency bucket filters the sessions
-  // table to the sessions active in that slot. Deliberately not URL-synced — it
-  // is a transient selection that resets whenever the report reloads.
-  let slotFilter = $state<{
-    idx: number;
+  // Page-local drill-down: dragging across Concurrency buckets filters the
+  // sessions table to sessions active anywhere in that range. Deliberately not
+  // URL-synced; it is a transient selection that resets when the report reloads.
+  let rangeFilter = $state<{
+    start: number;
+    end: number;
     label: string;
   } | null>(null);
-  let slotReportGeneration = -1;
+  let rangeReportGeneration = -1;
 
   // Every successful full-report load gets fresh buckets and sessions, even
   // when its deterministic report_id is unchanged. Clear any slot membership
   // captured against the previous generation.
   $effect(() => {
     const generation = activity.reportGeneration;
-    if (generation !== slotReportGeneration) {
-      slotReportGeneration = generation;
-      slotFilter = null;
+    if (generation !== rangeReportGeneration) {
+      rangeReportGeneration = generation;
+      rangeFilter = null;
     }
   });
 
-  async function selectBucket(sel: { idx: number; label: string } | null) {
+  // The last sessions request the user started: a time range, a sort, or the
+  // next page. Retry repeats it, so a failed sort or range change is retried
+  // instead of loading the next page of the list still on screen.
+  let retrySessions: (() => void) | null = null;
+
+  async function selectRange(
+    sel: { start: number; end: number; label: string } | null,
+  ) {
+    retrySessions = () => void selectRange(sel);
     const generation = activity.reportGeneration;
     if (
-      await activity.loadSessionPage({ bucket: sel?.idx ?? null })
+      await activity.loadSessionPage({
+        bucketRange: sel ? { start: sel.start, end: sel.end } : null,
+      })
       && activity.reportGeneration === generation
     ) {
-      slotFilter = sel;
+      rangeFilter = sel;
     }
   }
 
@@ -88,7 +115,13 @@
     sort: import("../../api/activity-report.js").ActivitySessionSort,
     direction: "asc" | "desc",
   ) {
+    retrySessions = () => void sortSessions(sort, direction);
     await activity.loadSessionPage({ sort, direction });
+  }
+
+  function loadMoreSessions(cursor: string) {
+    retrySessions = () => loadMoreSessions(cursor);
+    void activity.loadSessionPage({ cursor });
   }
 
   function reportProgressLabel(progress: ActivityReportProgress | null): string {
@@ -111,6 +144,15 @@
   const refreshStatus = $derived(
     activity.loading ? reportProgressLabel(activity.progress) : undefined,
   );
+  // Every progress label at its widest, so the refresh label box fits them
+  // with the running duration after them.
+  const refreshStatusSamples = [
+    m.activity_loading_report(),
+    m.activity_loading_sessions(),
+    m.activity_loading_usage(),
+    m.activity_report_progress({ count: 9_999_999 }),
+    m.activity_finalizing_report(),
+  ];
 
   const earliestSession = $derived(sync.stats?.earliest_session ?? null);
   let today = $state(localDateStr(new Date()));
@@ -143,18 +185,34 @@
       count: agent.session_count,
     })),
   ]);
-  const machineOptions = $derived.by((): TypeaheadOption[] => [
-    {
-      name: "",
-      label: m.activity_all_machines(),
-      displayLabel: m.activity_all_machines(),
-    },
-    ...activity.machines.map((machine) => ({
-      name: machine,
-      label: machine,
-      displayLabel: machine,
-    })),
-  ]);
+  // Machines sharing a friendly label get a short ID fragment so they stay
+  // distinguishable. Full IDs are non-shrinking meta and would squeeze the
+  // label to zero width in the compact menu, so unique labels get no meta.
+  const machineOptions = $derived.by((): TypeaheadOption[] => {
+    const byLabel = new Map<string, string[]>();
+    for (const machine of activity.machines) {
+      const label = sessions.machineLabel(machine);
+      byLabel.set(label, [...(byLabel.get(label) ?? []), machine]);
+    }
+    return [
+      {
+        name: "",
+        label: m.activity_all_machines(),
+        displayLabel: m.activity_all_machines(),
+      },
+      ...activity.machines.map((machine) => {
+        const label = sessions.machineLabel(machine);
+        const peers = byLabel.get(label) ?? [];
+        const shortId = peers.length > 1 ? shortenId(machine, peers) : undefined;
+        return {
+          name: machine,
+          label,
+          displayLabel: shortId ? `${label} (${shortId})` : label,
+          meta: shortId,
+        };
+      }),
+    ];
+  });
   const automationOptions: TypeaheadOption[] = $derived([
     {
       name: "all",
@@ -407,12 +465,22 @@
     <div class="activity-refresh" aria-live="polite">
       <RefreshControl
         lastUpdatedAt={activity.lastUpdatedAt}
+        queryDurationMs={activity.lastQueryDurationMs}
+        querySteps={activity.lastQuerySteps}
+        liveQuery={activity.liveQuery}
         busy={activity.loading}
         status={refreshStatus}
+        statusWidthSamples={refreshStatusSamples}
         onRefresh={() => activity.load({ background: true })}
         label={m.activity_refresh()}
       />
     </div>
+
+    {#if inProgressAsOf}
+      <div class="activity-partial-note">
+        {m.activity_in_progress_as_of({ time: inProgressAsOf })}
+      </div>
+    {/if}
   </div>
 
   <div class="activity-content">
@@ -426,22 +494,24 @@
       <Card level="default" padding="none" class="chart-panel">
         <ConcurrencyTimeline
           report={activity.report}
-          selectedBucket={slotFilter?.idx ?? null}
-          onSelectBucket={selectBucket}
+          selectedRange={rangeFilter}
+          onSelectRange={selectRange}
         />
       </Card>
       <Card level="default" padding="none" class="chart-panel">
         <SessionsTable
           report={activity.report}
-          filterActive={slotFilter !== null}
-          filterLabel={slotFilter?.label ?? ""}
+          filterActive={rangeFilter !== null}
+          filterLabel={rangeFilter?.label ?? ""}
           loading={activity.sessionsLoading}
           error={activity.sessionsError}
           sortKey={activity.sessionsSort}
           sortDir={activity.sessionsDirection}
-          onClearFilter={() => selectBucket(null)}
+          listVersion={activity.sessionsListVersion}
+          onClearFilter={() => selectRange(null)}
           onSort={sortSessions}
-          onNext={(cursor) => activity.loadSessionPage({ cursor })}
+          onLoadMore={loadMoreSessions}
+          onRetry={() => retrySessions?.()}
         />
       </Card>
       <Card level="default" padding="none" class="chart-panel">
@@ -508,30 +578,21 @@
     --typeahead-max-width: 150px;
   }
 
-  /* The refresh control always owns the same toolbar footprint. Progress
-     replaces its age label inside this box, so phase and row-count updates
-     cannot reflow the filters or report body. */
+  /* The control reserves its own text widths (see shared/RefreshControl),
+   * so it needs no clamp here: the age box clips a long progress status
+   * instead of pushing the toolbar around. */
   .activity-refresh {
-    flex: 0 0 220px;
-    width: 220px;
+    flex: 0 0 auto;
     max-width: 100%;
     min-width: 0;
-    overflow: hidden;
   }
 
-  .activity-refresh :global(.kit-refresh-control) {
-    width: 100%;
-    min-width: 0;
-  }
-
-  .activity-refresh :global(.kit-refresh-control__status) {
-    min-width: 0;
-    overflow: hidden;
-  }
-
-  .activity-refresh :global(.kit-refresh-control__status span) {
-    overflow: hidden;
-    text-overflow: ellipsis;
+  /* Pinned to the right end of the toolbar, or of the wrapped last row. */
+  .activity-partial-note {
+    margin-left: auto;
+    font-size: 11px;
+    color: var(--accent-amber);
+    white-space: nowrap;
   }
 
   .activity-content {

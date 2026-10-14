@@ -1,23 +1,25 @@
-import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
+import { afterEach, beforeEach, describe, expect, it, vi } from "vite-plus/test";
 import { mount, tick, unmount } from "svelte";
 import UsagePairwiseComparisonPanel from "./UsagePairwiseComparisonPanel.svelte";
 import { usage } from "../../stores/usage.svelte.js";
 import type {
-  UsagePairwiseComparisonResponse,
+  ServiceUsagePairwiseComparisonResponse,
   UsageSummaryResponse,
-} from "../../api/types/usage.js";
+} from "../../api/generated/index";
 import { testMoney } from "../../test/money.js";
 
 function usageSummary(): UsageSummaryResponse {
   return {
     from: "2024-01-01",
     to: "2024-01-31",
+    projects: {},
     totals: {
       inputTokens: 400,
       outputTokens: 200,
       cacheCreationTokens: 0,
       cacheReadTokens: 0,
       totalCost: testMoney(99.99),
+      cacheSavings: testMoney(0),
     },
     daily: [],
     projectTotals: [
@@ -75,7 +77,7 @@ function usageSummary(): UsageSummaryResponse {
   };
 }
 
-function pairwiseComparison(): UsagePairwiseComparisonResponse {
+function pairwiseComparison(): ServiceUsagePairwiseComparisonResponse {
   return {
     left: {
       totalCost: testMoney(4),
@@ -144,12 +146,7 @@ describe("UsagePairwiseComparisonPanel", () => {
     usage.loading.pairwise = false;
     usage.errors.pairwise = null;
     usage.mode = "cost";
-    usage.setSelectedTokenTypes([
-      "input",
-      "cache_write",
-      "cache_read",
-      "output",
-    ]);
+    usage.setSelectedTokenTypes(["input", "cache_write", "cache_read", "output"]);
     document.body.innerHTML = "";
     vi.restoreAllMocks();
   });
@@ -162,16 +159,16 @@ describe("UsagePairwiseComparisonPanel", () => {
     await tick();
 
     const trigger = document.querySelector<HTMLButtonElement>(
-      'button[aria-label="Left comparison dimension"]',
+      'button[aria-label^="Left comparison dimension:"]',
     );
     expect(trigger).toBeTruthy();
     if (!trigger) return;
     trigger.click();
     await tick();
 
-    const option = Array.from(
-      document.querySelectorAll<HTMLLIElement>('li[role="option"]'),
-    ).find((item) => item.textContent?.includes("Project"));
+    const option = Array.from(document.querySelectorAll<HTMLLIElement>('li[role="option"]')).find(
+      (item) => item.textContent?.includes("Project"),
+    );
     expect(option).toBeTruthy();
     option?.dispatchEvent(new MouseEvent("mousedown", { bubbles: true }));
     await tick();
@@ -227,16 +224,30 @@ describe("UsagePairwiseComparisonPanel", () => {
     await tick();
 
     const firstRow = document.querySelector("tbody tr");
-    const cells = Array.from(
-      firstRow?.querySelectorAll("th, td") ?? [],
-    ).map((cell) => cell.textContent?.replace(/\s+/g, " ").trim());
-    expect(cells).toEqual([
-      "Total Tokens",
-      "100",
-      "50",
-      "-50 -50.0%",
-    ]);
+    const cells = Array.from(firstRow?.querySelectorAll("th, td") ?? []).map((cell) =>
+      cell.textContent?.replace(/\s+/g, " ").trim(),
+    );
+    expect(cells).toEqual(["Total Tokens", "100", "50", "-50 -50.0%"]);
 
     unmount(component);
   });
+
+  it.each(["cost", "token"] as const)(
+    "labels the input row as uncached input in %s mode",
+    async (mode) => {
+      usage.mode = mode;
+      const component = mount(UsagePairwiseComparisonPanel, {
+        target: document.body,
+      });
+      await tick();
+
+      const headers = Array.from(document.querySelectorAll("tbody th")).map((cell) =>
+        cell.textContent?.trim(),
+      );
+      expect(headers).toContain("Uncached Input");
+      expect(headers).not.toContain("Input Tokens");
+
+      unmount(component);
+    },
+  );
 });

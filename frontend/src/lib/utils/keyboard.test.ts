@@ -5,11 +5,17 @@ import { sessions } from "../stores/sessions.svelte.js";
 import { starred } from "../stores/starred.svelte.js";
 import { router } from "../stores/router.svelte.js";
 import { messages } from "../stores/messages.svelte.js";
-import { SessionsService } from "../api/generated/index";
+import { sync } from "../stores/sync.svelte.js";
+import { inSessionSearch } from "../stores/inSessionSearch.svelte.js";
+import { SessionsService, SyncService } from "../api/generated/index";
 import { copyToClipboard } from "../utils/clipboard.js";
 import AppHeader from "../components/layout/AppHeader.svelte";
 import SidebarToggleButton from "../components/layout/SidebarToggleButton.svelte";
 import { registerShortcuts } from "./keyboard.js";
+import { registerSessionList } from "./arrow-target.js";
+import { reportTelemetry } from "./telemetry.js";
+
+vi.mock("./telemetry.js", () => ({ reportTelemetry: vi.fn() }));
 
 vi.mock("../utils/clipboard.js", () => ({
   copyToClipboard: vi.fn().mockResolvedValue(true),
@@ -24,10 +30,22 @@ function fireKey(key: string, opts: Partial<KeyboardEventInit> = {}) {
   document.dispatchEvent(event);
 }
 
+function fireCancelableKey(key: string, opts: Partial<KeyboardEventInit> = {}) {
+  const event = new KeyboardEvent("keydown", {
+    key,
+    bubbles: true,
+    cancelable: true,
+    ...opts,
+  });
+  document.dispatchEvent(event);
+  return event;
+}
+
 describe("registerShortcuts", () => {
   let cleanup: () => void;
   let navigateMessage: (delta: number) => void;
   let navigateUserPrompt: (delta: number) => void;
+  let detachSessionList: (() => void) | undefined;
 
   beforeEach(() => {
     ui.activeModal = null;
@@ -41,10 +59,92 @@ describe("registerShortcuts", () => {
     navigateMessage = vi.fn();
     navigateUserPrompt = vi.fn();
     cleanup = registerShortcuts({ navigateMessage, navigateUserPrompt });
+    detachSessionList = undefined;
   });
 
   afterEach(() => {
     cleanup();
+    detachSessionList?.();
+    document.body.innerHTML = "";
+    vi.restoreAllMocks();
+    vi.clearAllMocks();
+  });
+
+  it("hides sync and ignores r for an archive-only server", async () => {
+    sync.serverVersion = { archive_only: true } as NonNullable<typeof sync.serverVersion>;
+    const request = vi.spyOn(SyncService, "postApiV1Sync");
+    const header = mount(AppHeader, { target: document.body });
+    try {
+      await tick();
+      expect(document.querySelector(".sync-btn")).toBeNull();
+      fireKey("r");
+      expect(request).not.toHaveBeenCalled();
+      expect(sync.syncing).toBe(false);
+    } finally {
+      unmount(header);
+      sync.serverVersion = null;
+    }
+  });
+
+  describe("remote c copy", () => {
+    it.each([
+      ["claude", false, "cd '/remote/project' && claude --resume abc-123"],
+      ["claude", true, "claude --resume abc-123"],
+      ["cursor", false, "cd '/remote/project' && cursor agent --resume abc-123"],
+      ["cursor", true, null],
+      ["unknown", false, null],
+    ] as const)("%s fallback=%s", async (agent, fallback, expected) => {
+      const id = `devbox1~${agent}:abc-123`;
+      sessions.sessions = [
+        {
+          compaction_count: 0,
+          consecutive_failure_max: 0,
+          edit_churn_count: 0,
+          ended_with_role: "",
+          final_failure_streak: 0,
+          has_peak_context_tokens: false,
+          has_total_output_tokens: false,
+          mid_task_compaction_count: 0,
+          outcome: "",
+          outcome_confidence: "",
+          secret_leak_count: 0,
+          tool_failure_signal_count: 0,
+          tool_retry_count: 0,
+          id,
+          agent,
+          project: "remote-project",
+          machine: "devbox1",
+          first_message: null,
+          started_at: null,
+          ended_at: null,
+          message_count: 1,
+          user_message_count: 1,
+          total_output_tokens: 0,
+          peak_context_tokens: 0,
+          is_automated: false,
+          created_at: "2026-01-01T00:00:00Z",
+        },
+      ];
+      sessions.activeSessionId = id;
+      const resume = vi.spyOn(SessionsService, "postApiV1SessionsByIdResume");
+      if (fallback) resume.mockRejectedValue(new Error("offline"));
+      else
+        resume.mockResolvedValue({
+          launched: false,
+          command:
+            agent === "cursor"
+              ? "cursor agent --resume abc-123"
+              : "cd '/remote/project' && claude --resume abc-123",
+          cwd: "/remote/project",
+        });
+      fireKey("c");
+      await Promise.resolve();
+      await Promise.resolve();
+      if (agent === "unknown") expect(resume).not.toHaveBeenCalled();
+      else expect(resume).toHaveBeenCalledExactlyOnceWith({ id }, { command_only: true });
+      if (expected) expect(copyToClipboard).toHaveBeenCalledExactlyOnceWith(expected);
+      else expect(copyToClipboard).not.toHaveBeenCalled();
+    });
   });
 
   describe("Cmd+K modal toggle", () => {
@@ -74,12 +174,6 @@ describe("registerShortcuts", () => {
   });
 
   describe("Escape handling", () => {
-    it("should close active modal on Escape", () => {
-      ui.activeModal = "commandPalette";
-      fireKey("Escape");
-      expect(ui.activeModal).toBeNull();
-    });
-
     it("should close shortcuts modal on Escape", () => {
       ui.activeModal = "shortcuts";
       fireKey("Escape");
@@ -99,7 +193,7 @@ describe("registerShortcuts", () => {
     });
 
     it("should prioritize closing modal over deselecting session", () => {
-      ui.activeModal = "commandPalette";
+      ui.activeModal = "shortcuts";
       sessions.activeSessionId = "s1";
 
       fireKey("Escape");
@@ -140,6 +234,192 @@ describe("registerShortcuts", () => {
       ui.activeModal = "commandPalette";
       fireKey("J", { shiftKey: true });
       expect(navigateUserPrompt).not.toHaveBeenCalled();
+    });
+  });
+
+  describe("arrow target", () => {
+    function mountSessionList(
+      navigate = (delta: number) =>
+        sessions.navigateSession(
+          delta,
+          starred.filterOnly ? (session) => starred.isStarred(session.id) : undefined,
+        ),
+    ) {
+      const list = document.createElement("div");
+      list.className = "session-list-scroll";
+      document.body.appendChild(list);
+      detachSessionList = registerSessionList(list, navigate);
+      return list;
+    }
+
+    it("navigates sessions up and down in the registered list", () => {
+      const list = mountSessionList();
+      sessions.sessions = [{ id: "s1" } as any, { id: "s2" } as any];
+      sessions.activeSessionId = "s1";
+      const row = document.createElement("button");
+      list.appendChild(row);
+      row.focus();
+      fireKey("ArrowDown");
+      expect(sessions.activeSessionId).toBe("s2");
+      fireKey("ArrowUp");
+      expect(sessions.activeSessionId).toBe("s1");
+      expect(navigateMessage).not.toHaveBeenCalled();
+    });
+
+    it("switches panes after deliberate pointer interaction, not hover", () => {
+      const navigateSessions = vi.fn();
+      const list = mountSessionList(navigateSessions);
+      const row = document.createElement("button");
+      list.appendChild(row);
+      row.focus();
+
+      fireKey("ArrowDown");
+      expect(navigateSessions).toHaveBeenCalledWith(1);
+
+      const message = document.createElement("div");
+      message.className = "message-list-scroll";
+      document.body.appendChild(message);
+      message.dispatchEvent(new Event("pointermove", { bubbles: true }));
+      fireKey("ArrowDown");
+      expect(navigateSessions).toHaveBeenCalledTimes(2);
+      expect(navigateMessage).not.toHaveBeenCalled();
+
+      message.dispatchEvent(new Event("pointerdown", { bubbles: true }));
+      expect(document.activeElement).toBe(row);
+
+      fireKey("ArrowDown");
+      expect(navigateSessions).toHaveBeenCalledTimes(2);
+      expect(navigateMessage).toHaveBeenCalledWith(1);
+
+      const unrelated = document.createElement("button");
+      document.body.appendChild(unrelated);
+      row.dispatchEvent(new Event("pointerdown", { bubbles: true }));
+      unrelated.dispatchEvent(new Event("pointerdown", { bubbles: true }));
+      fireKey("ArrowDown");
+      expect(navigateSessions).toHaveBeenCalledTimes(3);
+      expect(navigateMessage).toHaveBeenCalledTimes(1);
+    });
+
+    it("uses session navigation after a sidebar control interaction", () => {
+      const navigateSessions = vi.fn();
+      const sidebar = document.createElement("aside");
+      sidebar.id = "session-sidebar";
+      const filter = document.createElement("button");
+      sidebar.appendChild(filter);
+      document.body.appendChild(sidebar);
+      const list = mountSessionList(navigateSessions);
+      sidebar.appendChild(list);
+
+      const messagePane = document.createElement("div");
+      messagePane.className = "message-list-scroll";
+      document.body.appendChild(messagePane);
+      messagePane.dispatchEvent(new Event("pointerdown", { bubbles: true }));
+      filter.dispatchEvent(new Event("pointerdown", { bubbles: true }));
+
+      fireKey("ArrowDown");
+
+      expect(navigateSessions).toHaveBeenCalledWith(1);
+      expect(navigateMessage).not.toHaveBeenCalled();
+    });
+
+    it("keeps arrow navigation within the starred-only list", () => {
+      const list = mountSessionList();
+      sessions.sessions = [{ id: "s1" } as any, { id: "s2" } as any, { id: "s3" } as any];
+      sessions.activeSessionId = "s1";
+      starred.filterOnly = true;
+      starred.ids = new Set(["s1", "s3"]);
+      const row = document.createElement("button");
+      list.appendChild(row);
+      row.focus();
+
+      fireKey("ArrowDown");
+      expect(sessions.activeSessionId).toBe("s3");
+      fireKey("ArrowUp");
+      expect(sessions.activeSessionId).toBe("s1");
+      expect(navigateMessage).not.toHaveBeenCalled();
+    });
+
+    it.each([
+      ["direct/root", {}],
+      ["subagent", { relationship_type: "subagent" }],
+      ["forked child", { parent_session_id: "root", relationship_type: "fork" }],
+      ["continuation", { parent_session_id: "root", relationship_type: "continuation" }],
+      ["imported", { agent: "imported-agent" }],
+      ["soft-deleted", { deleted_at: "2026-08-01T00:00:00Z" }],
+      ["tombstoned", { tombstoned: true }],
+    ])("preserves arrow routing for the %s Session lineage variant", (_name, variant) => {
+      const list = mountSessionList();
+      sessions.sessions = [{ id: "root" } as any, { id: "variant", ...variant } as any];
+      sessions.activeSessionId = "root";
+      const row = document.createElement("button");
+      list.appendChild(row);
+      row.focus();
+
+      fireKey("ArrowDown");
+
+      expect(sessions.activeSessionId).toBe("variant");
+      expect(navigateMessage).not.toHaveBeenCalled();
+    });
+
+    it("keeps message fallback and native vetoes", () => {
+      const list = mountSessionList();
+      list.appendChild(document.createElement("button"));
+      fireKey("ArrowDown");
+      expect(navigateMessage).toHaveBeenCalledWith(1);
+
+      const input = document.createElement("input");
+      list.appendChild(input);
+      input.focus();
+      fireKey("ArrowDown");
+      expect(navigateMessage).toHaveBeenCalledTimes(1);
+      expect(sessions.activeSessionId).toBeNull();
+    });
+
+    it("does not route arrows from a dialog through the message fallback", () => {
+      const list = mountSessionList();
+      const dialog = document.createElement("div");
+      dialog.setAttribute("role", "dialog");
+      const button = document.createElement("button");
+      dialog.appendChild(button);
+      list.appendChild(dialog);
+      button.focus();
+
+      fireKey("ArrowDown");
+
+      expect(navigateMessage).not.toHaveBeenCalled();
+      expect(sessions.activeSessionId).toBeNull();
+    });
+
+    it("clears the list route when the component disconnects", () => {
+      const list = mountSessionList();
+      list.remove();
+      fireKey("ArrowDown");
+      expect(navigateMessage).toHaveBeenCalledWith(1);
+    });
+
+    it("routes arrows to messages after mobile auto-close hides the sidebar", () => {
+      const navigateSessions = vi.fn();
+      const sidebar = document.createElement("aside");
+      document.body.appendChild(sidebar);
+      const list = mountSessionList(navigateSessions);
+      sidebar.appendChild(list);
+      list.dispatchEvent(new Event("pointerdown", { bubbles: true }));
+
+      sidebar.style.display = "none";
+      fireKey("ArrowDown");
+
+      expect(navigateSessions).not.toHaveBeenCalled();
+      expect(navigateMessage).toHaveBeenCalledWith(1);
+    });
+
+    it("clears the list route when registration is unregistered", () => {
+      const list = mountSessionList();
+      detachSessionList?.();
+      detachSessionList = undefined;
+      list.appendChild(document.createElement("button"));
+      fireKey("ArrowDown");
+      expect(navigateMessage).toHaveBeenCalledWith(1);
+      expect(sessions.activeSessionId).toBeNull();
     });
   });
 
@@ -250,6 +530,19 @@ describe("registerShortcuts", () => {
   describe("[ ] with starred-only filter", () => {
     function makeSession(id: string) {
       return {
+        compaction_count: 0,
+        consecutive_failure_max: 0,
+        edit_churn_count: 0,
+        ended_with_role: "",
+        final_failure_streak: 0,
+        has_peak_context_tokens: false,
+        has_total_output_tokens: false,
+        mid_task_compaction_count: 0,
+        outcome: "",
+        outcome_confidence: "",
+        secret_leak_count: 0,
+        tool_failure_signal_count: 0,
+        tool_retry_count: 0,
         id,
         project: "proj",
         machine: "local",
@@ -449,6 +742,19 @@ describe("registerShortcuts", () => {
 
   it("pins the active session model in the resume fallback", async () => {
     const session = {
+      compaction_count: 0,
+      consecutive_failure_max: 0,
+      edit_churn_count: 0,
+      ended_with_role: "",
+      final_failure_streak: 0,
+      has_peak_context_tokens: false,
+      has_total_output_tokens: false,
+      mid_task_compaction_count: 0,
+      outcome: "",
+      outcome_confidence: "",
+      secret_leak_count: 0,
+      tool_failure_signal_count: 0,
+      tool_retry_count: 0,
       id: "run:keyboard-session",
       project: "proj",
       machine: "local",
@@ -488,7 +794,7 @@ describe("registerShortcuts", () => {
         is_system: false,
       },
     ];
-    vi.spyOn(SessionsService, "postApiV1SessionsIdResume").mockRejectedValue(
+    vi.spyOn(SessionsService, "postApiV1SessionsByIdResume").mockRejectedValue(
       new Error("backend unavailable"),
     );
 
@@ -503,6 +809,19 @@ describe("registerShortcuts", () => {
 
   it("keeps successful backend resume commands authoritative", async () => {
     const session = {
+      compaction_count: 0,
+      consecutive_failure_max: 0,
+      edit_churn_count: 0,
+      ended_with_role: "",
+      final_failure_streak: 0,
+      has_peak_context_tokens: false,
+      has_total_output_tokens: false,
+      mid_task_compaction_count: 0,
+      outcome: "",
+      outcome_confidence: "",
+      secret_leak_count: 0,
+      tool_failure_signal_count: 0,
+      tool_retry_count: 0,
       id: "run:keyboard-session",
       project: "proj",
       machine: "local",
@@ -541,7 +860,7 @@ describe("registerShortcuts", () => {
         is_system: false,
       },
     ];
-    vi.spyOn(SessionsService, "postApiV1SessionsIdResume").mockResolvedValue({
+    vi.spyOn(SessionsService, "postApiV1SessionsByIdResume").mockResolvedValue({
       launched: false,
       command: "claude --resume run:keyboard-session",
       cwd: "/tmp/project",
@@ -556,6 +875,19 @@ describe("registerShortcuts", () => {
 
   it("does not pin a partial-history model in the resume fallback", async () => {
     const session = {
+      compaction_count: 0,
+      consecutive_failure_max: 0,
+      edit_churn_count: 0,
+      ended_with_role: "",
+      final_failure_streak: 0,
+      has_peak_context_tokens: false,
+      has_total_output_tokens: false,
+      mid_task_compaction_count: 0,
+      outcome: "",
+      outcome_confidence: "",
+      secret_leak_count: 0,
+      tool_failure_signal_count: 0,
+      tool_retry_count: 0,
       id: "run:keyboard-session",
       project: "proj",
       machine: "local",
@@ -595,7 +927,7 @@ describe("registerShortcuts", () => {
       },
     ];
     messages.hasOlder = true;
-    vi.spyOn(SessionsService, "postApiV1SessionsIdResume").mockRejectedValue(
+    vi.spyOn(SessionsService, "postApiV1SessionsByIdResume").mockRejectedValue(
       new Error("backend unavailable"),
     );
 
@@ -608,6 +940,19 @@ describe("registerShortcuts", () => {
 
   it("does not pin a reloading stable model in the resume fallback", async () => {
     const session = {
+      compaction_count: 0,
+      consecutive_failure_max: 0,
+      edit_churn_count: 0,
+      ended_with_role: "",
+      final_failure_streak: 0,
+      has_peak_context_tokens: false,
+      has_total_output_tokens: false,
+      mid_task_compaction_count: 0,
+      outcome: "",
+      outcome_confidence: "",
+      secret_leak_count: 0,
+      tool_failure_signal_count: 0,
+      tool_retry_count: 0,
       id: "run:keyboard-session",
       project: "proj",
       machine: "local",
@@ -615,7 +960,7 @@ describe("registerShortcuts", () => {
       first_message: null,
       started_at: null,
       ended_at: null,
-      message_count: 3001,
+      message_count: 1,
       user_message_count: 1,
       total_output_tokens: 0,
       peak_context_tokens: 0,
@@ -624,10 +969,37 @@ describe("registerShortcuts", () => {
     };
     sessions.sessions = [session];
     sessions.activeSessionId = session.id;
-    messages.sessionId = session.id;
+    vi.mocked(vi.spyOn(SessionsService, "getApiV1SessionsById"), {
+      partial: true,
+    }).mockResolvedValueOnce(session);
+    vi.spyOn(SessionsService, "getApiV1SessionsByIdMessages").mockResolvedValueOnce({
+      messages: [
+        {
+          id: 1,
+          session_id: session.id,
+          ordinal: 0,
+          role: "assistant",
+          content: "answer",
+          timestamp: "",
+          has_thinking: false,
+          thinking_text: "",
+          has_tool_use: false,
+          content_length: 6,
+          model: "claude sonnet",
+          token_usage: null,
+          context_tokens: 0,
+          output_tokens: 0,
+          has_context_tokens: false,
+          has_output_tokens: false,
+          is_system: false,
+        },
+      ],
+      count: 1,
+    });
+    await messages.loadSession(session.id);
     messages.loading = true;
-    (messages as any)._stableMainModel = "claude sonnet";
-    vi.spyOn(SessionsService, "postApiV1SessionsIdResume").mockRejectedValue(
+    expect(messages.mainModel).toBe("claude sonnet");
+    vi.spyOn(SessionsService, "postApiV1SessionsByIdResume").mockRejectedValue(
       new Error("backend unavailable"),
     );
 
@@ -636,5 +1008,137 @@ describe("registerShortcuts", () => {
       expect(copyToClipboard).toHaveBeenCalledWith("claude --resume 'run:keyboard-session'");
     });
     messages.clear();
+  });
+});
+
+describe("go to session shortcut", () => {
+  let cleanup: () => void;
+
+  beforeEach(() => {
+    ui.activeModal = null;
+    router.route = "quality";
+    inSessionSearch.close();
+    cleanup = registerShortcuts({ navigateMessage: vi.fn(), navigateUserPrompt: vi.fn() });
+  });
+
+  afterEach(() => {
+    cleanup();
+    inSessionSearch.close();
+    ui.activeModal = null;
+    router.route = "sessions";
+    document.body.innerHTML = "";
+    vi.restoreAllMocks();
+  });
+
+  it.each([{ ctrlKey: true }, { metaKey: true }])(
+    "opens the modal and prevents the browser default for an eligible shortcut %j",
+    (modifier) => {
+      const event = fireCancelableKey("g", modifier);
+
+      expect(event.defaultPrevented).toBe(true);
+      expect(ui.activeModal).toBe("goToSession");
+    },
+  );
+
+  it.each([{ shiftKey: true }, { altKey: true }, { isComposing: true }, { keyCode: 229 }])(
+    "leaves the browser default for a guarded event %j",
+    (options) => {
+      const event = fireCancelableKey("g", { ctrlKey: true, ...options });
+
+      expect(event.defaultPrevented).toBe(false);
+      expect(ui.activeModal).toBeNull();
+    },
+  );
+
+  it("leaves an already-consumed event alone", () => {
+    const event = new KeyboardEvent("keydown", {
+      key: "g",
+      ctrlKey: true,
+      bubbles: true,
+      cancelable: true,
+    });
+    event.preventDefault();
+    document.dispatchEvent(event);
+
+    expect(event.defaultPrevented).toBe(true);
+    expect(ui.activeModal).toBeNull();
+  });
+
+  it("leaves an active modal in charge", () => {
+    ui.activeModal = "shortcuts";
+
+    const event = fireCancelableKey("g", { ctrlKey: true });
+
+    expect(event.defaultPrevented).toBe(false);
+    expect(ui.activeModal).toBe("shortcuts");
+  });
+
+  it.each(["input", "textarea", "select"])("leaves Ctrl+G available to a focused %s", (tag) => {
+    const input = document.createElement(tag);
+    document.body.appendChild(input);
+    input.focus();
+
+    const event = fireCancelableKey("g", { ctrlKey: true });
+
+    expect(event.defaultPrevented).toBe(false);
+    expect(ui.activeModal).toBeNull();
+  });
+
+  it("leaves Ctrl+G available to a focused contenteditable", () => {
+    const editor = document.createElement("div");
+    Object.defineProperty(editor, "isContentEditable", { value: true });
+    document.body.appendChild(editor);
+    editor.tabIndex = 0;
+    editor.focus();
+
+    const event = fireCancelableKey("g", { ctrlKey: true });
+
+    expect(event.defaultPrevented).toBe(false);
+    expect(ui.activeModal).toBeNull();
+  });
+
+  it("still opens from a focused button", () => {
+    const button = document.createElement("button");
+    document.body.appendChild(button);
+    button.focus();
+
+    const event = fireCancelableKey("g", { ctrlKey: true });
+
+    expect(event.defaultPrevented).toBe(true);
+    expect(ui.activeModal).toBe("goToSession");
+  });
+
+  it("keeps Cmd+G and Cmd+Shift+G on in-session find navigation", () => {
+    router.route = "sessions";
+    sessions.activeSessionId = "session-1";
+    inSessionSearch.isOpen = true;
+    const next = vi.spyOn(inSessionSearch, "next");
+    const prev = vi.spyOn(inSessionSearch, "prev");
+
+    const nextEvent = fireCancelableKey("g", { metaKey: true });
+    const prevEvent = fireCancelableKey("G", { metaKey: true, shiftKey: true });
+
+    expect(nextEvent.defaultPrevented).toBe(true);
+    expect(prevEvent.defaultPrevented).toBe(true);
+    expect(next).toHaveBeenCalledExactlyOnceWith();
+    expect(prev).toHaveBeenCalledExactlyOnceWith();
+    expect(ui.activeModal).toBeNull();
+  });
+});
+
+describe("export shortcut telemetry", () => {
+  it("reports export_run html when e opens the active session's export", () => {
+    vi.mocked(reportTelemetry).mockClear();
+    vi.spyOn(window, "open").mockReturnValue(null);
+    const cleanup = registerShortcuts({ navigateMessage: vi.fn(), navigateUserPrompt: vi.fn() });
+    sessions.activeSessionId = "session-1";
+    try {
+      fireKey("e");
+      expect(reportTelemetry).toHaveBeenCalledExactlyOnceWith("export_run", { format: "html" });
+    } finally {
+      cleanup();
+      sessions.activeSessionId = null;
+      vi.restoreAllMocks();
+    }
   });
 });

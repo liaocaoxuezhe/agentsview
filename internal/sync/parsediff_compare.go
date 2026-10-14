@@ -27,6 +27,8 @@ package sync
 import (
 	"context"
 	"crypto/sha256"
+	"database/sql"
+	"errors"
 	"fmt"
 	"sort"
 	"strconv"
@@ -35,6 +37,7 @@ import (
 
 	"go.kenn.io/agentsview/internal/db"
 	"go.kenn.io/agentsview/internal/parser"
+	"go.kenn.io/agentsview/internal/stringutil"
 )
 
 // maxRenderedValueRunes caps rendered string values in FieldDiff;
@@ -51,6 +54,10 @@ func (e *Engine) compareStoredSession(
 	msgs []db.Message,
 	events []db.UsageEvent,
 ) ([]FieldDiff, error) {
+	prepared, err := e.withExternalParent(ctx, prepared)
+	if err != nil {
+		return nil, err
+	}
 	diffs := compareSessionFields(stored, prepared)
 
 	// Tier 1: three exact ordered fingerprints over the stored
@@ -62,21 +69,21 @@ func (e *Engine) compareStoredSession(
 	// body hash. Equal fingerprints prove the messages match on the
 	// compared fields without materializing full rows; only a
 	// mismatch loads them for attribution.
-	storedTokenFP, err := e.db.MessageTokenFingerprint(stored.ID)
+	storedTokenFP, err := e.db.MessageTokenFingerprint(ctx, stored.ID)
 	if err != nil {
 		return nil, fmt.Errorf(
 			"parse-diff: message fingerprint for %s: %w",
 			stored.ID, err,
 		)
 	}
-	storedRoleTimeFP, err := e.db.MessageRoleTimeFingerprint(stored.ID)
+	storedRoleTimeFP, err := e.db.MessageRoleTimeFingerprint(ctx, stored.ID)
 	if err != nil {
 		return nil, fmt.Errorf(
 			"parse-diff: role/time fingerprint for %s: %w",
 			stored.ID, err,
 		)
 	}
-	storedContentFP, err := e.db.MessageContentHashFingerprint(stored.ID)
+	storedContentFP, err := e.db.MessageContentHashFingerprint(ctx, stored.ID)
 	if err != nil {
 		return nil, fmt.Errorf(
 			"parse-diff: content fingerprint for %s: %w",
@@ -88,14 +95,14 @@ func (e *Engine) compareStoredSession(
 	// tool_calls rows. Neither is reachable through the token, role/time,
 	// or content fingerprints, so without them a change confined to those
 	// columns would never load the rows and would report identical.
-	storedFlagsFP, err := e.db.MessageFlagsFingerprint(stored.ID)
+	storedFlagsFP, err := e.db.MessageFlagsFingerprint(ctx, stored.ID)
 	if err != nil {
 		return nil, fmt.Errorf(
 			"parse-diff: flags fingerprint for %s: %w",
 			stored.ID, err,
 		)
 	}
-	storedToolFP, err := e.db.ToolCallParseDiffFingerprint(stored.ID)
+	storedToolFP, err := e.db.ToolCallParseDiffFingerprint(ctx, stored.ID)
 	if err != nil {
 		return nil, fmt.Errorf(
 			"parse-diff: tool-call fingerprint for %s: %w",
@@ -286,6 +293,16 @@ func appendSessionMetadataDiffs(
 	diffs = appendScalarSessionDiff(
 		diffs, FieldGitBranch, agent, stored.GitBranch, prepared.GitBranch,
 	)
+	// Pull request links are never incremental-append history: an appended
+	// record that would change them forces a full parse, so any difference
+	// is real drift.
+	if sv, pv := db.EncodePRLinks(stored.PRLinks), db.EncodePRLinks(prepared.PRLinks); sv != pv {
+		diffs = append(diffs, FieldDiff{
+			Field:  FieldPRLinks,
+			Stored: stringutil.TruncateRunes(renderNullableScalar(sv), maxRenderedValueRunes, "..."),
+			Parsed: stringutil.TruncateRunes(renderNullableScalar(pv), maxRenderedValueRunes, "..."),
+		})
+	}
 	diffs = appendScalarSessionDiff(
 		diffs, FieldRelationshipType, agent,
 		stored.RelationshipType, prepared.RelationshipType,
@@ -302,6 +319,7 @@ func appendSessionMetadataDiffs(
 		diffs, FieldTranscriptFidelity, agent,
 		stored.TranscriptFidelity, prepared.TranscriptFidelity,
 	)
+	diffs = appendScalarSessionDiff(diffs, FieldGroupKey, agent, stored.GroupKey, prepared.GroupKey)
 	// parent_session_id is *string: NULL and "" are the same state
 	// (toDBSession maps "" to nil via strPtr).
 	diffs = appendScalarSessionDiff(
@@ -345,8 +363,8 @@ func appendScalarSessionDiff(
 	}
 	d := FieldDiff{
 		Field:  field,
-		Stored: truncateRunes(renderNullableScalar(sv), maxRenderedValueRunes),
-		Parsed: truncateRunes(renderNullableScalar(pv), maxRenderedValueRunes),
+		Stored: stringutil.TruncateRunes(renderNullableScalar(sv), maxRenderedValueRunes, "..."),
+		Parsed: stringutil.TruncateRunes(renderNullableScalar(pv), maxRenderedValueRunes, "..."),
 	}
 	markIncrementalHistory(&d, agent)
 	return append(diffs, d)
@@ -486,15 +504,7 @@ func renderTextValue(ptr *string, sanitized string) string {
 	if ptr == nil {
 		return "(null)"
 	}
-	return truncateRunes(sanitized, maxRenderedValueRunes)
-}
-
-func truncateRunes(s string, limit int) string {
-	if utf8.RuneCountInString(s) <= limit {
-		return s
-	}
-	runes := []rune(s)
-	return string(runes[:limit]) + "..."
+	return stringutil.TruncateRunes(sanitized, maxRenderedValueRunes, "...")
 }
 
 // messageTokenFingerprintTwin is the in-memory twin of
@@ -513,6 +523,8 @@ func messageTokenFingerprintTwin(msgs []db.Message) string {
 	var b strings.Builder
 	for _, m := range ordered {
 		model := db.SanitizeUTF8(m.Model)
+		reasoningEffort := db.SanitizeUTF8(m.ReasoningEffort)
+		providerID := db.SanitizeUTF8(m.ProviderID)
 		tokenUsage := db.SanitizeUTF8(string(m.TokenUsage))
 		claudeMsgID := db.SanitizeUTF8(m.ClaudeMessageID)
 		claudeReqID := db.SanitizeUTF8(m.ClaudeRequestID)
@@ -522,10 +534,12 @@ func messageTokenFingerprintTwin(msgs []db.Message) string {
 		srcUUID := db.SanitizeUTF8(m.SourceUUID)
 		srcParentUUID := db.SanitizeUTF8(m.SourceParentUUID)
 		fmt.Fprintf(&b,
-			"%d|%d:%s|%d:%s|%d|%d|%t|%t|%s|%s|"+
+			"%d|%d:%s|%d:%s|%d:%s|%d:%s|%d|%d|%t|%t|%s|%s|"+
 				"%d:%s|%d:%s|%d:%s|%d:%s|%d:%s|%t|%t;",
 			m.Ordinal,
 			len(model), model,
+			len(reasoningEffort), reasoningEffort,
+			len(providerID), providerID,
 			len(tokenUsage), tokenUsage,
 			m.ContextTokens, m.OutputTokens,
 			m.HasContextTokens, m.HasOutputTokens,
@@ -856,6 +870,11 @@ func messageMetadataDiff(stored, parsed db.Message) string {
 	switch {
 	case db.SanitizeUTF8(stored.Role) != db.SanitizeUTF8(parsed.Role):
 		return fmt.Sprintf("role %q -> %q", stored.Role, parsed.Role)
+	case db.SanitizeUTF8(stored.ReasoningEffort) !=
+		db.SanitizeUTF8(parsed.ReasoningEffort):
+		return fmt.Sprintf(
+			"reasoning_effort %q -> %q", stored.ReasoningEffort, parsed.ReasoningEffort,
+		)
 	case stored.Timestamp != parsed.Timestamp:
 		return fmt.Sprintf(
 			"timestamp %q -> %q", stored.Timestamp, parsed.Timestamp,
@@ -1347,4 +1366,30 @@ func parseDiffSourceRaced(
 		return true
 	}
 	return liveMtime > *storedMtime
+}
+
+// withExternalParent applies a launcher-supplied parent link to the parsed
+// session the way the archive does when it stores a parse with no parent,
+// so a linked session is not reported as parser drift.
+func (e *Engine) withExternalParent(
+	ctx context.Context, prepared db.Session,
+) (db.Session, error) {
+	if derefString(prepared.ParentSessionID) != "" {
+		return prepared, nil
+	}
+	link, err := e.db.GetSessionExternalParent(ctx, prepared.ID)
+	if errors.Is(err, sql.ErrNoRows) {
+		return prepared, nil
+	}
+	if err != nil {
+		return db.Session{}, fmt.Errorf(
+			"parse-diff: session parent for %s: %w", prepared.ID, err,
+		)
+	}
+	if !link.Applied {
+		return prepared, nil
+	}
+	prepared.ParentSessionID = &link.ParentSessionID
+	prepared.RelationshipType = link.RelationshipType
+	return prepared, nil
 }

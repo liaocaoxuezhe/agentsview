@@ -10,6 +10,7 @@ import (
 
 	"go.kenn.io/agentsview/internal/db"
 	"go.kenn.io/agentsview/internal/signals"
+	"go.kenn.io/agentsview/internal/timeutil"
 )
 
 // maxPGVars is the maximum bind variables per IN clause.
@@ -91,6 +92,33 @@ func analyticsUTCRange(
 	return from, to
 }
 
+func pgAnalyticsMessageWindow(f db.AnalyticsFilter, col string, pb *paramBuilder) string {
+	from, to := analyticsUTCRange(f)
+	var preds []string
+	if f.From != "" {
+		preds = append(preds, col+" >= "+pb.add(from)+"::timestamptz")
+	}
+	if f.To != "" {
+		if t, err := time.Parse(time.RFC3339, to); err == nil {
+			to = t.Add(time.Second).Format(time.RFC3339)
+		}
+		preds = append(preds, col+" < "+pb.add(to)+"::timestamptz")
+	}
+	if len(preds) == 0 {
+		return ""
+	}
+	return "(" + col + " IS NULL OR (" + strings.Join(preds, " AND ") + "))"
+}
+
+func pgAnalyticsToolSessionWindow(f db.AnalyticsFilter, pb *paramBuilder) string {
+	sessionPred := pgAnalyticsMessageWindow(f, pgDateCol, pb)
+	if sessionPred == "" {
+		return ""
+	}
+	messagePred := pgAnalyticsMessageWindow(f, "wm.timestamp", pb)
+	return "(" + sessionPred + " OR EXISTS (SELECT 1 FROM messages wm WHERE wm.session_id = sessions.id AND " + messagePred + "))"
+}
+
 // buildAnalyticsWhere builds a WHERE clause with PG
 // placeholders. dateCol is the date expression.
 func buildAnalyticsWhere(
@@ -116,137 +144,27 @@ func buildAnalyticsWhereWithoutDate(
 	)
 }
 
-func buildAnalyticsWhereWithDate(
-	f db.AnalyticsFilter,
-	dateCol string,
-	pb *paramBuilder,
-	includeDate bool,
-	sessionIDExpr string,
-) string {
-	if sessionIDExpr == "" {
-		sessionIDExpr = "id"
-	}
-	preds := []string{
-		"message_count > 0",
-		// Mirror the SQLite analytics filter: count subagents only on
-		// opt-in sum/count surfaces; fork rows stay excluded always.
-		f.RelationshipExclusionSQL(),
-		"deleted_at IS NULL",
-	}
+func buildAnalyticsWhereWithDate(f db.AnalyticsFilter, dateCol string, pb *paramBuilder, includeDate bool, sessionIDExpr string) string {
+	b := db.NewQueryBuilder(db.PostgresQueryDialect(), pb.n)
+	var dates []string
 	if includeDate {
-		utcFrom, utcTo := analyticsUTCRange(f)
-		preds = append(preds,
-			dateCol+" >= "+pb.add(utcFrom)+"::timestamptz")
-		preds = append(preds,
-			dateCol+" <= "+pb.add(utcTo)+"::timestamptz")
+		from, to := analyticsUTCRange(f)
+		dates = append(dates, dateCol+" >= "+b.Add(from)+"::timestamptz", dateCol+" <= "+b.Add(to)+"::timestamptz")
 	}
-	if f.Machine != "" {
-		preds = appendPGAnalyticsCSVFilter(
-			preds, "machine", f.Machine, pb)
-	}
-	if f.Project != "" {
-		preds = append(preds,
-			"project = "+pb.add(f.Project))
-	}
-	if f.GitBranch != "" {
-		preds = append(preds, db.BranchPairPredicate(
-			"project", "git_branch", f.GitBranch,
-			func(s string) string { return pb.add(s) }))
-	}
-	if f.Agent != "" {
-		preds = appendPGAnalyticsCSVFilter(
-			preds, "agent", f.Agent, pb)
-	}
-	if f.Model != "" {
-		models := csvFilterValues(f.Model)
-		if len(models) == 1 {
-			preds = append(preds,
-				"EXISTS (SELECT 1 FROM messages m WHERE "+
-					"m.session_id = "+sessionIDExpr+
-					" AND m.model = "+pb.add(models[0])+")")
-		} else if len(models) > 1 {
-			phs := make([]string, len(models))
-			for i, model := range models {
-				phs[i] = pb.add(model)
-			}
-			preds = append(preds,
-				"EXISTS (SELECT 1 FROM messages m WHERE "+
-					"m.session_id = "+sessionIDExpr+
-					" AND m.model IN ("+
-					strings.Join(phs, ",")+
-					"))")
-		}
-	}
-	if f.MinUserMessages > 0 {
-		preds = append(preds,
-			"user_message_count >= "+
-				pb.add(f.MinUserMessages))
-	}
-	scope := normalizePGAutomatedScope(
-		f.AutomatedScope, f.ExcludeAutomated)
-	if f.ExcludeOneShot {
-		if scope != "human" {
-			preds = append(preds,
-				f.OneShotExclusionSQL(
-					"(user_message_count > 1 OR is_automated = TRUE)"))
-		} else {
-			preds = append(preds,
-				f.OneShotExclusionSQL("user_message_count > 1"))
-		}
-	}
-	if pred := pgAutomatedScopePredicate(scope, "is_automated"); pred != "" {
+	where := db.BuildAnalyticsWhere(f, b, "", sessionIDExpr, dates)
+	pb.args = append(pb.args, b.Args()...)
+	pb.n += len(b.Args())
+	return where
+}
+
+func appendPGAnalyticsCSVFilter(preds []string, col, raw string, pb *paramBuilder) []string {
+	b := db.NewQueryBuilder(db.PostgresQueryDialect(), pb.n)
+	if pred := b.ValuesPredicate(col, db.CSVFilterValues(raw), true); pred != "" {
 		preds = append(preds, pred)
 	}
-	if f.ExcludeInteractive {
-		preds = append(preds, "is_automated = TRUE")
-	}
-	if f.ActiveSince != "" {
-		preds = append(preds,
-			"COALESCE(ended_at, started_at, created_at)"+
-				" >= "+pb.add(f.ActiveSince)+
-				"::timestamptz")
-	}
-	if pred := pgTerminationPred(f.Termination, pb); pred != "" {
-		preds = append(preds, pred)
-	}
-	return strings.Join(preds, " AND ")
-}
-
-func appendPGAnalyticsCSVFilter(
-	preds []string,
-	col string,
-	raw string,
-	pb *paramBuilder,
-) []string {
-	values := pgAnalyticsCSVValues(raw)
-	if len(values) == 0 {
-		return preds
-	}
-	if len(values) == 1 {
-		return append(preds, col+" = "+pb.add(values[0]))
-	}
-	phs := make([]string, len(values))
-	for i, value := range values {
-		phs[i] = pb.add(value)
-	}
-	return append(preds,
-		col+" IN ("+strings.Join(phs, ",")+")")
-}
-
-func pgAnalyticsCSVValues(raw string) []string {
-	return csvFilterValues(raw)
-}
-
-func csvFilterValues(raw string) []string {
-	values := strings.Split(raw, ",")
-	out := values[:0]
-	for _, value := range values {
-		trimmed := strings.TrimSpace(value)
-		if trimmed != "" {
-			out = append(out, trimmed)
-		}
-	}
-	return out
+	pb.args = append(pb.args, b.Args()...)
+	pb.n += len(b.Args())
+	return preds
 }
 
 func (s *Store) getAnalyticsFilteredMessageCounts(
@@ -279,7 +197,7 @@ func (s *Store) getAnalyticsModelScopedMessages(
 	if scope == nil {
 		return map[string][]db.ScopedMessage{}, nil
 	}
-	return scope.MessagesBySession(), nil
+	return scope, nil
 }
 
 func (s *Store) getAnalyticsFilteredMessageStats(
@@ -295,74 +213,6 @@ func (s *Store) getAnalyticsFilteredMessageStats(
 		return map[string]db.MessageStats{}, nil
 	}
 	return scope.StatsBySession(), nil
-}
-
-// localTime parses a UTC timestamp string and converts it to
-// the given location.
-func localTime(
-	ts string, loc *time.Location,
-) (time.Time, bool) {
-	t, err := time.Parse(time.RFC3339Nano, ts)
-	if err != nil {
-		t, err = time.Parse("2006-01-02T15:04:05Z", ts)
-		if err != nil {
-			return time.Time{}, false
-		}
-	}
-	return t.In(loc), true
-}
-
-// localDate converts a UTC timestamp string to a local date
-// string (YYYY-MM-DD).
-func localDate(ts string, loc *time.Location) string {
-	t, ok := localTime(ts, loc)
-	if !ok {
-		if len(ts) >= 10 {
-			return ts[:10]
-		}
-		return ""
-	}
-	return t.Format("2006-01-02")
-}
-
-// inDateRange checks if a local date falls within [from, to].
-// Empty bounds are treated as unbounded so callers can pass a
-// zero AnalyticsFilter to get every session.
-func inDateRange(date, from, to string) bool {
-	if from != "" && date < from {
-		return false
-	}
-	if to != "" && date > to {
-		return false
-	}
-	return true
-}
-
-// medianInt returns the median of a sorted int slice.
-func medianInt(sorted []int, n int) int {
-	if n == 0 {
-		return 0
-	}
-	if n%2 == 0 {
-		return (sorted[n/2-1] + sorted[n/2]) / 2
-	}
-	return sorted[n/2]
-}
-
-// percentileFloat returns the value at the given percentile
-// from a pre-sorted float64 slice.
-func percentileFloat(
-	sorted []float64, pct float64,
-) float64 {
-	n := len(sorted)
-	if n == 0 {
-		return 0
-	}
-	idx := int(float64(n) * pct)
-	if idx >= n {
-		idx = n - 1
-	}
-	return sorted[idx]
 }
 
 // analyticsLocation loads the timezone from the filter.
@@ -454,7 +304,7 @@ func (s *Store) filteredSessionIDs(
 		if ids[sid] {
 			continue
 		}
-		t, ok := localTime(msgTS, loc)
+		t, ok := db.LocalTime(msgTS, loc)
 		if !ok {
 			continue
 		}
@@ -487,33 +337,10 @@ func (s *Store) filteredSessionIDsModel(
 		return nil, err
 	}
 	ids := make(map[string]bool)
-	if scope != nil {
-		for id := range scope.MessagesBySession() {
-			ids[id] = true
-		}
+	for id := range scope {
+		ids[id] = true
 	}
 	return ids, nil
-}
-
-// bucketDate truncates a date to the start of its bucket.
-func bucketDate(date string, granularity string) string {
-	t, err := time.Parse("2006-01-02", date)
-	if err != nil {
-		return date
-	}
-	switch granularity {
-	case "week":
-		weekday := int(t.Weekday())
-		if weekday == 0 {
-			weekday = 7
-		}
-		t = t.AddDate(0, 0, -(weekday - 1))
-		return t.Format("2006-01-02")
-	case "month":
-		return t.Format("2006-01") + "-01"
-	default:
-		return date
-	}
 }
 
 func (s *Store) getModelScopedToolCallCounts(
@@ -526,7 +353,7 @@ func (s *Store) getModelScopedToolCallCounts(
 		return counts, nil
 	}
 
-	flt := messageScopeFilter(f)
+	flt := f.MessageScopeFilter()
 	loc := analyticsLocation(f)
 	if err := pgQueryChunked(sessionIDs, func(chunk []string) error {
 		pb := &paramBuilder{}
@@ -566,7 +393,7 @@ func (s *Store) getModelScopedToolCallCounts(
 			if _, ok := flt.Models[model]; !ok {
 				continue
 			}
-			parsed, has := localTime(ts, loc)
+			parsed, has := db.LocalTime(ts, loc)
 			if !flt.MatchesDayHour(parsed, has) {
 				continue
 			}
@@ -618,8 +445,8 @@ func (s *Store) getAnalyticsActivityFilteredByModelTime(
 			return db.ActivityResponse{},
 				fmt.Errorf("scanning analytics activity session: %w", err)
 		}
-		date := localDate(scanDateCol(ts), loc)
-		if !inDateRange(date, f.From, f.To) {
+		date := db.LocalDate(scanDateCol(ts), loc)
+		if !db.InDateRange(date, f.From, f.To) {
 			continue
 		}
 		if timeIDs != nil && !timeIDs[id] {
@@ -648,7 +475,7 @@ func (s *Store) getAnalyticsActivityFilteredByModelTime(
 
 	buckets := make(map[string]*db.ActivityEntry)
 	for _, session := range sessions {
-		bucket := bucketDate(session.date, granularity)
+		bucket := db.BucketDate(session.date, granularity)
 		entry := buckets[bucket]
 		if entry == nil {
 			entry = &db.ActivityEntry{
@@ -763,7 +590,7 @@ func (s *Store) getAnalyticsModelsForSessionIDsFiltered(
 		unique = append(unique, sessionID)
 	}
 
-	filterModels := csvFilterValues(f.Model)
+	filterModels := db.CSVFilterValues(f.Model)
 	allowedModels := make(map[string]struct{}, len(filterModels))
 	for _, model := range filterModels {
 		allowedModels[model] = struct{}{}
@@ -798,7 +625,7 @@ func (s *Store) getAnalyticsModelsForSessionIDsFiltered(
 				}
 			}
 			if f.HasTimeFilter() {
-				t, ok := localTime(ts, loc)
+				t, ok := db.LocalTime(ts, loc)
 				if !ok || !matchesTimeFilter(f, t) {
 					continue
 				}
@@ -885,8 +712,8 @@ func (s *Store) GetAnalyticsSummary(
 					"scanning summary row: %w", err,
 				)
 		}
-		date := localDate(scanDateCol(ts), loc)
-		if !inDateRange(date, f.From, f.To) {
+		date := db.LocalDate(scanDateCol(ts), loc)
+		if !db.InDateRange(date, f.From, f.To) {
 			continue
 		}
 		if timeIDs != nil && !timeIDs[id] {
@@ -1058,12 +885,12 @@ func (s *Store) GetAnalyticsActivity(
 	}
 
 	query := `SELECT ` + pgDateColS + `, s.agent, s.id,
-		m.role, m.has_thinking, COUNT(*)
+		m.role, m.has_thinking, m.is_system, COALESCE(m.source_subtype, ''), COUNT(*)
 		FROM sessions s
 		LEFT JOIN messages m ON m.session_id = s.id
 		WHERE ` + strings.Join(preds, " AND ") + `
 		GROUP BY s.id, ` + pgDateColS +
-		`, s.agent, m.role, m.has_thinking`
+		`, s.agent, m.role, m.has_thinking, m.is_system, m.source_subtype`
 
 	rows, err := s.pg.QueryContext(
 		ctx, query, pb.args...,
@@ -1084,11 +911,12 @@ func (s *Store) GetAnalyticsActivity(
 		var tsVal *time.Time
 		var agent, sid string
 		var role *string
-		var hasThinking *bool
+		var sourceSubtype string
+		var hasThinking, isSystem *bool
 		var count int
 		if err := rows.Scan(
 			&tsVal, &agent, &sid, &role,
-			&hasThinking, &count,
+			&hasThinking, &isSystem, &sourceSubtype, &count,
 		); err != nil {
 			return db.ActivityResponse{},
 				fmt.Errorf(
@@ -1096,14 +924,14 @@ func (s *Store) GetAnalyticsActivity(
 				)
 		}
 
-		date := localDate(scanDateCol(tsVal), loc)
-		if !inDateRange(date, f.From, f.To) {
+		date := db.LocalDate(scanDateCol(tsVal), loc)
+		if !db.InDateRange(date, f.From, f.To) {
 			continue
 		}
 		if timeIDs != nil && !timeIDs[sid] {
 			continue
 		}
-		bucket := bucketDate(date, granularity)
+		bucket := db.BucketDate(date, granularity)
 
 		entry, ok := buckets[bucket]
 		if !ok {
@@ -1120,12 +948,15 @@ func (s *Store) GetAnalyticsActivity(
 			entry.Sessions++
 		}
 
+		sys := isSystem != nil && *isSystem
 		if role != nil {
 			entry.Messages += count
 			entry.ByAgent[agent] += count
 			switch *role {
 			case "user":
-				entry.UserMessages += count
+				if !sys && sourceSubtype != "tool_result" {
+					entry.UserMessages += count
+				}
 			case "assistant":
 				entry.AssistantMessages += count
 			}
@@ -1220,92 +1051,6 @@ func (s *Store) mergeActivityToolCalls(
 
 // --- Heatmap ---
 
-// MaxHeatmapDays is the maximum number of day entries.
-const MaxHeatmapDays = 366
-
-// clampFrom returns from clamped so [from, to] spans at
-// most MaxHeatmapDays.
-func clampFrom(from, to string) string {
-	start, err := time.Parse("2006-01-02", from)
-	if err != nil {
-		return from
-	}
-	end, err := time.Parse("2006-01-02", to)
-	if err != nil {
-		return from
-	}
-	earliest := end.AddDate(0, 0, -(MaxHeatmapDays - 1))
-	if start.Before(earliest) {
-		return earliest.Format("2006-01-02")
-	}
-	return from
-}
-
-// computeQuartileLevels computes thresholds from sorted
-// values.
-func computeQuartileLevels(
-	sorted []int,
-) db.HeatmapLevels {
-	if len(sorted) == 0 {
-		return db.HeatmapLevels{
-			L1: 1, L2: 2, L3: 3, L4: 4,
-		}
-	}
-	n := len(sorted)
-	return db.HeatmapLevels{
-		L1: sorted[0],
-		L2: sorted[n/4],
-		L3: sorted[n/2],
-		L4: sorted[n*3/4],
-	}
-}
-
-// assignLevel determines the heatmap level (0-4) for a value.
-func assignLevel(value int, levels db.HeatmapLevels) int {
-	if value <= 0 {
-		return 0
-	}
-	if value <= levels.L2 {
-		return 1
-	}
-	if value <= levels.L3 {
-		return 2
-	}
-	if value <= levels.L4 {
-		return 3
-	}
-	return 4
-}
-
-// buildDateEntries creates a HeatmapEntry for each day in
-// [from, to].
-func buildDateEntries(
-	from, to string,
-	values map[string]int,
-	levels db.HeatmapLevels,
-) []db.HeatmapEntry {
-	start, err := time.Parse("2006-01-02", from)
-	if err != nil {
-		return nil
-	}
-	end, err := time.Parse("2006-01-02", to)
-	if err != nil {
-		return nil
-	}
-
-	entries := []db.HeatmapEntry{}
-	for d := start; !d.After(end); d = d.AddDate(0, 0, 1) {
-		date := d.Format("2006-01-02")
-		v := values[date]
-		entries = append(entries, db.HeatmapEntry{
-			Date:  date,
-			Value: v,
-			Level: assignLevel(v, levels),
-		})
-	}
-	return entries
-}
-
 // GetAnalyticsHeatmap returns daily counts with intensity
 // levels.
 func (s *Store) GetAnalyticsHeatmap(
@@ -1371,8 +1116,8 @@ func (s *Store) GetAnalyticsHeatmap(
 					"scanning heatmap row: %w", err,
 				)
 		}
-		date := localDate(scanDateCol(ts), loc)
-		if !inDateRange(date, f.From, f.To) {
+		date := db.LocalDate(scanDateCol(ts), loc)
+		if !db.InDateRange(date, f.From, f.To) {
 			continue
 		}
 		if timeIDs != nil && !timeIDs[id] {
@@ -1426,38 +1171,7 @@ func (s *Store) GetAnalyticsHeatmap(
 		source = dayOutputTokens
 	}
 
-	// For output_tokens, an empty source means no sessions
-	// reported token coverage. Return an empty heatmap so the
-	// UI can show "no data" instead of a misleading zero grid.
-	if metric == "output_tokens" && len(source) == 0 {
-		return db.HeatmapResponse{
-			Metric:      metric,
-			EntriesFrom: clampFrom(f.From, f.To),
-		}, nil
-	}
-
-	entriesFrom := clampFrom(f.From, f.To)
-
-	var values []int
-	for date, v := range source {
-		if v > 0 && date >= entriesFrom && date <= f.To {
-			values = append(values, v)
-		}
-	}
-	sort.Ints(values)
-
-	levels := computeQuartileLevels(values)
-
-	entries := buildDateEntries(
-		entriesFrom, f.To, source, levels,
-	)
-
-	return db.HeatmapResponse{
-		Metric:      metric,
-		Entries:     entries,
-		Levels:      levels,
-		EntriesFrom: entriesFrom,
-	}, nil
+	return db.BuildHeatmapResponse(f.From, f.To, metric, source), nil
 }
 
 // --- Projects ---
@@ -1531,8 +1245,8 @@ func (s *Store) GetAnalyticsProjects(
 					"scanning project row: %w", err,
 				)
 		}
-		date := localDate(scanDateCol(ts), loc)
-		if !inDateRange(date, f.From, f.To) {
+		date := db.LocalDate(scanDateCol(ts), loc)
+		if !db.InDateRange(date, f.From, f.To) {
 			continue
 		}
 		if timeIDs != nil && !timeIDs[id] {
@@ -1629,7 +1343,7 @@ func (s *Store) GetAnalyticsProjects(
 			FirstSession:   pd.first,
 			LastSession:    pd.last,
 			AvgMessages:    avg,
-			MedianMessages: medianInt(pd.counts, n),
+			MedianMessages: db.MedianInt(pd.counts, n),
 			Agents:         pd.agents,
 			DailyTrend:     trend,
 		})
@@ -1691,11 +1405,11 @@ func (s *Store) GetAnalyticsHourOfWeek(
 					err,
 				)
 		}
-		sessDate := localDate(scanDateCol(sessTS), loc)
-		if !inDateRange(sessDate, f.From, f.To) {
+		sessDate := db.LocalDate(scanDateCol(sessTS), loc)
+		if !db.InDateRange(sessDate, f.From, f.To) {
 			continue
 		}
-		t, ok := localTime(msgTS, loc)
+		t, ok := db.LocalTime(msgTS, loc)
 		if !ok {
 			continue
 		}
@@ -1748,7 +1462,7 @@ func (s *Store) analyticsModelCandidateSessionIDs(
 		if err := rows.Scan(&id, &ts); err != nil {
 			return nil, fmt.Errorf("scanning model candidate session: %w", err)
 		}
-		if !inDateRange(localDate(scanDateCol(ts), loc), f.From, f.To) {
+		if !db.InDateRange(db.LocalDate(scanDateCol(ts), loc), f.From, f.To) {
 			continue
 		}
 		ids = append(ids, id)
@@ -1778,15 +1492,13 @@ func (s *Store) getAnalyticsHourOfWeekFilteredByModel(
 	}
 
 	var grid [7][24]int
-	if scope != nil {
-		for _, msgs := range scope.MessagesBySession() {
-			for _, m := range msgs {
-				if !m.HasLocalTime {
-					continue
-				}
-				dow := (int(m.LocalTime.Weekday()) + 6) % 7
-				grid[dow][m.LocalTime.Hour()]++
+	for _, msgs := range scope {
+		for _, m := range msgs {
+			if !m.HasLocalTime {
+				continue
 			}
+			dow := (int(m.LocalTime.Weekday()) + 6) % 7
+			grid[dow][m.LocalTime.Hour()]++
 		}
 	}
 
@@ -1794,104 +1506,6 @@ func (s *Store) getAnalyticsHourOfWeekFilteredByModel(
 }
 
 // --- Session Shape ---
-
-// lengthBucket returns the bucket label for a message count.
-func lengthBucket(mc int) string {
-	switch {
-	case mc <= 5:
-		return "1-5"
-	case mc <= 15:
-		return "6-15"
-	case mc <= 30:
-		return "16-30"
-	case mc <= 60:
-		return "31-60"
-	case mc <= 120:
-		return "61-120"
-	default:
-		return "121+"
-	}
-}
-
-// durationBucket returns the bucket label for a duration in
-// minutes.
-func durationBucket(mins float64) string {
-	switch {
-	case mins < 5:
-		return "<5m"
-	case mins < 15:
-		return "5-15m"
-	case mins < 30:
-		return "15-30m"
-	case mins < 60:
-		return "30-60m"
-	case mins < 120:
-		return "1-2h"
-	default:
-		return "2h+"
-	}
-}
-
-// autonomyBucket returns the bucket label for an autonomy
-// ratio.
-func autonomyBucket(ratio float64) string {
-	switch {
-	case ratio < 0.5:
-		return "<0.5"
-	case ratio < 1:
-		return "0.5-1"
-	case ratio < 2:
-		return "1-2"
-	case ratio < 5:
-		return "2-5"
-	case ratio < 10:
-		return "5-10"
-	default:
-		return "10+"
-	}
-}
-
-var (
-	lengthOrder = map[string]int{
-		"1-5": 0, "6-15": 1, "16-30": 2,
-		"31-60": 3, "61-120": 4, "121+": 5,
-	}
-	durationOrder = map[string]int{
-		"<5m": 0, "5-15m": 1, "15-30m": 2,
-		"30-60m": 3, "1-2h": 4, "2h+": 5,
-	}
-	autonomyOrder = map[string]int{
-		"<0.5": 0, "0.5-1": 1, "1-2": 2,
-		"2-5": 3, "5-10": 4, "10+": 5,
-	}
-)
-
-// sortBuckets sorts distribution buckets by defined order.
-func sortBuckets(
-	buckets []db.DistributionBucket,
-	order map[string]int,
-) {
-	sort.Slice(buckets, func(i, j int) bool {
-		return order[buckets[i].Label] <
-			order[buckets[j].Label]
-	})
-}
-
-// mapToBuckets converts a label->count map to sorted buckets.
-func mapToBuckets(
-	m map[string]int, order map[string]int,
-) []db.DistributionBucket {
-	buckets := make(
-		[]db.DistributionBucket, 0, len(m),
-	)
-	for label, count := range m {
-		buckets = append(buckets, db.DistributionBucket{
-			Label: label, Count: count,
-		})
-	}
-	sortBuckets(buckets, order)
-	return buckets
-}
 
 // GetAnalyticsSessionShape returns distribution histograms
 // for session length, duration, and autonomy ratio.
@@ -1947,8 +1561,8 @@ func (s *Store) GetAnalyticsSessionShape(
 					err,
 				)
 		}
-		date := localDate(scanDateCol(tsVal), loc)
-		if !inDateRange(date, f.From, f.To) {
+		date := db.LocalDate(scanDateCol(tsVal), loc)
+		if !db.InDateRange(date, f.From, f.To) {
 			continue
 		}
 		if timeIDs != nil && !timeIDs[id] {
@@ -1957,13 +1571,13 @@ func (s *Store) GetAnalyticsSessionShape(
 
 		totalCount++
 		if !modelFilter {
-			lengthCounts[lengthBucket(mc)]++
+			lengthCounts[db.LengthBucket(mc)]++
 		}
 		sessionIDs = append(sessionIDs, id)
 
 		if durationSec != nil && *durationSec >= 0 {
 			mins := *durationSec / 60.0
-			durationCounts[durationBucket(mins)]++
+			durationCounts[db.DurationBucket(mins)]++
 		}
 	}
 	if err := rows.Err(); err != nil {
@@ -1990,11 +1604,11 @@ func (s *Store) GetAnalyticsSessionShape(
 			}
 			seen[sessionID] = struct{}{}
 			stat := stats[sessionID]
-			lengthCounts[lengthBucket(stat.Messages)]++
+			lengthCounts[db.LengthBucket(stat.Messages)]++
 			if stat.UserMessages > 0 {
 				ratio := float64(stat.ToolUseMessages) /
 					float64(stat.UserMessages)
-				autonomyCounts[autonomyBucket(ratio)]++
+				autonomyCounts[db.AutonomyBucket(ratio)]++
 			}
 		}
 	} else if len(sessionIDs) > 0 {
@@ -2010,16 +1624,10 @@ func (s *Store) GetAnalyticsSessionShape(
 	}
 
 	return db.SessionShapeResponse{
-		Count: totalCount,
-		LengthDistribution: mapToBuckets(
-			lengthCounts, lengthOrder,
-		),
-		DurationDistribution: mapToBuckets(
-			durationCounts, durationOrder,
-		),
-		AutonomyDistribution: mapToBuckets(
-			autonomyCounts, autonomyOrder,
-		),
+		Count:                totalCount,
+		LengthDistribution:   db.LengthDistributionBuckets(lengthCounts),
+		DurationDistribution: db.DurationDistributionBuckets(durationCounts),
+		AutonomyDistribution: db.AutonomyDistributionBuckets(autonomyCounts),
 	}, nil
 }
 
@@ -2034,6 +1642,7 @@ func (s *Store) queryAutonomyChunk(
 	ph := pgInPlaceholders(chunk, pb)
 	q := `SELECT session_id,
 		SUM(CASE WHEN role='user' AND is_system=false
+			AND COALESCE(source_subtype, '') <> 'tool_result'
 			THEN 1 ELSE 0 END),
 		SUM(CASE WHEN role='assistant'
 			AND has_tool_use=true THEN 1 ELSE 0 END)
@@ -2060,7 +1669,7 @@ func (s *Store) queryAutonomyChunk(
 		if userCount > 0 {
 			ratio := float64(toolCount) /
 				float64(userCount)
-			counts[autonomyBucket(ratio)]++
+			counts[db.AutonomyBucket(ratio)]++
 		}
 	}
 	return rows.Err()
@@ -2068,260 +1677,210 @@ func (s *Store) queryAutonomyChunk(
 
 // --- Tools ---
 
-// GetAnalyticsTools returns tool usage analytics.
-func (s *Store) GetAnalyticsTools(
-	ctx context.Context, f db.AnalyticsFilter,
-) (db.ToolsAnalyticsResponse, error) {
-	pb := &paramBuilder{}
-	where := buildAnalyticsWhereWithoutDate(f, pb)
-
-	sessQ := `SELECT id, ` + pgDateCol + `, agent
-		FROM sessions WHERE ` + where
-
-	sessRows, err := s.pg.QueryContext(
-		ctx, sessQ, pb.args...,
-	)
+// pgAnalyticsZone returns the IANA zone PostgreSQL uses to localize
+// analytics call timestamps. "Local" resolves through the shared
+// timeutil.LocalTimezoneOrUTC helper; unknown names fall back to UTC.
+func pgAnalyticsZone(f db.AnalyticsFilter) string {
+	if f.Timezone == "Local" {
+		return timeutil.LocalTimezoneOrUTC()
+	}
+	zone, err := db.NormalizeSessionTimezone(f.Timezone)
 	if err != nil {
-		return db.ToolsAnalyticsResponse{},
-			fmt.Errorf(
-				"querying tool sessions: %w", err,
-			)
+		return "UTC"
 	}
-	defer sessRows.Close()
+	return zone
+}
 
-	type sessInfo struct {
-		ts    string
-		agent string
+// pgAnalyticsCallsSQL renders the filtered sessions and their per-call
+// facts shared by the tool and skill aggregates. Each call keeps its
+// owning session so distinct-session counts stay exact. A call's time is
+// its message timestamp, or the session start when the message has none;
+// local_at is that time in the requested zone. sessionCols and callCols
+// add panel-specific columns and callPreds add panel-specific predicates.
+//
+// analytics_sessions is MATERIALIZED so PostgreSQL filters sessions
+// before it touches tool_calls and messages. pgx caches prepared
+// statements per connection. After five executions PostgreSQL may switch
+// to a generic plan. With an inlined CTE, that plan joins every tool call
+// to every message before it applies a narrow project filter.
+func pgAnalyticsCallsSQL(
+	f db.AnalyticsFilter, pb *paramBuilder,
+	sessionCols, callCols string, callPreds ...string,
+) string {
+	where := buildAnalyticsWhereWithoutDate(f, pb)
+	if pred := pgAnalyticsToolSessionWindow(f, pb); pred != "" {
+		where += " AND " + pred
 	}
-	sessionMap := make(map[string]sessInfo)
-	var sessionIDs []string
+	preds := appendPGAnalyticsCSVFilter(callPreds, "m.model", f.Model, pb)
+	if pred := pgAnalyticsMessageWindow(f, "m.timestamp", pb); pred != "" {
+		preds = append(preds, pred)
+	}
+	callWhere := ""
+	if len(preds) > 0 {
+		callWhere = "\n\t\tWHERE " + strings.Join(preds, " AND ")
+	}
+	return `WITH analytics_sessions AS MATERIALIZED (
+		SELECT id, ` + pgDateCol + ` AS session_at` + sessionCols + `
+		FROM sessions WHERE ` + where + `
+	),
+	analytics_calls AS (
+		SELECT tc.session_id` + callCols + `,
+			COALESCE(m.timestamp, s.session_at) AS used_at,
+			COALESCE(m.timestamp, s.session_at)
+				AT TIME ZONE ` + pb.add(pgAnalyticsZone(f)) + `::text AS local_at
+		FROM tool_calls tc
+		JOIN analytics_sessions s ON s.id = tc.session_id
+		LEFT JOIN messages m
+			ON m.session_id = tc.session_id
+			AND m.ordinal = tc.message_ordinal` + callWhere + `
+	)`
+}
 
-	for sessRows.Next() {
-		var id, agent string
-		var ts *time.Time
-		if err := sessRows.Scan(
-			&id, &ts, &agent,
-		); err != nil {
-			return db.ToolsAnalyticsResponse{},
-				fmt.Errorf(
-					"scanning tool session: %w", err,
-				)
-		}
-		sessionMap[id] = sessInfo{
-			ts: scanDateCol(ts), agent: agent,
-		}
-		sessionIDs = append(sessionIDs, id)
+// pgAnalyticsCallLocalWhere filters analytics_calls by the local date
+// range and the hour/day-of-week filter, as ResolveSkillRowTime does. A
+// call without any timestamp fails a lower bound and the hour/day-of-week
+// filter but passes an upper bound. Bounds must be valid dates; callers
+// validate them before they reach the store.
+func pgAnalyticsCallLocalWhere(
+	f db.AnalyticsFilter, pb *paramBuilder,
+) string {
+	preds := []string{"TRUE"}
+	if f.From != "" {
+		preds = append(preds, "local_at >= "+pb.add(f.From)+"::date")
 	}
-	if err := sessRows.Err(); err != nil {
-		return db.ToolsAnalyticsResponse{},
-			fmt.Errorf(
-				"iterating tool sessions: %w", err,
-			)
+	if f.To != "" {
+		preds = append(preds,
+			"(local_at IS NULL OR local_at < "+pb.add(f.To)+"::date + 1)")
 	}
+	if f.DayOfWeek != nil {
+		// ISODOW is Monday=1; the filter is Monday=0.
+		preds = append(preds,
+			"EXTRACT(ISODOW FROM local_at) = "+pb.add(*f.DayOfWeek+1)+"::int")
+	}
+	if f.Hour != nil {
+		preds = append(preds,
+			"EXTRACT(HOUR FROM local_at) = "+pb.add(*f.Hour)+"::int")
+	}
+	return strings.Join(preds, " AND ")
+}
 
-	resp := db.ToolsAnalyticsResponse{
-		ByCategory: []db.ToolCategoryCount{},
-		ByAgent:    []db.ToolAgentBreakdown{},
-		ByTool:     []db.ToolUsageAnalysis{},
-		Trend:      []db.ToolTrendEntry{},
+// pgScanLocalDate formats a scanned local DATE column, or returns ""
+// when the call had no timestamp.
+func pgScanLocalDate(t *time.Time) string {
+	if t == nil {
+		return ""
 	}
+	return t.Format("2006-01-02")
+}
 
-	if len(sessionIDs) == 0 {
-		return resp, nil
+// GetAnalyticsTools returns tool usage analytics. PostgreSQL joins the
+// filtered sessions to their tool calls and returns one row per session,
+// category, tool name, and local date; BuildToolsAnalytics forms the
+// weekly trend from those dates.
+func (s *Store) GetAnalyticsTools(ctx context.Context, f db.AnalyticsFilter) (db.ToolsAnalyticsResponse, error) {
+	rows, err := s.analyticsToolRows(ctx, f)
+	return db.BuildToolsAnalytics(rows), err
+}
+
+func (s *Store) analyticsToolRows(
+	ctx context.Context, f db.AnalyticsFilter,
+) ([]db.ToolAnalyticsRow, error) {
+	pb := &paramBuilder{}
+	predicates := db.ToolSelectionPredicates("tc", "s.quality_signal_version", f, func(value string) string { return pb.add(value) })
+	q := pgAnalyticsCallsSQL(f, pb, ", agent, project, quality_signal_version",
+		`, tc.category,
+			TRIM(COALESCE(tc.tool_name, '')) AS tool_name, s.agent, s.project, m.ordinal, s.quality_signal_version, tc.observed_outcome, tc.observed_repeat, tc.sequence_ending`, predicates...) + `
+	SELECT session_id, category, tool_name, agent,
+		local_at::date AS local_date, COUNT(*), project, MIN(ordinal)` + db.ToolEffectivenessSQL("analytics_calls", "quality_signal_version") + `
+	FROM analytics_calls
+	WHERE ` + pgAnalyticsCallLocalWhere(f, pb) + `
+	GROUP BY session_id, category, tool_name, agent, project, local_at::date`
+
+	rows, err := s.pg.QueryContext(ctx, q, pb.args...)
+	if err != nil {
+		return nil,
+			fmt.Errorf("querying tool_calls: %w", err)
 	}
+	defer rows.Close()
 
 	var toolRows []db.ToolAnalyticsRow
-
-	err = pgQueryChunked(sessionIDs,
-		func(chunk []string) error {
-			chunkPB := &paramBuilder{}
-			ph := pgInPlaceholders(chunk, chunkPB)
-			preds := []string{"tc.session_id IN " + ph}
-			preds = appendPGAnalyticsCSVFilter(
-				preds, "m.model", f.Model, chunkPB,
-			)
-			msgTSExpr := `COALESCE(TO_CHAR(m.timestamp AT TIME ZONE 'UTC', ` +
-				`'YYYY-MM-DD"T"HH24:MI:SS"Z"'), '')`
-			q := `SELECT tc.session_id, tc.category,
-				TRIM(COALESCE(tc.tool_name, '')), COUNT(*),
-				` + msgTSExpr + `
-				FROM tool_calls tc
-				LEFT JOIN messages m
-					ON m.session_id = tc.session_id
-					AND m.ordinal = tc.message_ordinal`
-			q += `
-				WHERE ` + strings.Join(preds, " AND ") + `
-				GROUP BY tc.session_id, tc.category,
-					TRIM(COALESCE(tc.tool_name, '')), ` + msgTSExpr
-			rows, qErr := s.pg.QueryContext(
-				ctx, q, chunkPB.args...,
-			)
-			if qErr != nil {
-				return fmt.Errorf(
-					"querying tool_calls: %w", qErr,
-				)
-			}
-			defer rows.Close()
-			for rows.Next() {
-				var sid, cat, toolName, ts string
-				var count int
-				if err := rows.Scan(
-					&sid, &cat, &toolName, &count, &ts,
-				); err != nil {
-					return fmt.Errorf(
-						"scanning tool_call: %w", err,
-					)
-				}
-				info, ok := sessionMap[sid]
-				if !ok {
-					continue
-				}
-				_, date, keep := f.ResolveSkillRowTime(
-					ts, info.ts,
-				)
-				if !keep {
-					continue
-				}
-				toolRows = append(toolRows, db.ToolAnalyticsRow{
-					SessionID: sid,
-					Category:  cat,
-					ToolName:  toolName,
-					Agent:     info.agent,
-					Count:     count,
-					Date:      date,
-				})
-			}
-			return rows.Err()
-		})
-	if err != nil {
-		return db.ToolsAnalyticsResponse{}, err
+	for rows.Next() {
+		var row db.ToolAnalyticsRow
+		var date *time.Time
+		if err := rows.Scan(
+			append([]any{&row.SessionID, &row.Category, &row.ToolName, &row.Agent, &date, &row.Count, &row.Project, &row.Ordinal}, row.ScanTargets()...)...,
+		); err != nil {
+			return nil,
+				fmt.Errorf("scanning tool_call: %w", err)
+		}
+		row.Date = pgScanLocalDate(date)
+		toolRows = append(toolRows, row)
 	}
-
-	if len(toolRows) == 0 {
-		return resp, nil
+	if err := rows.Err(); err != nil {
+		return nil,
+			fmt.Errorf("iterating tool_calls: %w", err)
 	}
-	return db.BuildToolsAnalytics(toolRows), nil
+	return toolRows, nil
+}
+
+// pgSkillsTrendGranularity maps a skills trend granularity to a
+// date_trunc unit; empty or unknown values use week, as
+// BuildSkillsAnalytics does.
+func pgSkillsTrendGranularity(granularity string) string {
+	switch granularity {
+	case "day", "month":
+		return granularity
+	default:
+		return "week"
+	}
 }
 
 // GetAnalyticsSkills returns skill usage analytics. granularity picks
 // the trend bucket size (day, week, or month); empty defaults to week.
+// PostgreSQL returns one row per session, skill, and local trend bucket
+// with the latest call time, so distinct sessions and last-used times
+// stay exact without shipping individual calls.
 func (s *Store) GetAnalyticsSkills(
 	ctx context.Context, f db.AnalyticsFilter, granularity string,
 ) (db.SkillsAnalyticsResponse, error) {
 	pb := &paramBuilder{}
-	where := buildAnalyticsWhereWithoutDate(f, pb)
+	q := pgAnalyticsCallsSQL(f, pb, ", agent, project",
+		`, TRIM(tc.skill_name) AS skill_name, s.agent, s.project`,
+		"TRIM(COALESCE(tc.skill_name, '')) != ''") + `
+	SELECT session_id, skill_name, agent, project,
+		date_trunc(` + pb.add(pgSkillsTrendGranularity(granularity)) + `::text,
+			local_at)::date AS bucket,
+		MAX(used_at), COUNT(*)
+	FROM analytics_calls
+	WHERE ` + pgAnalyticsCallLocalWhere(f, pb) + `
+	GROUP BY session_id, skill_name, agent, project, bucket`
 
-	sessQ := `SELECT id, ` + pgDateCol + `, agent, project
-		FROM sessions WHERE ` + where
-
-	sessRows, err := s.pg.QueryContext(ctx, sessQ, pb.args...)
+	rows, err := s.pg.QueryContext(ctx, q, pb.args...)
 	if err != nil {
 		return db.SkillsAnalyticsResponse{},
-			fmt.Errorf("querying skill sessions: %w", err)
+			fmt.Errorf("querying skill tool_calls: %w", err)
 	}
-	defer sessRows.Close()
-
-	type sessInfo struct {
-		ts      string
-		agent   string
-		project string
-	}
-	sessionMap := make(map[string]sessInfo)
-	var sessionIDs []string
-
-	for sessRows.Next() {
-		var id, agent, project string
-		var ts *time.Time
-		if err := sessRows.Scan(
-			&id, &ts, &agent, &project,
-		); err != nil {
-			return db.SkillsAnalyticsResponse{},
-				fmt.Errorf("scanning skill session: %w", err)
-		}
-		sessionMap[id] = sessInfo{
-			ts:      scanDateCol(ts),
-			agent:   agent,
-			project: project,
-		}
-		sessionIDs = append(sessionIDs, id)
-	}
-	if err := sessRows.Err(); err != nil {
-		return db.SkillsAnalyticsResponse{},
-			fmt.Errorf("iterating skill sessions: %w", err)
-	}
-	if len(sessionIDs) == 0 {
-		return db.BuildSkillsAnalytics(
-			nil, f.From, f.To, granularity,
-		), nil
-	}
+	defer rows.Close()
 
 	var skillRows []db.SkillAnalyticsRow
-	err = pgQueryChunked(sessionIDs,
-		func(chunk []string) error {
-			chunkPB := &paramBuilder{}
-			ph := pgInPlaceholders(chunk, chunkPB)
-			preds := []string{
-				"tc.session_id IN " + ph,
-				"TRIM(COALESCE(tc.skill_name, '')) != ''",
-			}
-			preds = appendPGAnalyticsCSVFilter(
-				preds, "m.model", f.Model, chunkPB,
-			)
-			q := `SELECT tc.session_id,
-					TRIM(COALESCE(tc.skill_name, '')),
-					COUNT(*),
-					m.timestamp
-				FROM tool_calls tc
-				LEFT JOIN messages m
-					ON m.session_id = tc.session_id
-					AND m.ordinal = tc.message_ordinal
-				WHERE ` + strings.Join(preds, " AND ") + `
-				GROUP BY tc.session_id,
-					TRIM(COALESCE(tc.skill_name, '')),
-					m.timestamp`
-			rows, qErr := s.pg.QueryContext(
-				ctx, q, chunkPB.args...,
-			)
-			if qErr != nil {
-				return fmt.Errorf(
-					"querying skill tool_calls: %w", qErr,
-				)
-			}
-			defer rows.Close()
-			for rows.Next() {
-				var sid, skill string
-				var count int
-				var lastTS *time.Time
-				if err := rows.Scan(
-					&sid, &skill, &count, &lastTS,
-				); err != nil {
-					return fmt.Errorf(
-						"scanning skill tool_call: %w", err,
-					)
-				}
-				info := sessionMap[sid]
-				usedTS, date, keep := f.ResolveSkillRowTime(
-					scanDateCol(lastTS), info.ts,
-				)
-				if !keep {
-					continue
-				}
-				skillRows = append(skillRows, db.SkillAnalyticsRow{
-					SessionID:  sid,
-					SkillName:  skill,
-					Agent:      info.agent,
-					Project:    info.project,
-					Date:       date,
-					LastUsedAt: usedTS,
-					Count:      count,
-				})
-			}
-			return rows.Err()
-		})
-	if err != nil {
-		return db.SkillsAnalyticsResponse{}, err
+	for rows.Next() {
+		var row db.SkillAnalyticsRow
+		var bucket, lastUsed *time.Time
+		if err := rows.Scan(
+			&row.SessionID, &row.SkillName, &row.Agent, &row.Project,
+			&bucket, &lastUsed, &row.Count,
+		); err != nil {
+			return db.SkillsAnalyticsResponse{},
+				fmt.Errorf("scanning skill tool_call: %w", err)
+		}
+		row.Date = pgScanLocalDate(bucket)
+		row.LastUsedAt = scanDateCol(lastUsed)
+		skillRows = append(skillRows, row)
 	}
-
+	if err := rows.Err(); err != nil {
+		return db.SkillsAnalyticsResponse{},
+			fmt.Errorf("iterating skill tool_calls: %w", err)
+	}
 	return db.BuildSkillsAnalytics(
 		skillRows, f.From, f.To, granularity,
 	), nil
@@ -2426,18 +1985,6 @@ func (s *Store) getAnalyticsVelocityMessages(
 	return sessionMsgs, nil
 }
 
-// complexityBucket returns the complexity label.
-func complexityBucket(mc int) string {
-	switch {
-	case mc <= 15:
-		return "1-15"
-	case mc <= 60:
-		return "16-60"
-	default:
-		return "61+"
-	}
-}
-
 // velocityAccumulator collects raw values for a velocity
 // group.
 type velocityAccumulator struct {
@@ -2457,16 +2004,16 @@ func (a *velocityAccumulator) computeOverview() db.VelocityOverview {
 	var v db.VelocityOverview
 	v.TurnCycleSec = db.Percentiles{
 		P50: math.Round(
-			percentileFloat(a.turnCycles, 0.5)*10) / 10,
+			db.PercentileFloat(a.turnCycles, 0.5)*10) / 10,
 		P90: math.Round(
-			percentileFloat(a.turnCycles, 0.9)*10) / 10,
+			db.PercentileFloat(a.turnCycles, 0.9)*10) / 10,
 	}
 	v.FirstResponseSec = db.Percentiles{
 		P50: math.Round(
-			percentileFloat(
+			db.PercentileFloat(
 				a.firstResponses, 0.5)*10) / 10,
 		P90: math.Round(
-			percentileFloat(
+			db.PercentileFloat(
 				a.firstResponses, 0.9)*10) / 10,
 	}
 	if a.activeMinutes > 0 {
@@ -2535,8 +2082,8 @@ func (s *Store) GetAnalyticsVelocity(
 					err,
 				)
 		}
-		date := localDate(scanDateCol(ts), loc)
-		if !inDateRange(date, f.From, f.To) {
+		date := db.LocalDate(scanDateCol(ts), loc)
+		if !db.InDateRange(date, f.From, f.To) {
 			continue
 		}
 		if timeIDs != nil && !timeIDs[id] {
@@ -2644,7 +2191,7 @@ func (s *Store) GetAnalyticsVelocity(
 		}
 
 		agentKey := info.agent
-		compKey := complexityBucket(info.mc)
+		compKey := db.ComplexityBucket(info.mc)
 
 		if byAgent[agentKey] == nil {
 			byAgent[agentKey] = &velocityAccumulator{}
@@ -2907,8 +2454,8 @@ func (s *Store) GetAnalyticsTopSessions(
 					"scanning top session: %w", err,
 				)
 		}
-		date := localDate(scanDateCol(ts), loc)
-		if !inDateRange(date, f.From, f.To) {
+		date := db.LocalDate(scanDateCol(ts), loc)
+		if !db.InDateRange(date, f.From, f.To) {
 			continue
 		}
 		if timeIDs != nil && !timeIDs[id] {
@@ -3060,8 +2607,8 @@ func (s *Store) GetAnalyticsSignals(
 				"scanning signals row: %w", err,
 			)
 		}
-		r.Date = localDate(scanDateCol(ts), loc)
-		if !inDateRange(r.Date, f.From, f.To) {
+		r.Date = db.LocalDate(scanDateCol(ts), loc)
+		if !db.InDateRange(r.Date, f.From, f.To) {
 			continue
 		}
 		if timeIDs != nil && !timeIDs[r.ID] {
@@ -3087,6 +2634,14 @@ func (s *Store) GetAnalyticsSignalSessions(
 	signal string,
 	limit int,
 ) (db.SignalSessionsResponse, error) {
+	if db.IsToolMetric(signal) {
+		f.ToolMetric = signal
+		rows, err := s.analyticsToolRows(ctx, f)
+		if err != nil {
+			return db.SignalSessionsResponse{}, err
+		}
+		return db.BuildToolMetricEvidence(rows, signal, f.ToolName, f.EvidenceOffset, limit), nil
+	}
 	if !db.IsSupportedAnalyticsSignal(signal) {
 		return db.SignalSessionsResponse{},
 			db.ErrUnsupportedAnalyticsSignal
@@ -3154,7 +2709,7 @@ func (s *Store) signalRows(
 		if err != nil {
 			return nil, err
 		}
-		if !inDateRange(r.Date, f.From, f.To) {
+		if !db.InDateRange(r.Date, f.From, f.To) {
 			continue
 		}
 		if timeIDs != nil && !timeIDs[r.ID] {
@@ -3198,7 +2753,7 @@ func scanPGSignalRow(
 			"scanning signal row: %w", err,
 		)
 	}
-	r.Date = localDate(scanDateCol(ts), loc)
+	r.Date = db.LocalDate(scanDateCol(ts), loc)
 	return r, nil
 }
 
@@ -3223,19 +2778,20 @@ func (s *Store) signalMessages(
 		for sessionID, scopedRows := range rowsBySession {
 			for _, row := range scopedRows {
 				out[sessionID] = append(out[sessionID], db.SignalMessage{
-					SessionID:  row.SessionID,
-					Ordinal:    row.Ordinal,
-					Role:       row.Role,
-					Content:    row.Content,
-					Timestamp:  row.Timestamp,
-					IsSystem:   row.IsSystem,
-					HasToolUse: row.HasToolUse,
+					SessionID:     row.SessionID,
+					Ordinal:       row.Ordinal,
+					Role:          row.Role,
+					SourceSubtype: row.SourceSubtype,
+					Content:       row.Content,
+					Timestamp:     row.Timestamp,
+					IsSystem:      row.IsSystem,
+					HasToolUse:    row.HasToolUse,
 				})
 			}
 		}
 		return out, nil
 	}
-	filterModels := csvFilterValues(f.Model)
+	filterModels := db.CSVFilterValues(f.Model)
 	err := pgQueryChunked(ids, func(chunk []string) error {
 		pb := &paramBuilder{}
 		placeholders := make([]string, 0, len(chunk))
@@ -3245,7 +2801,7 @@ func (s *Store) signalMessages(
 		q := `SELECT session_id, ordinal, role, content,
 					COALESCE(to_char(timestamp AT TIME ZONE 'UTC',
 						'YYYY-MM-DD"T"HH24:MI:SS.US"Z"'), ''),
-					is_system, has_tool_use
+					is_system, has_tool_use, COALESCE(source_subtype, '')
 				FROM messages
 				WHERE session_id IN (` + strings.Join(placeholders, ",") + `)`
 		if len(filterModels) == 1 {
@@ -3274,7 +2830,7 @@ func (s *Store) signalMessages(
 			if err := msgRows.Scan(
 				&m.SessionID, &m.Ordinal, &m.Role,
 				&m.Content, &m.Timestamp,
-				&m.IsSystem, &m.HasToolUse,
+				&m.IsSystem, &m.HasToolUse, &m.SourceSubtype,
 			); err != nil {
 				return fmt.Errorf(
 					"scanning signal message: %w", err,
@@ -3314,6 +2870,7 @@ func (s *Store) populateFrustrationMarkers(
 		q := `SELECT session_id, ordinal, content, is_system
 			FROM messages
 			WHERE role = 'user'
+			  AND COALESCE(source_subtype, '') <> 'tool_result'
 			  AND session_id IN (` + strings.Join(placeholders, ",") + `)`
 		msgRows, err := s.pg.QueryContext(ctx, q, pb.args...)
 		if err != nil {

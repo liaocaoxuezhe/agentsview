@@ -79,6 +79,17 @@ func (db *DB) FileBackedSessionCountForSource(
 	return db.fileBackedSessionCount(ctx, machine, idPrefix, true)
 }
 
+// RebuildAgentExclusion names an agent whose sessions leave the protected
+// rebuild count. KeepJSONLRows spares the agent's Claude-layout .jsonl
+// transcript rows: ICodeMate shares one agent label across self-preserving
+// OpenCode containers and ordinary CLI transcripts, and the coordinator
+// decides per resync whether the transcript rows stay protected (provider
+// enabled) or leave with the rest (provider disabled, nothing discovered).
+type RebuildAgentExclusion struct {
+	Agent         string
+	KeepJSONLRows bool
+}
+
 // FileBackedSessionCountForRebuildOwner returns the protected root-session
 // count owned by the local rebuild phase. Current, empty, and legacy local
 // machine values cover archives created before source baselines; exact
@@ -89,7 +100,7 @@ func (db *DB) FileBackedSessionCountForRebuildOwner(
 	ctx context.Context,
 	localMachine string,
 	excludedIDPrefixes []string,
-	excludedAgents []string,
+	excludedAgents []RebuildAgentExclusion,
 ) (int, error) {
 	conditions := []string{`(
 		machine = ? OR machine = '' OR machine = 'local' OR EXISTS (
@@ -116,16 +127,22 @@ func (db *DB) FileBackedSessionCountForRebuildOwner(
 		args = append(args, prefix, prefix)
 	}
 	seenAgents := make(map[string]struct{}, len(excludedAgents))
-	for _, agent := range excludedAgents {
-		if agent == "" {
+	for _, exclusion := range excludedAgents {
+		if exclusion.Agent == "" {
 			continue
 		}
-		if _, seen := seenAgents[agent]; seen {
+		if _, seen := seenAgents[exclusion.Agent]; seen {
 			continue
 		}
-		seenAgents[agent] = struct{}{}
+		seenAgents[exclusion.Agent] = struct{}{}
+		if exclusion.KeepJSONLRows {
+			conditions = append(conditions,
+				`(agent <> ? OR lower(file_path) LIKE '%.jsonl')`)
+			args = append(args, exclusion.Agent)
+			continue
+		}
 		conditions = append(conditions, `agent <> ?`)
-		args = append(args, agent)
+		args = append(args, exclusion.Agent)
 	}
 
 	var count int
@@ -189,21 +206,12 @@ func (db *DB) GetStats(
 	if excludeAutomated {
 		filter += " AND is_automated = 0"
 	}
-	query := fmt.Sprintf(`
-		SELECT
-			(SELECT COUNT(*) FROM sessions
-			 WHERE %s),
-			(SELECT COALESCE(SUM(message_count), 0)
-			 FROM sessions WHERE %s),
-			(SELECT COUNT(DISTINCT project) FROM sessions
-			 WHERE %s),
-			(SELECT COUNT(DISTINCT machine) FROM sessions
-			 WHERE %s),
-			(SELECT MIN(COALESCE(
-				NULLIF(started_at, ''), created_at
-			 )) FROM sessions
-			 WHERE %s)`,
-		filter, filter, filter, filter, filter)
+	// Sidebar polling needs all totals for the same rows. Aggregate them
+	// together so each refresh visits the filtered sessions only once.
+	query := `SELECT COUNT(*), COALESCE(SUM(message_count), 0),
+		COUNT(DISTINCT project), COUNT(DISTINCT machine),
+		MIN(COALESCE(NULLIF(started_at, ''), created_at))
+		FROM sessions WHERE ` + filter
 
 	var s Stats
 	err := db.getReader().QueryRowContext(ctx, query).Scan(

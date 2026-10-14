@@ -17,12 +17,15 @@ import (
 )
 
 func (s *Server) registerUsageRoutes() {
-	group := newRouteGroup(s.api, "/api/v1/usage", "Usage")
+	group := huma.NewGroup(s.api, "/api/v1/usage")
+	configureRouteGroup(group, "Usage")
 
-	get(s, group, "/summary", "Get usage summary", s.humaUsageSummary)
-	get(s, group, "/comparison", "Get usage comparison", s.humaUsageComparison)
-	get(
-		s, group, "/pairwise-comparison",
+	// A cold report builds the requested usage data before returning exact
+	// totals. Its lifetime is the request context, not the normal write limit.
+	s.getLong(group, "/summary", "Get usage summary", s.humaUsageSummary)
+	s.stream(group, http.MethodGet, "/summary/stream", "Get usage summary with progress", s.humaUsageSummaryStream)
+	s.getLong(group, "/comparison", "Get usage comparison", s.humaUsageComparison)
+	s.getLong(group, "/pairwise-comparison",
 		"Get usage pairwise comparison", s.humaUsagePairwiseComparison,
 	)
 	deltaSchema := s.api.OpenAPI().Components.Schemas.Map()["ServiceUsagePairwiseComparisonDelta"]
@@ -38,7 +41,7 @@ func (s *Server) registerUsageRoutes() {
 		{Type: "null"},
 	}
 	costPerSessionSchema.Ref = ""
-	get(s, group, "/top-sessions", "Get top usage sessions", s.humaUsageTopSessions)
+	s.getLong(group, "/top-sessions", "Get top usage sessions", s.humaUsageTopSessions)
 }
 
 type UsageFilterInput struct {
@@ -47,6 +50,7 @@ type UsageFilterInput struct {
 	Timezone          string `query:"timezone" doc:"IANA timezone name"`
 	Agent             string `query:"agent" doc:"Filter by agent"`
 	Project           string `query:"project" doc:"Filter by project"`
+	ProjectKey        string `query:"project_key" doc:"Filter by an opaque project key"`
 	Machine           string `query:"machine" doc:"Filter by machine"`
 	GitBranch         string `query:"git_branch" doc:"Filter by git branch; opaque (project, branch) tokens from the /branches endpoint"`
 	ExcludeProject    string `query:"exclude_project" doc:"Exclude a project"`
@@ -68,6 +72,7 @@ type usageTopSessionsInput struct {
 	UsageFilterInput
 	Limit      int    `query:"limit" minimum:"0" maximum:"100" default:"20" doc:"Maximum number of sessions"`
 	Sort       string `query:"sort" enum:"cost,tokens" default:"cost" doc:"Rank sessions by cost or selected token types"`
+	GroupBy    string `query:"group_by" enum:"group" doc:"Merge sessions by project and group; a trailing row with no session or group ID sums rows past limit"`
 	TokenTypes string `query:"token_types" doc:"Comma-separated token counters for token ranking: input, cache_write, cache_read, output"`
 }
 
@@ -93,6 +98,7 @@ func usageRequestFromInput(in UsageFilterInput) service.UsageRequest {
 		Timezone:          in.Timezone,
 		Agent:             in.Agent,
 		Project:           in.Project,
+		ProjectKey:        in.ProjectKey,
 		Machine:           in.Machine,
 		GitBranch:         in.GitBranch,
 		ExcludeProject:    in.ExcludeProject,
@@ -139,8 +145,14 @@ func usagePairwiseRequestFromInput(
 func (s *Server) usageFilterFromInput(
 	ctx context.Context, in UsageFilterInput,
 ) (db.UsageFilter, error) {
-	req, err := service.ResolveUsageProjectKeys(
-		ctx, s.db, usageRequestFromInput(in),
+	machine, err := db.ResolveMachineFilter(ctx, s.db, in.Machine)
+	if err != nil {
+		return db.UsageFilter{}, serverError(err)
+	}
+	in.Machine = machine
+	req := usageRequestFromInput(in)
+	req, err = service.ResolveUsageProjectKeys(
+		ctx, s.db, req,
 	)
 	if err == nil {
 		var f db.UsageFilter
@@ -149,8 +161,7 @@ func (s *Server) usageFilterFromInput(
 			return f, nil
 		}
 	}
-	var ue *service.UsageInputError
-	if errors.As(err, &ue) {
+	if ue, ok := errors.AsType[*service.UsageInputError](err); ok {
 		return db.UsageFilter{}, usageInputAPIError(ue)
 	}
 	return db.UsageFilter{}, err
@@ -162,21 +173,58 @@ func (s *Server) humaUsageSummary(
 ) (*jsonOutput[UsageSummaryResponse], error) {
 	res, err := s.sessions.UsageSummary(ctx, usageRequestFromInput(*in))
 	if err != nil {
-		var ue *service.UsageInputError
-		if errors.As(err, &ue) {
-			return nil, usageInputAPIError(ue)
-		}
-		if handled := handleHumaContextError(err); handled != nil {
-			return nil, handled
-		}
-		if handled := handleHumaReadOnly(err); handled != nil {
-			return nil, handled
-		}
-		return nil, internalError("usage summary error", err)
+		return nil, usageSummaryAPIError(err)
 	}
 	return &jsonOutput[UsageSummaryResponse]{
 		Body: usageSummaryResponseFromService(res),
 	}, nil
+}
+
+func usageSummaryAPIError(err error) error {
+	if ue, ok := errors.AsType[*service.UsageInputError](err); ok {
+		return usageInputAPIError(ue)
+	}
+	if handled := handleHumaContextError(err); handled != nil {
+		return handled
+	}
+	if handled := handleHumaReadOnly(err); handled != nil {
+		return handled
+	}
+	return internalError("usage summary error", err)
+}
+
+func (s *Server) humaUsageSummaryStream(
+	ctx context.Context, in *UsageFilterInput,
+) (*huma.StreamResponse, error) {
+	req := usageRequestFromInput(*in)
+	if _, err := service.BuildUsageFilter(req); err != nil {
+		if input, ok := errors.AsType[*service.UsageInputError](err); ok {
+			return nil, usageInputAPIError(input)
+		}
+		return nil, serverError(err)
+	}
+	return &huma.StreamResponse{Body: func(hctx huma.Context) {
+		stream, ok := newHumaSSEStream(hctx)
+		if !ok {
+			return
+		}
+		ctx, cancel := context.WithCancel(ctx)
+		defer cancel()
+		req.Progress = func(phase string) {
+			if !stream.SendJSON("progress", map[string]string{"detail": phase}) {
+				cancel()
+			}
+		}
+		req.Progress("Preparing usage report from the archive")
+		summary, err := s.sessions.UsageSummary(ctx, req)
+		if err != nil {
+			if err := usageSummaryAPIError(err); err != nil {
+				stream.SendJSON("error", map[string]string{"error": err.Error()})
+			}
+			return
+		}
+		stream.SendJSON("done", usageSummaryResponseFromService(summary))
+	}}, nil
 }
 
 func (s *Server) humaUsageComparison(
@@ -214,16 +262,14 @@ func (s *Server) humaUsagePairwiseComparison(
 ) (*jsonOutput[service.UsagePairwiseComparisonResponse], error) {
 	req, err := usagePairwiseRequestFromInput(*in)
 	if err != nil {
-		var ue *service.UsageInputError
-		if errors.As(err, &ue) {
+		if ue, ok := errors.AsType[*service.UsageInputError](err); ok {
 			return nil, usageInputAPIError(ue)
 		}
 		return nil, err
 	}
 	comparison, err := s.sessions.UsagePairwiseComparison(ctx, req)
 	if err != nil {
-		var ue *service.UsageInputError
-		if errors.As(err, &ue) {
+		if ue, ok := errors.AsType[*service.UsageInputError](err); ok {
 			return nil, usageInputAPIError(ue)
 		}
 		if handled := handleHumaContextError(err); handled != nil {
@@ -296,6 +342,7 @@ func (s *Server) humaUsageTopSessions(
 	if err != nil {
 		return nil, err
 	}
+	f.TopSessionsByGroup = in.GroupBy == "group"
 	f.Breakdowns = false
 	switch strings.ToLower(strings.TrimSpace(in.Sort)) {
 	case "", db.TopSessionsSortCost:

@@ -5,8 +5,7 @@
 package duckdb
 
 import (
-	"context"
-	"encoding/json"
+	"encoding/json/jsontext"
 	"strconv"
 	"testing"
 
@@ -15,6 +14,7 @@ import (
 	"go.kenn.io/agentsview/internal/db"
 	"go.kenn.io/agentsview/internal/export"
 	"go.kenn.io/agentsview/internal/money"
+	"go.kenn.io/agentsview/internal/storage"
 )
 
 // webSearchPricing prices the fixture model at $1/MTok in and $2/MTok out,
@@ -28,8 +28,8 @@ var webSearchPricing = []db.ModelPricing{{
 // webSearchWrites seeds one Claude session with two identical assistant
 // turns, the first of which was billed for `searches` web searches.
 func webSearchWrites(model string, searches int) []db.SessionBatchWrite {
-	usage := func(requests int) json.RawMessage {
-		return json.RawMessage(
+	usage := func(requests int) jsontext.Value {
+		return jsontext.Value(
 			`{"input_tokens":100000,"output_tokens":100000,` +
 				`"server_tool_use":{"web_search_requests":` +
 				strconv.Itoa(requests) + `,"web_fetch_requests":0}}`)
@@ -71,6 +71,8 @@ func webSearchWrites(model string, searches int) []db.SessionBatchWrite {
 func webSearchStores(
 	t *testing.T, model string, searches int,
 ) (*db.DB, *Store) {
+	t.Helper()
+
 	return webSearchStoresFromWrites(t, webSearchWrites(model, searches))
 }
 
@@ -78,12 +80,13 @@ func webSearchStoresFromWrites(
 	t *testing.T, writes []db.SessionBatchWrite,
 ) (*db.DB, *Store) {
 	t.Helper()
-	ctx := context.Background()
+
+	ctx := t.Context()
 	local := newLocalDB(t)
 	require.NoError(t, local.UpsertModelPricing(webSearchPricing))
-	_, err := local.WriteSessionBatchAtomic(writes)
+	_, err := local.WriteSessionBatchAtomic(ctx, writes)
 	require.NoError(t, err)
-	syncer := newInMemoryTestSync(t, local, SyncOptions{})
+	syncer := newInMemoryTestSync(t, local, storage.MirrorPushOptions{})
 	require.NoError(t, createSchema(ctx, syncer.DB()))
 	_, err = syncer.pushEverything(ctx, nil)
 	require.NoError(t, err)
@@ -100,7 +103,7 @@ func asymmetricWebSearchWrites() []db.SessionBatchWrite {
 		Content:   "fuller snapshot",
 		Timestamp: "2026-07-30T10:03:00Z",
 		Model:     "claude-websearch-test",
-		TokenUsage: json.RawMessage(
+		TokenUsage: jsontext.Value(
 			`{"input_tokens":100000,"output_tokens":200000,` +
 				`"server_tool_use":{"web_search_requests":0}}`),
 		OutputTokens:    200000,
@@ -112,7 +115,7 @@ func asymmetricWebSearchWrites() []db.SessionBatchWrite {
 }
 
 func TestDuckSessionUsageBillsWebSearchRequestsLikeSQLite(t *testing.T) {
-	ctx := context.Background()
+	ctx := t.Context()
 	local, duck := webSearchStores(t, "claude-websearch-test", 2)
 
 	sqliteGot, err := local.GetSessionUsage(ctx, "duck-ws", true)
@@ -133,7 +136,7 @@ func TestDuckSessionUsageBillsWebSearchRequestsLikeSQLite(t *testing.T) {
 }
 
 func TestDuckDailyUsageBillsWebSearchRequestsLikeSQLite(t *testing.T) {
-	ctx := context.Background()
+	ctx := t.Context()
 	local, duck := webSearchStores(t, "claude-websearch-test", 2)
 	filter := db.UsageFilter{From: "2026-07-01", To: "2026-07-31"}
 
@@ -159,7 +162,7 @@ func TestDuckWebSearchOnlyChargeMakesReportedSessionMixed(t *testing.T) {
 			SessionID: "duck-ws-mixed", Ordinal: 0, Role: "assistant",
 			Content: "searched", Timestamp: "2026-07-30T10:01:00Z",
 			Model: "claude-websearch-test",
-			TokenUsage: json.RawMessage(
+			TokenUsage: jsontext.Value(
 				`{"input_tokens":0,"output_tokens":0,` +
 					`"server_tool_use":{"web_search_requests":2}}`),
 			ClaudeMessageID: "m-web", ClaudeRequestID: "r-web",
@@ -172,7 +175,7 @@ func TestDuckWebSearchOnlyChargeMakesReportedSessionMixed(t *testing.T) {
 		}},
 		DataVersion: 1, ReplaceMessages: true,
 	}}
-	ctx := context.Background()
+	ctx := t.Context()
 	local, duck := webSearchStoresFromWrites(t, writes)
 
 	sqliteSession, err := local.GetSessionUsage(ctx, "duck-ws-mixed", false)
@@ -201,7 +204,7 @@ func TestDuckWebSearchOnlyChargeMakesReportedSessionMixed(t *testing.T) {
 func TestDuckAsymmetricClaudeSnapshotsPreserveWebSearchFeeLikeSQLite(
 	t *testing.T,
 ) {
-	ctx := context.Background()
+	ctx := t.Context()
 	local, duck := webSearchStoresFromWrites(t, asymmetricWebSearchWrites())
 
 	sqliteSession, err := local.GetSessionUsage(ctx, "duck-ws", true)
@@ -237,7 +240,7 @@ func TestDuckAsymmetricClaudeSnapshotsPreserveWebSearchFeeLikeSQLite(
 }
 
 func TestDuckActivityReportBillsWebSearchRequestsLikeSQLite(t *testing.T) {
-	ctx := context.Background()
+	ctx := t.Context()
 	local, duck := webSearchStores(t, "claude-websearch-test", 2)
 
 	sqliteGot, err := local.GetActivityReport(ctx,
@@ -254,7 +257,7 @@ func TestDuckActivityReportBillsWebSearchRequestsLikeSQLite(t *testing.T) {
 }
 
 func TestDuckSessionUsageRowsCarryWebSearchRequestsLikeSQLite(t *testing.T) {
-	ctx := context.Background()
+	ctx := t.Context()
 	local, duck := webSearchStores(t, "claude-websearch-test", 2)
 
 	sqliteRowSet, err := local.GetSessionUsageRows(ctx, []string{"duck-ws"})
@@ -272,7 +275,7 @@ func TestDuckSessionUsageRowsCarryWebSearchRequestsLikeSQLite(t *testing.T) {
 }
 
 func TestDuckWebSearchFeeOnUnpricedModelMatchesSQLite(t *testing.T) {
-	ctx := context.Background()
+	ctx := t.Context()
 	local, duck := webSearchStores(t, "some-unlisted-model", 2)
 
 	sqliteGot, err := local.GetSessionUsage(ctx, "duck-ws", true)

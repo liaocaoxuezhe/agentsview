@@ -91,6 +91,11 @@ func (c *usageProbeConn) QueryContext(
 	c.state.mu.Unlock()
 
 	normalized := strings.ToLower(query)
+	if strings.Contains(normalized, "from genai_pricing") {
+		return &usageProbeRows{columns: []string{
+			"version", "source_ref", "source", "data_json", "updated_at",
+		}}, nil
+	}
 	if strings.Contains(normalized, "from model_pricing") {
 		return &usageProbeRows{
 			columns: []string{
@@ -98,18 +103,20 @@ func (c *usageProbeConn) QueryContext(
 				"input_microdollars_per_mtok",
 				"output_microdollars_per_mtok",
 				"cache_creation_microdollars_per_mtok",
+				"cache_creation_1h_microdollars_per_mtok",
 				"cache_read_microdollars_per_mtok",
 				"updated_at",
 				"above_input_tokens",
 				"band_input_microdollars_per_mtok",
 				"band_output_microdollars_per_mtok",
 				"band_cache_creation_microdollars_per_mtok",
+				"band_cache_creation_1h_microdollars_per_mtok",
 				"band_cache_read_microdollars_per_mtok",
 				"band_updated_at",
 			},
 			values: [][]driver.Value{{
-				"claude-sonnet", int64(3000000), int64(15000000), int64(3750000), int64(300000), "2026-06-08",
-				nil, nil, nil, nil, nil, nil,
+				"claude-sonnet", int64(3000000), int64(15000000), int64(3750000), int64(0), int64(300000), "2026-06-08",
+				nil, nil, nil, nil, nil, nil, nil,
 			}},
 		}, nil
 	}
@@ -169,7 +176,9 @@ func (c *usageProbeConn) QueryContext(
 				"message_ordinal",
 				"usage_source",
 				"ts",
+				"pricing_ts",
 				"model",
+				"provider_id",
 				"token_usage",
 				"web_search_requests",
 				"input_tokens",
@@ -203,7 +212,9 @@ func usageProbeUsageRow(
 		int64(0),
 		"message",
 		ts,
+		ts,
 		"claude-sonnet",
+		"",
 		`{"input_tokens":100,"output_tokens":50}`,
 		int64(0),
 		int64(0),
@@ -240,7 +251,7 @@ func TestPGGetDailyUsageReturnsDedupedSessionCounts(t *testing.T) {
 		pg: newUsageProbeDB(t, &usageProbeState{}),
 	}
 
-	result, err := store.GetDailyUsage(context.Background(), db.UsageFilter{
+	result, err := store.GetDailyUsage(t.Context(), db.UsageFilter{
 		From: "2024-06-15",
 		To:   "2024-06-15",
 	})
@@ -256,22 +267,6 @@ func TestPGGetDailyUsageReturnsDedupedSessionCounts(t *testing.T) {
 	assert.Equal(t, 1, result.SessionCounts.ByAgent["claude"])
 	assert.NotContains(t, countsByDisplay, "proj-b")
 	assert.Zero(t, result.SessionCounts.ByAgent["codex"])
-}
-
-func TestPGUsageDedupTokenForRowFallsBackToSourceUUIDWhenClaudePairIncomplete(t *testing.T) {
-	got, ok := pgUsageDedupTokenForRow(
-		"message",
-		"claude-code",
-		"msg-dup",
-		"",
-		"source-dup",
-		"",
-	)
-	require.True(t, ok, "expected source_uuid fallback key")
-	assert.Equal(t, pgUsageDedupToken{
-		kind:  "source",
-		value: "claude-code:source-dup",
-	}, got)
 }
 
 func TestPGUsageAmountsPreserveSessionSummaryUsageEventTokens(t *testing.T) {
@@ -481,7 +476,7 @@ func TestPGGetUsageMatchingSessionCountUsesSessionQuery(t *testing.T) {
 		pg: newUsageProbeDB(t, state),
 	}
 
-	count, err := store.GetUsageMatchingSessionCount(context.Background(), db.UsageFilter{
+	count, err := store.GetUsageMatchingSessionCount(t.Context(), db.UsageFilter{
 		Agent: "copilot",
 		Model: "gpt-5.3-codex",
 	})
@@ -548,9 +543,12 @@ func TestPGTopSessionsUsageRowQueryUsesNarrowScan(t *testing.T) {
 		From:     "2024-06-01",
 		To:       "2024-06-30",
 		Timezone: "America/New_York",
-	})
+	}, true)
 
 	normalized := strings.ToLower(query)
+	assert.Contains(t, normalized, "coalesce(attributed.group_key, '') as group_key")
+	assert.Contains(t, normalized, "coalesce(attributed.session_name, '') as session_name")
+	assert.Contains(t, normalized, "attributed.started_at as group_started_at")
 	assert.NotContains(t, normalized, "display_name")
 	assert.NotContains(t, normalized, "first_message")
 	assert.NotContains(t, normalized, "cost_status")
@@ -652,6 +650,7 @@ func TestPGActivityReportRowStatusCanonicalizesKimiAliasByTimestamp(t *testing.T
 					usageSource: "provider",
 					model:       "daimon-kimi-code",
 					ts:          sql.NullTime{Time: tt.timestamp, Valid: true},
+					pricingTS:   sql.NullTime{Time: tt.timestamp, Valid: true},
 					inputTokens: 1_000_000,
 				},
 				resolver,
@@ -695,6 +694,10 @@ func TestPGActivityReportRowStatusPrefersExactCustomKimiAlias(t *testing.T) {
 			usageSource: "provider",
 			model:       "daimon-kimi-code",
 			ts: sql.NullTime{
+				Time:  pricingpkg.KimiModelEraCutoff,
+				Valid: true,
+			},
+			pricingTS: sql.NullTime{
 				Time:  pricingpkg.KimiModelEraCutoff,
 				Valid: true,
 			},
@@ -785,4 +788,166 @@ func TestPGDailyUsageAmountsPrefersExactCustomKimiAlias(t *testing.T) {
 	resolutions := block.Models["kimi-for-coding"].Resolutions
 	require.Len(t, resolutions, 1)
 	assert.Equal(t, "kimi-for-coding", resolutions[0].PricedModel)
+}
+
+func TestPGDailyUsageAmountsPricesGPTReserveAsLuna(t *testing.T) {
+	lunaCost := money.MustParseDollars("0.20")
+	resolver := export.NewPricingResolver([]export.EffectivePricingRow{{
+		ModelPattern: pricingpkg.GPT56LunaCanonical,
+		Rates:        export.ModelRates{InputPerMTok: lunaCost},
+	}})
+
+	_, _, _, _, cost, _, err := pgDailyUsageAmounts(pgDailyUsageScanRow{
+		usageSource: "provider",
+		model:       pricingpkg.GPTReserveModelName,
+		inputTokens: 1_000_000,
+	}, resolver)
+	require.NoError(t, err)
+	assert.Equal(t, lunaCost, cost)
+	block, err := resolver.BuildBlock()
+	require.NoError(t, err)
+	require.Contains(t, block.Models, pricingpkg.GPTReserveModelName)
+	resolutions := block.Models[pricingpkg.GPTReserveModelName].Resolutions
+	require.Len(t, resolutions, 1)
+	assert.Equal(t, pricingpkg.GPT56LunaCanonical, resolutions[0].PricedModel)
+	assert.NotContains(t, block.Models, pricingpkg.GPT56LunaCanonical)
+}
+
+func TestPGDailyUsageAmountsPrefersExactCustomGPTReserve(t *testing.T) {
+	resolver := export.NewPricingResolver([]export.EffectivePricingRow{
+		{
+			ModelPattern: pricingpkg.GPTReserveModelName,
+			Rates: export.ModelRates{
+				InputPerMTok: money.MustParseDollars("7"),
+				Source:       export.PricingRowSourceCustom,
+			},
+		},
+		{
+			ModelPattern: pricingpkg.GPT56LunaCanonical,
+			Rates: export.ModelRates{
+				InputPerMTok: money.MustParseDollars("0.20"),
+				Source:       export.PricingRowSourceFetched,
+			},
+		},
+	})
+
+	_, _, _, _, cost, _, err := pgDailyUsageAmounts(pgDailyUsageScanRow{
+		usageSource: "provider",
+		model:       pricingpkg.GPTReserveModelName,
+		inputTokens: 1_000_000,
+	}, resolver)
+	require.NoError(t, err)
+	assert.Equal(t, money.MustParseDollars("7"), cost)
+	block, err := resolver.BuildBlock()
+	require.NoError(t, err)
+	resolutions := block.Models[pricingpkg.GPTReserveModelName].Resolutions
+	require.Len(t, resolutions, 1)
+	assert.Equal(t, pricingpkg.GPTReserveModelName, resolutions[0].PricedModel)
+}
+
+func TestPGDailyUsageAmountsPricesCodexAutoReviewAsLuna(t *testing.T) {
+	lunaCost := money.MustParseDollars("0.20")
+	resolver := export.NewPricingResolver([]export.EffectivePricingRow{{
+		ModelPattern: pricingpkg.GPT56LunaCanonical,
+		Rates:        export.ModelRates{InputPerMTok: lunaCost},
+	}})
+
+	_, _, _, _, cost, _, err := pgDailyUsageAmounts(pgDailyUsageScanRow{
+		usageSource: "provider",
+		model:       pricingpkg.CodexAutoReviewModelName,
+		inputTokens: 1_000_000,
+	}, resolver)
+	require.NoError(t, err)
+	assert.Equal(t, lunaCost, cost)
+	block, err := resolver.BuildBlock()
+	require.NoError(t, err)
+	require.Contains(t, block.Models, pricingpkg.CodexAutoReviewModelName)
+	resolutions := block.Models[pricingpkg.CodexAutoReviewModelName].Resolutions
+	require.Len(t, resolutions, 1)
+	assert.Equal(t, pricingpkg.GPT56LunaCanonical, resolutions[0].PricedModel)
+	assert.NotContains(t, block.Models, pricingpkg.GPT56LunaCanonical)
+}
+
+// TestPGDailyUsageAmountsPrefersExactCustomPrefixedCodexAutoReview proves an
+// exact custom row beats the alias for both the provider-prefixed name and the
+// bare name users configure today.
+func TestPGDailyUsageAmountsPrefersExactCustomPrefixedCodexAutoReview(t *testing.T) {
+	for _, model := range []string{
+		"openai/" + pricingpkg.CodexAutoReviewModelName,
+		pricingpkg.CodexAutoReviewModelName,
+	} {
+		t.Run(model, func(t *testing.T) {
+			resolver := export.NewPricingResolver([]export.EffectivePricingRow{
+				{
+					ModelPattern: model,
+					Rates: export.ModelRates{
+						InputPerMTok: money.MustParseDollars("7"),
+						Source:       export.PricingRowSourceCustom,
+					},
+				},
+				{
+					ModelPattern: pricingpkg.GPT56LunaCanonical,
+					Rates: export.ModelRates{
+						InputPerMTok: money.MustParseDollars("0.20"),
+						Source:       export.PricingRowSourceFetched,
+					},
+				},
+			})
+
+			_, _, _, _, cost, _, err := pgDailyUsageAmounts(pgDailyUsageScanRow{
+				usageSource: "provider",
+				model:       model,
+				inputTokens: 1_000_000,
+			}, resolver)
+			require.NoError(t, err)
+			assert.Equal(t, money.MustParseDollars("7"), cost)
+			block, err := resolver.BuildBlock()
+			require.NoError(t, err)
+			resolutions := block.Models[model].Resolutions
+			require.Len(t, resolutions, 1)
+			assert.Equal(t, model, resolutions[0].PricedModel)
+		})
+	}
+}
+
+func TestPGDailyUsageAmountsForwardsProviderToBilling(t *testing.T) {
+	resolver := export.NewPricingResolver([]export.EffectivePricingRow{{
+		ModelPattern: "posit-model",
+		Rates:        export.ModelRates{InputPerMTok: money.MustParseDollars("1")},
+	}})
+	row := func(providerID string) pgDailyUsageScanRow {
+		return pgDailyUsageScanRow{
+			usageSource: "provider", model: "posit-model", providerID: providerID,
+			pricingTS: sql.NullTime{
+				Time: time.Date(2026, 8, 1, 0, 0, 0, 0, time.UTC), Valid: true,
+			},
+			inputTokens: 1_000_000,
+		}
+	}
+	_, _, _, _, positCost, _, err := pgDailyUsageAmounts(row("positai"), resolver)
+	require.NoError(t, err)
+	_, _, _, _, plainCost, _, err := pgDailyUsageAmounts(row("claude"), resolver)
+	require.NoError(t, err)
+	assert.Equal(t, money.MustParseDollars("1.1"), positCost)
+	assert.Equal(t, money.MustParseDollars("1"), plainCost)
+}
+
+func TestPGDailyUsageAmountsUsesBilledRatesForReportedCacheSavings(t *testing.T) {
+	resolver := export.NewPricingResolver([]export.EffectivePricingRow{{
+		ModelPattern: "posit-model",
+		Rates: export.ModelRates{
+			InputPerMTok:     money.MustParseDollars("1"),
+			CacheReadPerMTok: money.MustParseDollars("0.1"),
+		},
+	}})
+
+	_, _, _, _, cost, savings, err := pgDailyUsageAmounts(pgDailyUsageScanRow{
+		usageSource: "provider", model: "posit-model", providerID: "positai",
+		inputTokens: 1_000_000, cacheReadInputTokens: 1_000_000,
+		cost:       sql.NullInt64{Int64: 77, Valid: true},
+		costSource: "provider-reported",
+	}, resolver)
+	require.NoError(t, err)
+	assert.Equal(t, money.Money{Microdollars: 77}, cost)
+	assert.Equal(t, money.Money{Microdollars: 990_000}, savings)
 }

@@ -1,13 +1,13 @@
 package parser
 
 import (
-	"context"
-	"encoding/json"
+	"encoding/json/v2"
 	"os"
 	"path/filepath"
 	"runtime"
 	"strings"
 	"testing"
+	"time"
 
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
@@ -35,14 +35,15 @@ func newGrokTestProvider(t *testing.T, root string) Provider {
 
 func parseGrokGolden(t *testing.T, generation string) ParseResult {
 	t.Helper()
+
 	root := t.TempDir()
 	fixtureRoot := filepath.Join("testdata", "grok-build", generation)
 	require.NoError(t, os.CopyFS(root, os.DirFS(fixtureRoot)))
 	provider := newGrokTestProvider(t, root)
-	sources, err := provider.Discover(context.Background())
+	sources, err := provider.Discover(t.Context())
 	require.NoError(t, err)
 	require.Len(t, sources, 1)
-	outcome, err := provider.Parse(context.Background(), ParseRequest{
+	outcome, err := provider.Parse(t.Context(), ParseRequest{
 		Source: sources[0],
 	})
 	require.NoError(t, err)
@@ -77,8 +78,7 @@ func TestGrokProviderGoldenCurrentMetadata(t *testing.T) {
 	session := result.Session
 	assert.Equal(t, "/workspace/grok-worktrees/parser-audit", session.Cwd)
 	assert.Equal(t, "agentsview", session.Project)
-	assert.Equal(
-		t,
+	assert.Equal(t,
 		"grok:019f5000-0000-7000-8000-000000000000",
 		session.ParentSessionID,
 	)
@@ -102,6 +102,26 @@ func TestGrokProviderGoldenLegacyTranscript(t *testing.T) {
 	assert.Equal(t, "call_1", result.Messages[2].ToolResults[0].ToolUseID)
 }
 
+func TestGrokTimestampLookingPrompt(t *testing.T) {
+	root := t.TempDir()
+	sessionDir := filepath.Join(root, "cwd-key", "grok-timestamp")
+	writeGrokFixtureFile(t, filepath.Join(sessionDir, "summary.json"), `{
+		"info":{"id":"grok-timestamp","cwd":"/workspace/agentsview"},
+		"created_at":"2026-07-02T15:11:00Z",
+		"updated_at":"2026-07-02T15:12:00Z"
+	}`)
+	literal := "<timestamp>Thursday, Jul 2, 2026, 11:11 AM (UTC-4)</timestamp> review this prompt"
+	writeGrokFixtureFile(t, filepath.Join(sessionDir, "chat_history.jsonl"),
+		`{"type":"user","content":"`+literal+`"}`+"\n")
+
+	result, err := ParseGrokSummary(
+		filepath.Join(sessionDir, "summary.json"), "agentsview", "test-machine",
+	)
+	require.NoError(t, err)
+	require.Len(t, result.Messages, 1)
+	assert.Equal(t, literal, result.Messages[0].Content)
+}
+
 func TestGrokProviderParsesMixedTranscriptFormats(t *testing.T) {
 	root := t.TempDir()
 	sessionID := "mixed-formats"
@@ -118,11 +138,11 @@ func TestGrokProviderParsesMixedTranscriptFormats(t *testing.T) {
 			"{\"type\":\"assistant\",\"content\":\"current answer\"}\n",
 	)
 	provider := newGrokTestProvider(t, root)
-	sources, err := provider.Discover(context.Background())
+	sources, err := provider.Discover(t.Context())
 	require.NoError(t, err)
 	require.Len(t, sources, 1)
 	outcome, err := provider.Parse(
-		context.Background(),
+		t.Context(),
 		ParseRequest{Source: sources[0]},
 	)
 	require.NoError(t, err)
@@ -348,9 +368,9 @@ func TestGrokProviderStreamingDiscoveryPropagatesDirectorySymlinkErrors(t *testi
 		_, err := discoverEach(t, root)
 
 		require.Error(t, err)
-		assert.ErrorIs(t, err, os.ErrNotExist)
+		require.ErrorIs(t, err, os.ErrNotExist)
 		var incomplete DiscoveryIncompleteError
-		assert.ErrorAs(t, err, &incomplete)
+		require.ErrorAs(t, err, &incomplete)
 
 		require.NoError(t, os.Remove(link))
 		yielded, err := discoverEach(t, root)
@@ -372,9 +392,9 @@ func TestGrokProviderStreamingDiscoveryPropagatesDirectorySymlinkErrors(t *testi
 		_, err := discoverEach(t, root)
 
 		require.Error(t, err)
-		assert.ErrorIs(t, err, os.ErrNotExist)
+		require.ErrorIs(t, err, os.ErrNotExist)
 		var incomplete DiscoveryIncompleteError
-		assert.ErrorAs(t, err, &incomplete)
+		require.ErrorAs(t, err, &incomplete)
 
 		require.NoError(t, os.Remove(link))
 		yielded, err := discoverEach(t, root)
@@ -403,9 +423,9 @@ func TestGrokProviderStreamingDiscoveryPropagatesDirectorySymlinkErrors(t *testi
 		_, err := discoverEach(t, root)
 
 		require.Error(t, err)
-		assert.ErrorIs(t, err, os.ErrPermission)
+		require.ErrorIs(t, err, os.ErrPermission)
 		var incomplete DiscoveryIncompleteError
-		assert.ErrorAs(t, err, &incomplete)
+		require.ErrorAs(t, err, &incomplete)
 
 		require.NoError(t, os.Chmod(targetParent, 0o755))
 		yielded, err := discoverEach(t, root)
@@ -434,11 +454,11 @@ func TestGrokProviderSummarySource(t *testing.T) {
 			}
 		}`)
 	provider := newGrokTestProvider(t, root)
-	sources, err := provider.Discover(context.Background())
+	sources, err := provider.Discover(t.Context())
 	require.NoError(t, err)
 	require.Len(t, sources, 1)
 
-	outcome, err := provider.Parse(context.Background(), ParseRequest{
+	outcome, err := provider.Parse(t.Context(), ParseRequest{
 		Source: sources[0],
 	})
 	require.NoError(t, err)
@@ -654,8 +674,7 @@ func TestGrokProviderUpdatesUsageTopLevelFallback(t *testing.T) {
 	assert.Equal(t, "grok-summary", result.UsageEvents[0].Model)
 	assert.Equal(t, 12, result.UsageEvents[0].InputTokens)
 	require.NotNil(t, result.UsageEvents[0].Cost)
-	assert.Equal(t,
-		money.Money{Microdollars: 42_413},
+	assert.Equal(t, money.Money{Microdollars: 42_413},
 		*result.UsageEvents[0].Cost,
 	)
 }
@@ -718,12 +737,12 @@ func TestGrokProviderCurrentBuildSummarySchema(t *testing.T) {
 		}`)
 
 	provider := newGrokTestProvider(t, root)
-	sources, err := provider.Discover(context.Background())
+	sources, err := provider.Discover(t.Context())
 	require.NoError(t, err)
 	require.Len(t, sources, 1)
 	assert.Equal(t, cwdKey, sources[0].ProjectHint)
 
-	outcome, err := provider.Parse(context.Background(), ParseRequest{
+	outcome, err := provider.Parse(t.Context(), ParseRequest{
 		Source: sources[0],
 	})
 	require.NoError(t, err)
@@ -780,11 +799,11 @@ func TestGrokProviderParsesChatHistoryTranscript(t *testing.T) {
 	}, "\n")+"\n")
 
 	provider := newGrokTestProvider(t, root)
-	sources, err := provider.Discover(context.Background())
+	sources, err := provider.Discover(t.Context())
 	require.NoError(t, err)
 	require.Len(t, sources, 1)
 
-	outcome, err := provider.Parse(context.Background(), ParseRequest{
+	outcome, err := provider.Parse(t.Context(), ParseRequest{
 		Source: sources[0],
 	})
 	require.NoError(t, err)
@@ -825,6 +844,204 @@ func TestGrokProviderParsesChatHistoryTranscript(t *testing.T) {
 	assert.Equal(t, "fix the issues", result.Messages[4].Content)
 }
 
+func TestGrokProviderEnrichesTranscriptWithUpdateTimestamps(t *testing.T) {
+	root := t.TempDir()
+	sessionDir := filepath.Join(root, "workspace-key", "session-timing")
+	writeGrokFixtureFile(t, filepath.Join(sessionDir, "summary.json"), `{
+		"info":{"id":"session-timing","cwd":"/workspace/sample-project"},
+		"session_summary":"sample conversation",
+		"created_at":"2023-11-14T22:13:20Z",
+		"updated_at":"2023-11-14T22:15:20Z"
+	}`)
+	writeGrokFixtureFile(
+		t,
+		filepath.Join(sessionDir, "chat_history.jsonl"),
+		strings.Join([]string{
+			`{"type":"user","content":"first request"}`,
+			`{"type":"assistant","content":"first response"}`,
+			`{"type":"user","content":"follow-up request"}`,
+			`{"type":"assistant","content":"second response"}`,
+		}, "\n")+"\n",
+	)
+	writeGrokFixtureFile(
+		t,
+		filepath.Join(sessionDir, "updates.jsonl"),
+		strings.Join([]string{
+			`{"timestamp":1700000000,"method":"session/update","params":{"sessionId":"session-timing","update":{"sessionUpdate":"user_message_chunk","content":{"type":"text","text":"first request"}}}}`,
+			`{"timestamp":1700000010,"method":"session/update","params":{"sessionId":"session-timing","update":{"sessionUpdate":"agent_message_chunk","content":{"type":"text","text":"first response"}}}}`,
+			`{"timestamp":1700000060,"method":"session/update","params":{"sessionId":"session-timing","update":{"sessionUpdate":"user_message_chunk","content":{"type":"text","text":"follow-up request"}}}}`,
+			`{"timestamp":1700000075,"method":"session/update","params":{"sessionId":"session-timing","update":{"sessionUpdate":"agent_message_chunk","content":{"type":"text","text":"second response"}}}}`,
+		}, "\n")+"\n",
+	)
+
+	result, err := ParseGrokSummary(
+		filepath.Join(sessionDir, "summary.json"), "sample-project", "test-machine",
+	)
+	require.NoError(t, err)
+	require.Len(t, result.Messages, 4)
+	assert.Equal(t, []time.Time{
+		time.Unix(1_700_000_000, 0).UTC(),
+		time.Unix(1_700_000_010, 0).UTC(),
+		time.Unix(1_700_000_060, 0).UTC(),
+		time.Unix(1_700_000_075, 0).UTC(),
+	}, []time.Time{
+		result.Messages[0].Timestamp,
+		result.Messages[1].Timestamp,
+		result.Messages[2].Timestamp,
+		result.Messages[3].Timestamp,
+	})
+}
+
+func TestGrokProviderUpdateTimestampsFollowToolBoundaries(t *testing.T) {
+	root := t.TempDir()
+	sessionDir := filepath.Join(root, "workspace-key", "session-tools")
+	writeGrokFixtureFile(t, filepath.Join(sessionDir, "summary.json"), `{
+		"info":{"id":"session-tools","cwd":"/workspace/sample-project"},
+		"session_summary":"tool conversation",
+		"created_at":"2023-11-14T22:13:20Z",
+		"updated_at":"2023-11-14T22:15:20Z"
+	}`)
+	writeGrokFixtureFile(
+		t,
+		filepath.Join(sessionDir, "chat_history.jsonl"),
+		strings.Join([]string{
+			`{"type":"user","content":"inspect the sample"}`,
+			`{"type":"assistant","content":"","tool_calls":[{"id":"call-sample","name":"read_file","arguments":"{\"target_file\":\"sample.txt\"}"},{"id":"call-reference","name":"read_file","arguments":"{\"target_file\":\"reference.txt\"}"}]}`,
+			`{"type":"tool_result","tool_call_id":"call-sample","content":"example contents"}`,
+			`{"type":"tool_result","tool_call_id":"call-reference","content":"reference contents"}`,
+			`{"type":"assistant","content":"inspection complete"}`,
+		}, "\n")+"\n",
+	)
+	writeGrokFixtureFile(
+		t,
+		filepath.Join(sessionDir, "updates.jsonl"),
+		strings.Join([]string{
+			`{"timestamp":1700000000,"method":"session/update","params":{"sessionId":"session-tools","update":{"sessionUpdate":"user_message_chunk","content":{"type":"text","text":"inspect the sample"}}}}`,
+			`{"timestamp":1700000010,"method":"session/update","params":{"sessionId":"session-tools","update":{"sessionUpdate":"tool_call","toolCallId":"call-sample","title":"read_file"}}}`,
+			`{"timestamp":1700000012,"method":"session/update","params":{"sessionId":"session-tools","update":{"sessionUpdate":"tool_call","toolCallId":"call-reference","title":"read_file"}}}`,
+			`{"timestamp":1700000020,"method":"session/update","params":{"sessionId":"session-tools","update":{"sessionUpdate":"tool_call_update","toolCallId":"call-sample","status":"completed"}}}`,
+			`{"timestamp":1700000022,"method":"session/update","params":{"sessionId":"session-tools","update":{"sessionUpdate":"tool_call_update","toolCallId":"call-reference","status":"failed"}}}`,
+			`{"timestamp":1700000030,"method":"session/update","params":{"sessionId":"session-tools","update":{"sessionUpdate":"agent_message_chunk","content":{"type":"text","text":"inspection complete"}}}}`,
+		}, "\n")+"\n",
+	)
+
+	result, err := ParseGrokSummary(
+		filepath.Join(sessionDir, "summary.json"), "sample-project", "test-machine",
+	)
+	require.NoError(t, err)
+	require.Len(t, result.Messages, 5)
+	assert.Equal(t, time.Unix(1_700_000_000, 0).UTC(), result.Messages[0].Timestamp)
+	assert.Equal(t, time.Unix(1_700_000_010, 0).UTC(), result.Messages[1].Timestamp)
+	assert.True(t, result.Messages[2].Timestamp.IsZero())
+	assert.True(t, result.Messages[3].Timestamp.IsZero())
+	assert.Equal(t, time.Unix(1_700_000_030, 0).UTC(), result.Messages[4].Timestamp)
+	require.Len(t, result.Messages[1].ToolCalls, 2)
+	for i, want := range []struct {
+		started, completed int64
+		status             string
+	}{
+		{1_700_000_010, 1_700_000_020, "completed"},
+		{1_700_000_012, 1_700_000_022, "errored"},
+	} {
+		require.Len(t, result.Messages[1].ToolCalls[i].ResultEvents, 2)
+		assert.Equal(t, "started", result.Messages[1].ToolCalls[i].ResultEvents[0].Status)
+		assert.Equal(t, time.Unix(want.started, 0).UTC(), result.Messages[1].ToolCalls[i].ResultEvents[0].Timestamp)
+		assert.Equal(t, want.status, result.Messages[1].ToolCalls[i].ResultEvents[1].Status)
+		assert.Equal(t, time.Unix(want.completed, 0).UTC(), result.Messages[1].ToolCalls[i].ResultEvents[1].Timestamp)
+	}
+}
+
+func TestGrokProviderUpdateTimestampsRejectMismatchedToolIDs(t *testing.T) {
+	root := t.TempDir()
+	sessionDir := filepath.Join(root, "workspace-key", "session-tool-mismatch")
+	writeGrokFixtureFile(t, filepath.Join(sessionDir, "summary.json"), `{
+		"info":{"id":"session-tool-mismatch","cwd":"/workspace/sample-project"},
+		"session_summary":"tool conversation",
+		"created_at":"2023-11-14T22:13:20Z",
+		"updated_at":"2023-11-14T22:15:20Z"
+	}`)
+	writeGrokFixtureFile(
+		t,
+		filepath.Join(sessionDir, "chat_history.jsonl"),
+		strings.Join([]string{
+			`{"type":"user","content":"inspect the sample"}`,
+			`{"type":"assistant","content":"","tool_calls":[{"id":"call-missing","name":"read_file","arguments":"{\"target_file\":\"missing.txt\"}"}]}`,
+			`{"type":"tool_result","tool_call_id":"call-missing","content":"missing result"}`,
+			`{"type":"assistant","content":"","tool_calls":[{"id":"call-current","name":"read_file","arguments":"{\"target_file\":\"current.txt\"}"}]}`,
+			`{"type":"tool_result","tool_call_id":"call-current","content":"current result"}`,
+		}, "\n")+"\n",
+	)
+	writeGrokFixtureFile(
+		t,
+		filepath.Join(sessionDir, "updates.jsonl"),
+		strings.Join([]string{
+			`{"timestamp":1700000000,"method":"session/update","params":{"sessionId":"session-tool-mismatch","update":{"sessionUpdate":"user_message_chunk","content":{"type":"text","text":"inspect the sample"}}}}`,
+			`{"timestamp":1700000010,"method":"session/update","params":{"sessionId":"session-tool-mismatch","update":{"sessionUpdate":"tool_call","toolCallId":"call-current","title":"read_file"}}}`,
+			`{"timestamp":1700000020,"method":"session/update","params":{"sessionId":"session-tool-mismatch","update":{"sessionUpdate":"tool_call_update","toolCallId":"call-current","status":"completed"}}}`,
+		}, "\n")+"\n",
+	)
+
+	result, err := ParseGrokSummary(
+		filepath.Join(sessionDir, "summary.json"), "sample-project", "test-machine",
+	)
+	require.NoError(t, err)
+	require.Len(t, result.Messages, 5)
+	assert.True(t, result.Messages[1].Timestamp.IsZero())
+	assert.Equal(t,
+		time.Unix(1_700_000_010, 0).UTC(), result.Messages[3].Timestamp,
+	)
+}
+
+func TestGrokProviderUpdateTimestampsSeparateParallelBackendTools(t *testing.T) {
+	root := t.TempDir()
+	sessionDir := filepath.Join(root, "workspace-key", "session-parallel-tools")
+	writeGrokFixtureFile(t, filepath.Join(sessionDir, "summary.json"), `{
+		"info":{"id":"session-parallel-tools","cwd":"/workspace/sample-project"},
+		"session_summary":"parallel tool conversation",
+		"created_at":"2023-11-14T22:13:20Z",
+		"updated_at":"2023-11-14T22:15:20Z"
+	}`)
+	writeGrokFixtureFile(
+		t,
+		filepath.Join(sessionDir, "chat_history.jsonl"),
+		strings.Join([]string{
+			`{"type":"user","content":"compare two examples"}`,
+			`{"type":"backend_tool_call","kind":{"tool_type":"web_search","id":"search-first","status":"completed","action":{"type":"search","query":"first example","sources":[]}}}`,
+			`{"type":"backend_tool_call","kind":{"tool_type":"web_search","id":"search-second","status":"completed","action":{"type":"search","query":"second example","sources":[]}}}`,
+			`{"type":"assistant","content":"comparison complete"}`,
+		}, "\n")+"\n",
+	)
+	writeGrokFixtureFile(
+		t,
+		filepath.Join(sessionDir, "updates.jsonl"),
+		strings.Join([]string{
+			`{"timestamp":1700000000,"method":"session/update","params":{"sessionId":"session-parallel-tools","update":{"sessionUpdate":"user_message_chunk","content":{"type":"text","text":"compare two examples"}}}}`,
+			`{"timestamp":1700000010,"method":"session/update","params":{"sessionId":"session-parallel-tools","update":{"sessionUpdate":"tool_call","toolCallId":"search-first","title":"Web search:"}}}`,
+			`{"timestamp":1700000012,"method":"session/update","params":{"sessionId":"session-parallel-tools","update":{"sessionUpdate":"tool_call","toolCallId":"search-second","title":"Web search:"}}}`,
+			`{"timestamp":1700000020,"method":"session/update","params":{"sessionId":"session-parallel-tools","update":{"sessionUpdate":"tool_call_update","toolCallId":"search-first","status":"completed"}}}`,
+			`{"timestamp":1700000022,"method":"session/update","params":{"sessionId":"session-parallel-tools","update":{"sessionUpdate":"tool_call_update","toolCallId":"search-second","status":"completed"}}}`,
+			`{"timestamp":1700000030,"method":"session/update","params":{"sessionId":"session-parallel-tools","update":{"sessionUpdate":"agent_message_chunk","content":{"type":"text","text":"comparison complete"}}}}`,
+		}, "\n")+"\n",
+	)
+
+	result, err := ParseGrokSummary(
+		filepath.Join(sessionDir, "summary.json"), "sample-project", "test-machine",
+	)
+	require.NoError(t, err)
+	require.Len(t, result.Messages, 4)
+	assert.Equal(t, []time.Time{
+		time.Unix(1_700_000_000, 0).UTC(),
+		time.Unix(1_700_000_010, 0).UTC(),
+		time.Unix(1_700_000_012, 0).UTC(),
+		time.Unix(1_700_000_030, 0).UTC(),
+	}, []time.Time{
+		result.Messages[0].Timestamp,
+		result.Messages[1].Timestamp,
+		result.Messages[2].Timestamp,
+		result.Messages[3].Timestamp,
+	})
+}
+
 func TestGrokProviderUnwrapsOpenAIStyleToolArguments(t *testing.T) {
 	// OpenAI-style tool calls nest name/arguments under "function" and encode
 	// arguments as a JSON string. InputJSON must be the decoded object so
@@ -843,11 +1060,11 @@ func TestGrokProviderUnwrapsOpenAIStyleToolArguments(t *testing.T) {
 	}, "\n")+"\n")
 
 	provider := newGrokTestProvider(t, root)
-	sources, err := provider.Discover(context.Background())
+	sources, err := provider.Discover(t.Context())
 	require.NoError(t, err)
 	require.Len(t, sources, 1)
 
-	outcome, err := provider.Parse(context.Background(), ParseRequest{Source: sources[0]})
+	outcome, err := provider.Parse(t.Context(), ParseRequest{Source: sources[0]})
 	require.NoError(t, err)
 	require.Len(t, outcome.Results, 1)
 
@@ -893,11 +1110,11 @@ Please fix the flaky test in grok_test.go`
 	}, "\n")+"\n")
 
 	provider := newGrokTestProvider(t, root)
-	sources, err := provider.Discover(context.Background())
+	sources, err := provider.Discover(t.Context())
 	require.NoError(t, err)
 	require.Len(t, sources, 1)
 
-	outcome, err := provider.Parse(context.Background(), ParseRequest{Source: sources[0]})
+	outcome, err := provider.Parse(t.Context(), ParseRequest{Source: sources[0]})
 	require.NoError(t, err)
 	require.Len(t, outcome.Results, 1)
 
@@ -919,14 +1136,14 @@ func TestGrokProviderFindSource(t *testing.T) {
 	}`)
 
 	provider := newGrokTestProvider(t, root)
-	source, ok, err := provider.FindSource(context.Background(), FindSourceRequest{
+	source, ok, err := provider.FindSource(t.Context(), FindSourceRequest{
 		RawSessionID: "sess-1",
 	})
 	require.NoError(t, err)
 	require.True(t, ok)
 	assert.Equal(t, filepath.Clean(grokSummaryPath(root, "cwd-key", "sess-1")), filepath.Clean(source.FingerprintKey))
 
-	_, ok, err = provider.FindSource(context.Background(), FindSourceRequest{
+	_, ok, err = provider.FindSource(t.Context(), FindSourceRequest{
 		RawSessionID: "missing",
 	})
 	require.NoError(t, err)
@@ -942,11 +1159,11 @@ func TestGrokProviderFirstPromptKeepsSessionVisibleWithoutNumMessages(t *testing
 	}`)
 
 	provider := newGrokTestProvider(t, root)
-	sources, err := provider.Discover(context.Background())
+	sources, err := provider.Discover(t.Context())
 	require.NoError(t, err)
 	require.Len(t, sources, 1)
 
-	outcome, err := provider.Parse(context.Background(), ParseRequest{
+	outcome, err := provider.Parse(t.Context(), ParseRequest{
 		Source: sources[0],
 	})
 	require.NoError(t, err)
@@ -960,53 +1177,87 @@ func TestGrokProviderFirstPromptKeepsSessionVisibleWithoutNumMessages(t *testing
 	assert.Equal(t, "Locate the Grok source", outcome.Results[0].Result.Messages[0].Content)
 }
 
+func TestGrokProviderPromptContextClassifiesNonInteractive(t *testing.T) {
+	root := t.TempDir()
+	summary := grokSummaryPath(root, "cwd-key", "sess-1")
+	writeGrokFixtureFile(t, summary, `{
+		"summary":"Inspect a function",
+		"firstPrompt":"Explain this function",
+		"createdAt":"2026-07-08T10:00:00Z"
+	}`)
+	writeGrokFixtureFile(
+		t,
+		filepath.Join(root, "cwd-key", "sess-1", "prompt_context.json"),
+		`{"is_non_interactive":true}`,
+	)
+
+	provider := newGrokTestProvider(t, root)
+	sources, err := provider.Discover(t.Context())
+	require.NoError(t, err)
+	require.Len(t, sources, 1)
+	outcome, err := provider.Parse(t.Context(), ParseRequest{Source: sources[0]})
+	require.NoError(t, err)
+	require.Len(t, outcome.Results, 1)
+
+	assert.Equal(t, "non-interactive", outcome.Results[0].Result.Session.SessionKind)
+	assert.Equal(t, RelNone, outcome.Results[0].Result.Session.RelationshipType)
+	assert.Empty(t, outcome.Results[0].Result.Session.ParentSessionID)
+}
+
 func TestGrokProviderFingerprintTracksParsedFiles(t *testing.T) {
 	root := t.TempDir()
 	summary := grokSummaryPath(root, "cwd-key", "sess-1")
 	signals := filepath.Join(root, "cwd-key", "sess-1", "signals.json")
 	updates := filepath.Join(root, "cwd-key", "sess-1", "updates.jsonl")
 	chat := filepath.Join(root, "cwd-key", "sess-1", "chat_history.jsonl")
+	promptContext := filepath.Join(root, "cwd-key", "sess-1", "prompt_context.json")
 	unrelated := filepath.Join(root, "cwd-key", "sess-1", "notes.txt")
 	writeGrokFixtureFile(t, summary, `{"summary":"Fingerprint","firstPrompt":"hello","createdAt":"2026-07-08T10:00:00Z"}`)
 	writeGrokFixtureFile(t, signals, `{"tokenUsage":{"totalOutputTokens":1}}`)
 	writeGrokFixtureFile(t, updates, "{}\n")
 	writeGrokFixtureFile(t, chat, "{}\n")
+	writeGrokFixtureFile(t, promptContext, `{"is_non_interactive":false}`)
 	writeGrokFixtureFile(t, unrelated, "ignored")
 
 	provider := newGrokTestProvider(t, root)
-	source, ok, err := provider.FindSource(context.Background(), FindSourceRequest{
+	source, ok, err := provider.FindSource(t.Context(), FindSourceRequest{
 		RawSessionID: "sess-1",
 	})
 	require.NoError(t, err)
 	require.True(t, ok)
 
-	base, err := provider.Fingerprint(context.Background(), source)
+	base, err := provider.Fingerprint(t.Context(), source)
 	require.NoError(t, err)
 
 	writeGrokFixtureFile(t, summary, `{"summary":"Fingerprint changed","firstPrompt":"hello","createdAt":"2026-07-08T10:00:00Z"}`)
-	afterSummary, err := provider.Fingerprint(context.Background(), source)
+	afterSummary, err := provider.Fingerprint(t.Context(), source)
 	require.NoError(t, err)
 	assert.NotEqual(t, base.Hash, afterSummary.Hash)
 
 	writeGrokFixtureFile(t, signals, `{"tokenUsage":{"totalOutputTokens":2}}`)
-	afterSignals, err := provider.Fingerprint(context.Background(), source)
+	afterSignals, err := provider.Fingerprint(t.Context(), source)
 	require.NoError(t, err)
 	assert.NotEqual(t, afterSummary.Hash, afterSignals.Hash)
 
 	writeGrokFixtureFile(t, chat, "{\"message\":1}\n")
-	afterChat, err := provider.Fingerprint(context.Background(), source)
+	afterChat, err := provider.Fingerprint(t.Context(), source)
 	require.NoError(t, err)
 	assert.NotEqual(t, afterSignals.Hash, afterChat.Hash)
 
 	writeGrokFixtureFile(t, updates, "{\"delta\":1}\n")
-	afterUpdates, err := provider.Fingerprint(context.Background(), source)
+	afterUpdates, err := provider.Fingerprint(t.Context(), source)
 	require.NoError(t, err)
 	assert.NotEqual(t, afterChat.Hash, afterUpdates.Hash)
 
-	writeGrokFixtureFile(t, unrelated, "still ignored")
-	afterUnrelated, err := provider.Fingerprint(context.Background(), source)
+	writeGrokFixtureFile(t, promptContext, `{"is_non_interactive":true}`)
+	afterPromptContext, err := provider.Fingerprint(t.Context(), source)
 	require.NoError(t, err)
-	assert.Equal(t, afterUpdates.Hash, afterUnrelated.Hash)
+	assert.NotEqual(t, afterUpdates.Hash, afterPromptContext.Hash)
+
+	writeGrokFixtureFile(t, unrelated, "still ignored")
+	afterUnrelated, err := provider.Fingerprint(t.Context(), source)
+	require.NoError(t, err)
+	assert.Equal(t, afterPromptContext.Hash, afterUnrelated.Hash)
 }
 
 func TestGrokProviderChangedPathTracksParsedFiles(t *testing.T) {
@@ -1015,8 +1266,13 @@ func TestGrokProviderChangedPathTracksParsedFiles(t *testing.T) {
 	writeGrokFixtureFile(t, summary, `{"summary":"Changed path","firstPrompt":"hello","createdAt":"2026-07-08T10:00:00Z"}`)
 	provider := newGrokTestProvider(t, root)
 
-	for _, name := range []string{"summary.json", "signals.json", "chat_history.jsonl"} {
-		changed, err := provider.SourcesForChangedPath(context.Background(), ChangedPathRequest{
+	for _, name := range []string{
+		"summary.json",
+		"signals.json",
+		"chat_history.jsonl",
+		"prompt_context.json",
+	} {
+		changed, err := provider.SourcesForChangedPath(t.Context(), ChangedPathRequest{
 			Path: filepath.Join(root, "cwd-key", "sess-1", name),
 		})
 		require.NoError(t, err)
@@ -1024,7 +1280,7 @@ func TestGrokProviderChangedPathTracksParsedFiles(t *testing.T) {
 		assert.Equal(t, filepath.Clean(summary), filepath.Clean(changed[0].FingerprintKey))
 	}
 
-	changed, err := provider.SourcesForChangedPath(context.Background(), ChangedPathRequest{
+	changed, err := provider.SourcesForChangedPath(t.Context(), ChangedPathRequest{
 		Path: filepath.Join(root, "cwd-key", "sess-1", "updates.jsonl"),
 	})
 	require.NoError(t, err)
@@ -1032,15 +1288,22 @@ func TestGrokProviderChangedPathTracksParsedFiles(t *testing.T) {
 	assert.Equal(t, filepath.Clean(summary), filepath.Clean(changed[0].FingerprintKey))
 }
 
-func TestGrokProviderWatchPlanIncludesUpdates(t *testing.T) {
+func TestGrokProviderWatchPlanIncludesParsedCompanions(t *testing.T) {
 	root := t.TempDir()
 	provider := newGrokTestProvider(t, root)
 
-	plan, err := provider.WatchPlan(context.Background())
+	plan, err := provider.WatchPlan(t.Context())
 	require.NoError(t, err)
 	require.Len(t, plan.Roots, 1)
 	assert.ElementsMatch(t,
-		[]string{"summary.json", "signals.json", "chat_history.jsonl", "updates.jsonl"},
+		[]string{
+			"summary.json",
+			"signals.json",
+			"chat_history.jsonl",
+			"updates.jsonl",
+			"prompt_context.json",
+			"meta.json",
+		},
 		plan.Roots[0].IncludeGlobs,
 	)
 }
@@ -1060,12 +1323,12 @@ func TestGrokProviderArtifactBoundaries(t *testing.T) {
 	writeGrokFixtureFile(t, grokSummaryPath(root, "cwd-key", "sess-bad"), `{not json`)
 
 	provider := newGrokTestProvider(t, root)
-	sources, err := provider.Discover(context.Background())
+	sources, err := provider.Discover(t.Context())
 	require.NoError(t, err)
 	require.Len(t, sources, 2)
 
 	changed, err := provider.SourcesForChangedPath(
-		context.Background(),
+		t.Context(),
 		ChangedPathRequest{
 			Path: filepath.Join(root, "cwd-key", "not.a.grok.session", "signals.json"),
 		},
@@ -1073,12 +1336,12 @@ func TestGrokProviderArtifactBoundaries(t *testing.T) {
 	require.NoError(t, err)
 	assert.Empty(t, changed)
 
-	source, ok, err := provider.FindSource(context.Background(), FindSourceRequest{
+	source, ok, err := provider.FindSource(t.Context(), FindSourceRequest{
 		RawSessionID: "sess-bad",
 	})
 	require.NoError(t, err)
 	require.True(t, ok)
-	_, err = provider.Parse(context.Background(), ParseRequest{Source: source})
+	_, err = provider.Parse(t.Context(), ParseRequest{Source: source})
 	require.Error(t, err)
 }
 

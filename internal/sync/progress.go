@@ -1,6 +1,7 @@
 package sync
 
 import (
+	"slices"
 	gosync "sync"
 	"time"
 )
@@ -10,9 +11,11 @@ type Phase string
 
 const (
 	PhaseIdle             Phase = "idle"
+	PhaseOpeningDatabase  Phase = "opening_database"
 	PhaseDiscovering      Phase = "discovering"
 	PhasePreparingResync  Phase = "preparing_resync"
 	PhaseSyncing          Phase = "syncing"
+	PhaseFinalizing       Phase = "finalizing"
 	PhaseCopyingMetadata  Phase = "copying_metadata"
 	PhaseCopyingOrphans   Phase = "copying_orphans"
 	PhaseReclassifying    Phase = "reclassifying"
@@ -61,18 +64,35 @@ type SyncResult struct {
 // produced at least one session — used by ResyncAll to compare
 // against Failed on the same unit.
 type SyncStats struct {
-	TotalSessions  int                 `json:"total_sessions"`
-	Synced         int                 `json:"synced"`
-	Skipped        int                 `json:"skipped"`
-	Failed         int                 `json:"failed"`
+	TotalSessions int `json:"total_sessions"`
+	Synced        int `json:"synced"`
+	Skipped       int `json:"skipped"`
+	Failed        int `json:"failed"`
+	// Deferred counts provider results retained for a later retry. It is
+	// run-local completion state, not a durable or API field.
+	Deferred       int                 `json:"-"`
 	OrphanedCopied int                 `json:"orphaned_copied,omitempty"`
 	Warnings       []string            `json:"warnings,omitempty"`
 	Aborted        bool                `json:"aborted,omitempty"`
 	RebuildPhases  []RebuildPhaseStats `json:"rebuild_phases,omitempty"`
-	// Tombstoned counts committed session removals that are not ordinary sync
-	// writes. It remains meaningful on a partially failed or aborted pass: a
-	// later retry cannot rediscover an already-tombstoned row to notify clients.
+	// Tombstoned is the legacy protocol name for committed source-missing state
+	// changes that are not ordinary sync writes. It remains meaningful on a
+	// partially failed or aborted pass: a later retry will skip an already-marked
+	// row, so this first transition is the one that must notify clients.
 	Tombstoned int `json:"tombstoned,omitempty"`
+	// CwdUpdated counts durable source workspace (Cwd) reconciliations that
+	// changed rows without an ordinary session write. It is exported and
+	// serialized because worker-process passes marshal SyncStats back to the
+	// daemon, which must still emit "sessions" for cwd-only changes.
+	CwdUpdated int `json:"cwd_updated,omitempty"`
+	// LinksUpdated counts global, scoped, and queued parent-link repairs.
+	// A pending retry can update parent_session_id while the poll's
+	// sync stats and tombstone count stay zero. Workers carry the count back
+	// to the daemon so it can notify clients about link-only repairs.
+	LinksUpdated int `json:"links_updated,omitempty"`
+	// LinksPending is the worker's terminal snapshot of unfinished linking.
+	// The daemon retains it for its next poll when the worker exits.
+	LinksPending bool `json:"links_pending,omitempty"`
 
 	// Anomalies aggregates per-run parser/sanitizer anomaly signals
 	// surfaced in the CLI sync summary. These are live per-run counters
@@ -83,7 +103,7 @@ type SyncStats struct {
 	filesOK int // unexported: file-level success counter
 	// sourceMissingArchiveMembers carries members discovered in the original
 	// archive while a full resync writes into its replacement. Orphan copy must
-	// materialize them before the rebuild can apply the same guarded tombstone
+	// materialize them before the rebuild can apply the same guarded source-state
 	// transition used by an in-place sync.
 	sourceMissingArchiveMembers []sourceMissingMember
 	filesDiscovered             int // file-based total, excludes DB-backed agents
@@ -97,6 +117,8 @@ type SyncStats struct {
 	parserExcludedFiles    int // file-level intentional parser exclusions
 	parserExcludedIDs      []string
 	providerFailures       int // authoritative discoveries that did not complete
+	deferredRetryPaths     []string
+	deferredRetryOverflow  bool
 	// ArchiveRebuilt records a completed full-resync database swap. A rebuild
 	// can preserve/copy durable corpus rows while syncing zero session files,
 	// so downstream refresh consumers cannot infer it from Synced. It is not
@@ -115,9 +137,13 @@ type SyncStats struct {
 	cwdFilteredFiles int
 }
 
-func (s SyncStats) shouldEmitSync() bool {
-	return s.Tombstoned > 0 ||
-		(!s.Aborted && (s.Synced > 0 || s.ArchiveRebuilt))
+func (s *SyncStats) shouldEmitSync() bool {
+	return s.Tombstoned > 0 || s.LinksUpdated > 0 ||
+		(!s.Aborted && (s.hasSessionChanges() || s.ArchiveRebuilt))
+}
+
+func (s *SyncStats) hasSessionChanges() bool {
+	return s.Synced > 0 || s.CwdUpdated > 0 || s.Tombstoned > 0 || s.LinksUpdated > 0
 }
 
 // AnomalyStats aggregates parser-output anomaly signals observed during a
@@ -186,7 +212,7 @@ func (s SanitizeStats) IsZero() bool {
 
 // IsZero reports whether the run observed no anomalies at all, so the CLI
 // summary can omit the anomaly section entirely on clean runs.
-func (a AnomalyStats) IsZero() bool {
+func (a *AnomalyStats) IsZero() bool {
 	return a.UnsupportedSourceLayoutsTotal == 0 &&
 		a.MalformedLinesTotal == 0 &&
 		a.UnknownSchemaSessionsTotal == 0 &&
@@ -390,9 +416,44 @@ func (s *SyncStats) RecordSynced(n int) {
 	s.Synced += n
 }
 
+// RecordCwdUpdated records a durable source workspace reconciliation.
+func (s *SyncStats) RecordCwdUpdated(n int) {
+	s.CwdUpdated += n
+}
+
+// RecordLinksUpdated records parent-link rows repaired without an ordinary
+// session write. Zero and negative counts are ignored.
+func (s *SyncStats) RecordLinksUpdated(n int) {
+	if n > 0 {
+		s.LinksUpdated += n
+	}
+}
+
 // RecordFailed increments the hard-failure counter.
 func (s *SyncStats) RecordFailed() {
 	s.Failed++
+}
+
+func (s *SyncStats) recordDeferred(path string) {
+	s.Deferred++
+	s.retainDeferredRetryPath(path)
+}
+
+func (s *SyncStats) retainDeferredRetryPath(path string) {
+	if s.deferredRetryOverflow || path == "" {
+		return
+	}
+	if slices.Contains(s.deferredRetryPaths, path) {
+		return
+	}
+	if len(s.deferredRetryPaths) >= reconciliationRetryPathLimit ||
+		reconciliationRetryPathBytes(s.deferredRetryPaths)+len(path) >
+			reconciliationRetryPathByteLimit {
+		s.deferredRetryOverflow = true
+		s.deferredRetryPaths = nil
+		return
+	}
+	s.deferredRetryPaths = append(s.deferredRetryPaths, path)
 }
 
 // Percent returns the sync progress as a percentage (0–100).

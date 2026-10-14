@@ -2,7 +2,8 @@ package db
 
 import (
 	"context"
-	"encoding/json"
+	"encoding/json/jsontext"
+	"encoding/json/v2"
 	"fmt"
 	"strings"
 	"testing"
@@ -39,6 +40,128 @@ func dayQuery(t *testing.T, date, tz string) activity.Query {
 	return q
 }
 
+func TestGetActivityReportAutomatedSubagentPrecedence(t *testing.T) {
+	d := testDB(t)
+	insertSession(t, d, "root", "project-a")
+	insertSession(t, d, "deleted-root", "project-a")
+	for _, tc := range []struct {
+		id     string
+		parent *string
+	}{
+		{"task", Ptr("root")},
+		{"worker", nil},
+		{"dangling-task", Ptr("deleted-root")},
+	} {
+		insertSession(t, d, tc.id, "project-a", func(s *Session) {
+			s.ParentSessionID = tc.parent
+			s.RelationshipType = "subagent"
+			if tc.id == "dangling-task" {
+				s.Entrypoint = "sdk-cli"
+			}
+			if tc.id == "worker" {
+				s.SessionKind = "non-interactive"
+			}
+			s.FirstMessage = Ptr("You are a code reviewer. Review this change.")
+			s.UserMessageCount = 1
+			s.StartedAt = Ptr("2026-06-14T10:00:00Z")
+			s.EndedAt = Ptr("2026-06-14T10:01:00Z")
+		})
+		seedMessage(t, d, tc.id, 0, "assistant", "2026-06-14T10:00:00Z", "")
+	}
+	require.NoError(t, d.DeleteSession(t.Context(), "deleted-root"))
+	_, err := d.getWriter().Exec(t.Context(), clearDanglingSubagentParentQuery("(?)"), "dangling-task")
+	require.NoError(t, err)
+	dangling, err := d.GetSession(t.Context(), "dangling-task")
+	require.NoError(t, err)
+	require.NotNil(t, dangling)
+	require.Nil(t, dangling.ParentSessionID)
+	require.Equal(t, "subagent", dangling.RelationshipType)
+	require.True(t, dangling.IsAutomated)
+	report, err := d.GetActivityReport(t.Context(), AnalyticsFilter{Timezone: "UTC"}, dayQuery(t, "2026-06-14", "UTC"))
+	require.NoError(t, err)
+	assert.Equal(t, 3, report.Totals.SubagentSessions)
+	assert.Zero(t, report.Totals.AutomatedSessions)
+	assert.Zero(t, report.Totals.InteractiveSessions)
+}
+
+func TestActivityReportMessageCounts(t *testing.T) {
+	d := testDB(t)
+	for _, id := range []string{"conversation", "lone", "automated", "subagent", "other-project"} {
+		insertSession(t, d, id, "project-a", func(s *Session) {
+			s.StartedAt = Ptr("2026-06-14T09:00:00Z")
+			s.EndedAt = Ptr("2026-06-14T11:00:00Z")
+			if id == "automated" {
+				s.IsAutomated = true
+			}
+			if id == "subagent" {
+				s.RelationshipType = "subagent"
+			}
+			if id == "other-project" {
+				s.Project = "project-b"
+			}
+		})
+	}
+	messages := []Message{
+		{Role: "user", Timestamp: "2026-06-14T09:59:59Z"},
+		{Role: "user", Timestamp: "2026-06-14T10:00:00Z"},
+		{Role: "assistant", Timestamp: "2026-06-14T10:04:59.999999Z"},
+		{Role: "user", Timestamp: "2026-06-14T10:05:00Z"},
+		{Role: "assistant", Timestamp: "2026-06-14T10:10:00Z"},
+		{Role: "assistant", Timestamp: "2026-06-14T10:10:30.499Z"},
+		{Role: "assistant", Timestamp: "2026-06-14T10:10:30.500Z"},
+		{Role: "user"},
+		{Role: "user", Timestamp: "2026-06-14T10:01:00Z", SourceSubtype: "tool_result"},
+		{Role: "assistant", Timestamp: "2026-06-14T10:02:00Z", IsSystem: true},
+		{Role: "user", Timestamp: "2026-06-14T10:03:00Z", IsSystem: true},
+		{Role: "tool", Timestamp: "2026-06-14T10:04:00Z"},
+		{Role: "user", Timestamp: "2026-06-14T10:invalid"},
+	}
+	for i := range messages {
+		messages[i].SessionID = "conversation"
+		messages[i].Ordinal = i
+		messages[i].Content = "message"
+	}
+	insertMessages(t, d, messages...)
+	seedMessage(t, d, "lone", 0, "user", "2026-06-14T10:08:00Z", "")
+	seedMessage(t, d, "other-project", 0, "user", "2026-06-14T10:00:00Z", "")
+	for _, id := range []string{"automated", "subagent"} {
+		seedMessage(t, d, id, 0, "user", "2026-06-14T10:00:00Z", "")
+		seedMessage(t, d, id, 1, "assistant", "2026-06-14T10:00:00Z", "")
+	}
+	q, err := activity.ResolveQuery(activity.QueryInput{
+		Preset: "custom", Timezone: "UTC", BucketOverride: "5m",
+		From: "2026-06-14T10:00:00Z", To: "2026-06-14T10:15:00Z",
+	}, time.Date(2026, 6, 14, 10, 10, 30, 500_000_000, time.UTC))
+	require.NoError(t, err)
+
+	for _, tc := range []struct {
+		name            string
+		filter          AnalyticsFilter
+		user, assistant []int
+	}{
+		{"all", AnalyticsFilter{}, []int{2, 2, 0}, []int{3, 0, 2}},
+		{"project", AnalyticsFilter{Project: "project-a"}, []int{1, 2, 0}, []int{3, 0, 2}},
+		{"interactive", AnalyticsFilter{Project: "project-a", ExcludeAutomated: true}, []int{1, 2, 0}, []int{2, 0, 2}},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			artifacts, err := d.BuildActivityReportArtifacts(t.Context(), tc.filter, q, nil)
+			require.NoError(t, err)
+			var user, assistant []int
+			for _, bucket := range artifacts.Report.Buckets {
+				user = append(user, bucket.UserMessages)
+				assistant = append(assistant, bucket.AssistantMessages)
+			}
+			assert.Equal(t, tc.user, user)
+			assert.Equal(t, tc.assistant, assistant)
+			page, err := activity.PageSessions(artifacts.Sessions, artifacts.Membership,
+				activity.SessionPageOptions{BucketRange: &activity.BucketRange{Start: 1, End: 2}})
+			require.NoError(t, err)
+			assert.Contains(t, reportSessionIDs(page.Sessions), "lone")
+			assert.False(t, artifacts.Membership["lone"].Contains(0))
+		})
+	}
+}
+
 func seedMessage(
 	t *testing.T, d *DB, sid string, ordinal int, role, ts, model string,
 ) {
@@ -55,7 +178,7 @@ func seedMessage(
 
 func TestSQLiteActivityReportCandidatesMatchGoPairingAtScanBounds(t *testing.T) {
 	d := testDB(t)
-	ctx := context.Background()
+	ctx := t.Context()
 	insertSession(t, d, "edge", "p", func(s *Session) {
 		s.Agent = "claude"
 		s.StartedAt = Ptr("2026-06-15T23:54:59Z")
@@ -88,7 +211,7 @@ func TestSQLiteActivityReportCandidateQueryUsesExistingSessionIndex(t *testing.T
 	d := testDB(t)
 	q := dayQuery(t, "2026-06-16", "UTC")
 	rows, err := d.getReader().QueryContext(
-		context.Background(), "EXPLAIN QUERY PLAN "+activityReportCandidatesSQL,
+		t.Context(), "EXPLAIN QUERY PLAN "+activityReportCandidatesSQL,
 		`["session"]`, "2026-06-15T09:00:00Z", "2026-06-17T14:00:00Z",
 		q.RangeStart.Add(-5*time.Minute).UnixMicro(), q.EffectiveEnd.UnixMicro(),
 	)
@@ -122,7 +245,7 @@ func TestSQLiteActivityReportCandidateSourceStopsOnCancellation(t *testing.T) {
 	} {
 		seedMessage(t, d, "cancel", ordinal, "user", timestamp, "")
 	}
-	ctx, cancel := context.WithCancel(context.Background())
+	ctx, cancel := context.WithCancel(t.Context())
 	seen := 0
 	err := d.activityReportCandidateSource(
 		[]string{"cancel"}, dayQuery(t, "2026-06-16", "UTC"),
@@ -139,7 +262,7 @@ func TestSQLiteActivityReportCandidateSourceDoesNotRequireGlobalTimestampIndex(
 	t *testing.T,
 ) {
 	d := testDB(t)
-	_, err := d.getWriter().Exec(`DROP INDEX IF EXISTS idx_messages_activity_timestamp`)
+	_, err := d.getWriter().Exec(t.Context(), `DROP INDEX IF EXISTS idx_messages_activity_timestamp`)
 	require.NoError(t, err)
 	insertSession(t, d, "legacy-index", "p", func(s *Session) {
 		s.StartedAt = Ptr("2026-06-16T10:00:00Z")
@@ -149,11 +272,59 @@ func TestSQLiteActivityReportCandidateSourceDoesNotRequireGlobalTimestampIndex(
 	seedMessage(t, d, "legacy-index", 1, "assistant", "2026-06-16T10:01:00Z", "model")
 
 	candidates, err := d.activityReportCandidates(
-		context.Background(), []string{"legacy-index"},
+		t.Context(), []string{"legacy-index"},
 		dayQuery(t, "2026-06-16", "UTC"),
 	)
 	require.NoError(t, err)
 	require.Len(t, candidates, 1)
+}
+
+func TestGetActivityReport_InlineToolCompletionResetsGapCap(t *testing.T) {
+	d := testDB(t)
+	insertSession(t, d, "inline-completion", "tools", func(s *Session) {
+		s.Agent = "grok"
+		s.StartedAt = Ptr("2026-06-16T10:00:00Z")
+		s.EndedAt = Ptr("2026-06-16T10:11:00Z")
+	})
+	seedMessage(t, d, "inline-completion", 0, "user",
+		"2026-06-16T10:00:00Z", "")
+	seedMessage(t, d, "inline-completion", 1, "assistant",
+		"2026-06-16T10:01:00Z", "model-x")
+	seedMessage(t, d, "inline-completion", 2, "assistant",
+		"2026-06-16T10:11:00Z", "model-x")
+	timingInsertToolResultEvent(t, d, "inline-completion", 1, 0,
+		"sample-call", "completed", "2026-06-16T10:10:00Z", 1)
+
+	report, err := d.GetActivityReport(
+		t.Context(), AnalyticsFilter{Timezone: "UTC"},
+		dayQuery(t, "2026-06-16", "UTC"),
+	)
+	require.NoError(t, err)
+	require.Len(t, report.BySession, 1)
+	require.NotNil(t, report.BySession[0].AgentMinutes)
+	assert.InDelta(t, 7.0, *report.BySession[0].AgentMinutes, 1e-9)
+}
+
+func TestGetActivityReport_ToolCompletionAfterRangeClosesFinalMessage(t *testing.T) {
+	d := testDB(t)
+	insertSession(t, d, "completion-after-range", "tools", func(s *Session) {
+		s.Agent = "grok"
+		s.StartedAt = Ptr("2026-06-16T23:59:00Z")
+		s.EndedAt = Ptr("2026-06-17T00:01:00Z")
+	})
+	seedMessage(t, d, "completion-after-range", 0, "assistant",
+		"2026-06-16T23:59:00Z", "model-x")
+	timingInsertToolResultEvent(t, d, "completion-after-range", 0, 0,
+		"sample-call", "completed", "2026-06-17T00:01:00Z", 1)
+
+	report, err := d.GetActivityReport(
+		t.Context(), AnalyticsFilter{Timezone: "UTC"},
+		dayQuery(t, "2026-06-16", "UTC"),
+	)
+	require.NoError(t, err)
+	require.Len(t, report.BySession, 1)
+	require.NotNil(t, report.BySession[0].AgentMinutes)
+	assert.InDelta(t, 1.0, *report.BySession[0].AgentMinutes, 1e-9)
 }
 
 func BenchmarkSQLiteActivityReportCandidateSource100K(b *testing.B) {
@@ -163,7 +334,7 @@ func BenchmarkSQLiteActivityReportCandidateSource100K(b *testing.B) {
 	b.ResetTimer()
 	for range b.N {
 		count := 0
-		err := source(context.Background(), func(activity.IntervalCandidate) error {
+		err := source(b.Context(), func(activity.IntervalCandidate) error {
 			count++
 			return nil
 		})
@@ -179,7 +350,7 @@ func BenchmarkSQLiteActivityReportCandidateSource100K(b *testing.B) {
 func BenchmarkSQLiteActivityReportCandidateSourceLongSession(b *testing.B) {
 	d := testDB(b)
 	const messageCount = 100_001
-	_, err := d.getWriter().Exec(`
+	_, err := d.getWriter().Exec(b.Context(), `
 		INSERT INTO sessions(
 			id, project, started_at, ended_at, message_count
 		) VALUES (
@@ -187,7 +358,7 @@ func BenchmarkSQLiteActivityReportCandidateSourceLongSession(b *testing.B) {
 			'2026-07-02T03:46:40Z', ?
 		)`, messageCount)
 	require.NoError(b, err)
-	_, err = d.getWriter().Exec(`
+	_, err = d.getWriter().Exec(b.Context(), `
 		WITH RECURSIVE n(i) AS (
 			VALUES(0) UNION ALL SELECT i + 1 FROM n WHERE i < ?
 		)
@@ -224,7 +395,7 @@ func BenchmarkSQLiteActivityReportCandidateSourceLongSession(b *testing.B) {
 			b.ReportAllocs()
 			for range b.N {
 				count := 0
-				err := source(context.Background(), func(activity.IntervalCandidate) error {
+				err := source(b.Context(), func(activity.IntervalCandidate) error {
 					count++
 					return nil
 				})
@@ -241,7 +412,7 @@ func BenchmarkSQLiteActivityReportArtifacts100K(b *testing.B) {
 	b.ResetTimer()
 	for range b.N {
 		artifacts, err := d.BuildActivityReportArtifacts(
-			context.Background(), AnalyticsFilter{Timezone: "UTC"}, q, nil,
+			b.Context(), AnalyticsFilter{Timezone: "UTC"}, q, nil,
 		)
 		require.NoError(b, err)
 		require.Len(b, artifacts.Sessions, 100_000)
@@ -261,9 +432,10 @@ func seedSQLiteActivityReportBenchmark(
 	b *testing.B,
 ) (*DB, []string, activity.Query) {
 	b.Helper()
+
 	d := testDB(b)
 	const sessionCount = 100_000
-	_, err := d.getWriter().Exec(`
+	_, err := d.getWriter().Exec(b.Context(), `
 		WITH RECURSIVE n(i) AS (
 			VALUES(1) UNION ALL SELECT i + 1 FROM n WHERE i < ?
 		)
@@ -272,7 +444,7 @@ func seedSQLiteActivityReportBenchmark(
 			'2026-07-01T10:00:00Z', '2026-07-28T10:02:00Z', 2
 		FROM n`, sessionCount)
 	require.NoError(b, err)
-	_, err = d.getWriter().Exec(`
+	_, err = d.getWriter().Exec(b.Context(), `
 		WITH RECURSIVE n(i) AS (
 			VALUES(1) UNION ALL SELECT i + 1 FROM n WHERE i < ?
 		)
@@ -298,7 +470,7 @@ func seedSQLiteActivityReportBenchmark(
 
 func TestGetActivityReport_BasicConcurrency(t *testing.T) {
 	d := testDB(t)
-	ctx := context.Background()
+	ctx := t.Context()
 	// Two overlapping sessions on 2026-06-16 (UTC), each two messages.
 	// started_at/ended_at are set explicitly so the candidate-session
 	// window anchors on the target day regardless of the wall clock; a
@@ -330,7 +502,7 @@ func TestGetActivityReport_BasicConcurrency(t *testing.T) {
 
 func TestActivityReportEmptyProjectsMapExcludesUnrelatedObservations(t *testing.T) {
 	d := testDB(t)
-	ctx := context.Background()
+	ctx := t.Context()
 	seedProjectIdentityObservation(t, d, "unrelated-project")
 
 	r, err := d.GetActivityReport(ctx, AnalyticsFilter{Timezone: "UTC"},
@@ -342,7 +514,7 @@ func TestActivityReportEmptyProjectsMapExcludesUnrelatedObservations(t *testing.
 
 func TestGetActivityReport_UsageCostAndTokens(t *testing.T) {
 	d := testDB(t)
-	ctx := context.Background()
+	ctx := t.Context()
 	require.NoError(t, d.UpsertModelPricing([]ModelPricing{{
 		ModelPattern:  "claude-sonnet-4-20250514",
 		InputPerMTok:  money.MustParseDollars("3.0"),
@@ -361,7 +533,7 @@ func TestGetActivityReport_UsageCostAndTokens(t *testing.T) {
 		Content:    "x",
 		Timestamp:  "2026-06-16T10:30:00Z",
 		Model:      "claude-sonnet-4-20250514",
-		TokenUsage: json.RawMessage(`{"input_tokens":1000,"output_tokens":500}`),
+		TokenUsage: jsontext.Value(`{"input_tokens":1000,"output_tokens":500}`),
 	})
 
 	r, err := d.GetActivityReport(ctx, AnalyticsFilter{Timezone: "UTC"},
@@ -380,7 +552,7 @@ func TestGetActivityReport_UsageCostAndTokens(t *testing.T) {
 
 func TestGetActivityReportFiltersAfterCrossSessionSnapshotSelection(t *testing.T) {
 	d := testDB(t)
-	ctx := context.Background()
+	ctx := t.Context()
 
 	insertSession(t, d, "activity-parent", "parent-project", func(s *Session) {
 		s.Agent = "claude"
@@ -396,7 +568,7 @@ func TestGetActivityReportFiltersAfterCrossSessionSnapshotSelection(t *testing.T
 		Message{
 			SessionID: "activity-parent", Ordinal: 0, Role: "assistant",
 			Timestamp: "2026-06-16T10:00:00Z", Model: "partial-model",
-			TokenUsage: json.RawMessage(
+			TokenUsage: jsontext.Value(
 				`{"input_tokens":10,"output_tokens":5}`),
 			ClaudeMessageID: "activity-message",
 			ClaudeRequestID: "activity-request",
@@ -404,7 +576,7 @@ func TestGetActivityReportFiltersAfterCrossSessionSnapshotSelection(t *testing.T
 		Message{
 			SessionID: "activity-child", Ordinal: 0, Role: "assistant",
 			Timestamp: "2026-06-16T10:01:00Z", Model: "complete-model",
-			TokenUsage: json.RawMessage(
+			TokenUsage: jsontext.Value(
 				`{"input_tokens":1000,"output_tokens":631}`),
 			ClaudeMessageID: "activity-message",
 			ClaudeRequestID: "activity-request",
@@ -430,7 +602,7 @@ func TestGetActivityReportFiltersAfterCrossSessionSnapshotSelection(t *testing.T
 
 func TestGetActivityReportDeduplicatesAfterProjectFilter(t *testing.T) {
 	d := testDB(t)
-	ctx := context.Background()
+	ctx := t.Context()
 
 	insertSession(t, d, "excluded-earlier", "excluded-project", func(s *Session) {
 		s.Agent = "claude"
@@ -446,13 +618,13 @@ func TestGetActivityReportDeduplicatesAfterProjectFilter(t *testing.T) {
 		Message{
 			SessionID: "excluded-earlier", Ordinal: 0, Role: "assistant",
 			Timestamp: "2026-06-16T10:00:00Z", Model: "model-x",
-			TokenUsage: json.RawMessage(`{"input_tokens":10,"output_tokens":5}`),
+			TokenUsage: jsontext.Value(`{"input_tokens":10,"output_tokens":5}`),
 			SourceUUID: "shared-source",
 		},
 		Message{
 			SessionID: "included-later", Ordinal: 0, Role: "assistant",
 			Timestamp: "2026-06-16T10:01:00Z", Model: "model-x",
-			TokenUsage: json.RawMessage(`{"input_tokens":20,"output_tokens":631}`),
+			TokenUsage: jsontext.Value(`{"input_tokens":20,"output_tokens":631}`),
 			SourceUUID: "shared-source",
 		},
 	)
@@ -467,7 +639,7 @@ func TestGetActivityReportDeduplicatesAfterProjectFilter(t *testing.T) {
 
 func TestLoadActivityReportUsageCandidatesBoundsFilteredWorkingSet(t *testing.T) {
 	d := testDB(t)
-	ctx := context.Background()
+	ctx := t.Context()
 
 	insertSession(t, d, "candidate", "included-project", func(s *Session) {
 		s.Agent = "claude"
@@ -483,13 +655,13 @@ func TestLoadActivityReportUsageCandidatesBoundsFilteredWorkingSet(t *testing.T)
 		Message{
 			SessionID: "candidate", Ordinal: 0, Role: "assistant",
 			Timestamp: "2026-06-16T10:00:00Z", Model: "partial-model",
-			TokenUsage:      json.RawMessage(`{"input_tokens":10,"output_tokens":5}`),
+			TokenUsage:      jsontext.Value(`{"input_tokens":10,"output_tokens":5}`),
 			ClaudeMessageID: "shared-message", ClaudeRequestID: "shared-request",
 		},
 		Message{
 			SessionID: "snapshot-peer", Ordinal: 0, Role: "assistant",
 			Timestamp: "2026-06-16T10:01:00Z", Model: "complete-model",
-			TokenUsage:      json.RawMessage(`{"input_tokens":20,"output_tokens":631}`),
+			TokenUsage:      jsontext.Value(`{"input_tokens":20,"output_tokens":631}`),
 			ClaudeMessageID: "shared-message", ClaudeRequestID: "shared-request",
 		},
 	)
@@ -503,12 +675,13 @@ func TestLoadActivityReportUsageCandidatesBoundsFilteredWorkingSet(t *testing.T)
 		insertMessages(t, d, Message{
 			SessionID: id, Ordinal: 0, Role: "assistant",
 			Timestamp: "2026-06-16T11:00:00Z", Model: "unrelated-model",
-			TokenUsage: json.RawMessage(`{"input_tokens":1,"output_tokens":1}`),
+			TokenUsage: jsontext.Value(`{"input_tokens":1,"output_tokens":1}`),
 		})
 	}
 
-	candidates, _, err := d.loadActivityReportUsageCandidatesFrom(
-		ctx, d.getReader(), []string{"candidate"},
+	capture := &sessionExportQueryCapture{inner: d.getReader()}
+	candidates, _, _, err := d.loadActivityReportUsageCandidatesFrom(
+		ctx, capture, []string{"candidate"},
 		"2026-06-15T10:00:00Z", "2026-06-17T10:00:00Z", false)
 	require.NoError(t, err)
 	require.Len(t, candidates, 2,
@@ -517,13 +690,31 @@ func TestLoadActivityReportUsageCandidatesBoundsFilteredWorkingSet(t *testing.T)
 		candidates[0].row.SessionID,
 		candidates[1].row.SessionID,
 	})
+
+	// Returning only matching rows is insufficient: scanning unrelated usage
+	// before filtering made a day report scale with the entire archive.
+	var details []string
+	for _, captured := range capture.queries {
+		rows, err := d.getReader().QueryContext(
+			ctx, "EXPLAIN QUERY PLAN "+captured.query, captured.args...,
+		)
+		require.NoError(t, err)
+		defer rows.Close()
+		details = append(details, explainQueryPlanDetails(t, rows)...)
+		require.NoError(t, rows.Close())
+	}
+	plan := strings.Join(details, "\n")
+	assert.NotContains(t, plan, "SCAN m ",
+		"candidate and peer lookups must not scan unrelated message history")
+	assert.Contains(t, plan,
+		"idx_messages_claude_snapshot (claude_message_id=? AND claude_request_id=?)")
 }
 
 func TestGetSessionUsageRowsPrefersCompleteClaudeSnapshotAcrossSessions(
 	t *testing.T,
 ) {
 	d := testDB(t)
-	ctx := context.Background()
+	ctx := t.Context()
 	require.NoError(t, d.UpsertModelPricing([]ModelPricing{{
 		ModelPattern:  "claude-sonnet-test",
 		OutputPerMTok: money.MustParseDollars("1"),
@@ -544,7 +735,7 @@ func TestGetSessionUsageRowsPrefersCompleteClaudeSnapshotAcrossSessions(
 			SessionID: "root", Ordinal: 0, Role: "assistant",
 			Timestamp: "2026-06-16T10:00:00Z",
 			Model:     "claude-sonnet-test",
-			TokenUsage: json.RawMessage(
+			TokenUsage: jsontext.Value(
 				`{"input_tokens":2,"output_tokens":5}`),
 			ClaudeMessageID: "msg-stream",
 			ClaudeRequestID: "req-stream",
@@ -553,7 +744,7 @@ func TestGetSessionUsageRowsPrefersCompleteClaudeSnapshotAcrossSessions(
 			SessionID: "child", Ordinal: 0, Role: "assistant",
 			Timestamp: "2026-06-16T10:00:01Z",
 			Model:     "claude-sonnet-test",
-			TokenUsage: json.RawMessage(
+			TokenUsage: jsontext.Value(
 				`{"input_tokens":2,"output_tokens":631}`),
 			ClaudeMessageID: "msg-stream",
 			ClaudeRequestID: "req-stream",
@@ -572,6 +763,10 @@ func TestGetSessionUsageRowsPrefersCompleteClaudeSnapshotAcrossSessions(
 		rowSet.DeduplicatedOutputTokens)
 	assert.Equal(t, map[string]struct{}{"root": {}, "child": {}},
 		rowSet.DiscardedContributingSessions)
+	assert.Equal(t, map[string]activity.SessionTokenCoverage{
+		"root":  {OutputTokens: 631, PeakContextTokens: 2},
+		"child": {OutputTokens: 631, PeakContextTokens: 2},
+	}, rowSet.CanonicalTokenCoverageBySession)
 }
 
 func TestSQLiteSessionUsageRowLessEquivalentInstantUsesSessionOrder(t *testing.T) {
@@ -641,6 +836,7 @@ func TestSQLiteActivityReportRowStatusCanonicalizesKimiAliasByTimestamp(t *testi
 					usageSource: "provider",
 					model:       "daimon-kimi-code",
 					ts:          tt.timestamp,
+					pricingTS:   tt.timestamp,
 					inputTokens: 1_000_000,
 				},
 				resolver,
@@ -684,6 +880,7 @@ func TestSQLiteActivityReportRowStatusPrefersExactCustomKimiAlias(t *testing.T) 
 			usageSource: "provider",
 			model:       "daimon-kimi-code",
 			ts:          "2026-07-19T00:00:00Z",
+			pricingTS:   "2026-07-19T00:00:00Z",
 			inputTokens: 1_000_000,
 		},
 		resolver,
@@ -703,7 +900,7 @@ func TestSQLiteActivityReportRowStatusPrefersExactCustomKimiAlias(t *testing.T) 
 
 func TestGetActivityReport_CopilotReportedCostReplacesSessionEstimates(t *testing.T) {
 	d := testDB(t)
-	ctx := context.Background()
+	ctx := t.Context()
 	require.NoError(t, d.UpsertModelPricing([]ModelPricing{
 		{ModelPattern: "copilot-model-a", InputPerMTok: money.MustParseDollars("10")},
 		{ModelPattern: "copilot-model-b", InputPerMTok: money.MustParseDollars("20")},
@@ -714,7 +911,7 @@ func TestGetActivityReport_CopilotReportedCostReplacesSessionEstimates(t *testin
 		s.EndedAt = Ptr("2026-06-16T10:10:00Z")
 	})
 	reportedCost := money.MustParseDollars("0.03")
-	require.NoError(t, d.ReplaceSessionUsageEvents(
+	require.NoError(t, d.ReplaceSessionUsageEvents(ctx,
 		"copilot:activity-authoritative",
 		[]UsageEvent{
 			{
@@ -750,7 +947,7 @@ func TestGetActivityReport_CopilotReportedCostReplacesSessionEstimates(t *testin
 
 func TestGetActivityReport_PricingModelsOnlyIncludeDedupSurvivors(t *testing.T) {
 	d := testDB(t)
-	ctx := context.Background()
+	ctx := t.Context()
 	require.NoError(t, d.UpsertModelPricing([]ModelPricing{
 		{
 			ModelPattern:  "partial-model",
@@ -774,7 +971,7 @@ func TestGetActivityReport_PricingModelsOnlyIncludeDedupSurvivors(t *testing.T) 
 		Timestamp:       "2026-06-16T10:30:00Z",
 		Model:           "partial-model",
 		ClaudeMessageID: "m-dup", ClaudeRequestID: "r-dup",
-		TokenUsage: json.RawMessage(`{"input_tokens":1000,"output_tokens":500}`),
+		TokenUsage: jsontext.Value(`{"input_tokens":1000,"output_tokens":500}`),
 	})
 	insertSession(t, d, "later", "proj1", func(s *Session) {
 		s.Agent = "claude"
@@ -787,7 +984,7 @@ func TestGetActivityReport_PricingModelsOnlyIncludeDedupSurvivors(t *testing.T) 
 		Timestamp:       "2026-06-16T10:31:00Z",
 		Model:           "complete-model",
 		ClaudeMessageID: "m-dup", ClaudeRequestID: "r-dup",
-		TokenUsage: json.RawMessage(`{"input_tokens":2000,"output_tokens":900}`),
+		TokenUsage: jsontext.Value(`{"input_tokens":2000,"output_tokens":900}`),
 	})
 
 	r, err := d.GetActivityReport(ctx, AnalyticsFilter{Timezone: "UTC"},
@@ -818,7 +1015,7 @@ func TestGetActivityReport_PricingModelsOnlyIncludeDedupSurvivors(t *testing.T) 
 // GetDailyUsage relies on.
 func TestGetActivityReport_IncludesSubagentUsage(t *testing.T) {
 	d := testDB(t)
-	ctx := context.Background()
+	ctx := t.Context()
 	require.NoError(t, d.UpsertModelPricing([]ModelPricing{
 		{ModelPattern: "root-model", InputPerMTok: money.MustParseDollars("3.0"), OutputPerMTok: money.MustParseDollars("15.0")},
 		{ModelPattern: "sub-model", InputPerMTok: money.MustParseDollars("3.0"), OutputPerMTok: money.MustParseDollars("15.0")},
@@ -833,7 +1030,7 @@ func TestGetActivityReport_IncludesSubagentUsage(t *testing.T) {
 		SessionID: "root", Ordinal: 0, Role: "assistant", Content: "x",
 		Timestamp: "2026-06-16T10:00:00Z", Model: "root-model",
 		ClaudeMessageID: "m-root", ClaudeRequestID: "r-root",
-		TokenUsage: json.RawMessage(`{"input_tokens":1000,"output_tokens":500}`),
+		TokenUsage: jsontext.Value(`{"input_tokens":1000,"output_tokens":500}`),
 	})
 	insertSession(t, d, "agent-sub", "proj1", func(s *Session) {
 		s.Agent = "claude"
@@ -846,7 +1043,7 @@ func TestGetActivityReport_IncludesSubagentUsage(t *testing.T) {
 		SessionID: "agent-sub", Ordinal: 0, Role: "assistant", Content: "y",
 		Timestamp: "2026-06-16T10:03:00Z", Model: "sub-model",
 		ClaudeMessageID: "m-sub", ClaudeRequestID: "r-sub",
-		TokenUsage: json.RawMessage(`{"input_tokens":2000,"output_tokens":700}`),
+		TokenUsage: jsontext.Value(`{"input_tokens":2000,"output_tokens":700}`),
 	})
 	// Fork replaying the root's message: same Claude ids, so the dedup
 	// must drop its usage row while the session itself still appears.
@@ -861,7 +1058,7 @@ func TestGetActivityReport_IncludesSubagentUsage(t *testing.T) {
 		SessionID: "fork", Ordinal: 0, Role: "assistant", Content: "x",
 		Timestamp: "2026-06-16T10:05:00Z", Model: "root-model",
 		ClaudeMessageID: "m-root", ClaudeRequestID: "r-root",
-		TokenUsage: json.RawMessage(`{"input_tokens":1000,"output_tokens":500}`),
+		TokenUsage: jsontext.Value(`{"input_tokens":1000,"output_tokens":500}`),
 	})
 
 	r, err := d.GetActivityReport(ctx, AnalyticsFilter{Timezone: "UTC"},
@@ -872,6 +1069,10 @@ func TestGetActivityReport_IncludesSubagentUsage(t *testing.T) {
 	assert.Contains(t, ids, "agent-sub",
 		"subagent session must be a candidate")
 	assert.Contains(t, ids, "fork", "fork session must be a candidate")
+	assert.Equal(t, 3, r.Totals.Sessions)
+	assert.Equal(t, 2, r.Totals.InteractiveSessions, "subagents are not interactive conversations")
+	assert.Equal(t, 1, r.Totals.SubagentSessions)
+	assert.Zero(t, r.Totals.AutomatedSessions)
 	assert.Equal(t, 1200, r.Totals.OutputTokens,
 		"totals include subagent usage; the fork's replayed row dedups away")
 	// Cost = root (1000*3+500*15)/1e6 + subagent (2000*3+700*15)/1e6; the
@@ -884,7 +1085,7 @@ func TestGetActivityReport_IncludesSubagentUsage(t *testing.T) {
 // falls outside the target day from contributing to that day.
 func TestGetActivityReport_ExcludesOtherDays(t *testing.T) {
 	d := testDB(t)
-	ctx := context.Background()
+	ctx := t.Context()
 
 	insertSession(t, d, "today", "proj1", func(s *Session) {
 		s.Agent = "claude"
@@ -917,7 +1118,7 @@ func TestGetActivityReport_ExcludesOtherDays(t *testing.T) {
 // pad must NOT appear as an untimed session in the target day's report.
 func TestGetActivityReport_PriorDayWithinPadExcluded(t *testing.T) {
 	d := testDB(t)
-	ctx := context.Background()
+	ctx := t.Context()
 
 	insertSession(t, d, "today", "proj1", func(s *Session) {
 		s.Agent = "claude"
@@ -950,7 +1151,7 @@ func TestGetActivityReport_PriorDayWithinPadExcluded(t *testing.T) {
 // appears in the report as an untimed candidate.
 func TestGetActivityReport_UntimedSessionOnDayIncluded(t *testing.T) {
 	d := testDB(t)
-	ctx := context.Background()
+	ctx := t.Context()
 
 	insertSession(t, d, "untimed", "proj1", func(s *Session) {
 		s.Agent = "claude"
@@ -971,7 +1172,7 @@ func TestGetActivityReport_UntimedSessionOnDayIncluded(t *testing.T) {
 // treating an empty string as a real upper bound.
 func TestGetActivityReport_EmptyStringEndedAtIncluded(t *testing.T) {
 	d := testDB(t)
-	ctx := context.Background()
+	ctx := t.Context()
 
 	insertSession(t, d, "empty-end", "proj1", func(s *Session) {
 		s.Agent = "claude"
@@ -994,7 +1195,7 @@ func TestGetActivityReport_EmptyStringEndedAtIncluded(t *testing.T) {
 // wrongly exclude it. The zone-less day bound fixes that.
 func TestGetActivityReport_SubSecondDayStartIncluded(t *testing.T) {
 	d := testDB(t)
-	ctx := context.Background()
+	ctx := t.Context()
 
 	insertSession(t, d, "subsec", "proj1", func(s *Session) {
 		s.Agent = "claude"
@@ -1018,7 +1219,7 @@ func TestGetActivityReport_SubSecondDayStartIncluded(t *testing.T) {
 // an empty model and empty token_usage must not inflate the day totals.
 func TestGetActivityReport_ExcludesIneligibleUsage(t *testing.T) {
 	d := testDB(t)
-	ctx := context.Background()
+	ctx := t.Context()
 	require.NoError(t, d.UpsertModelPricing([]ModelPricing{{
 		ModelPattern:  "claude-sonnet-4-20250514",
 		InputPerMTok:  money.MustParseDollars("3.0"),
@@ -1037,7 +1238,7 @@ func TestGetActivityReport_ExcludesIneligibleUsage(t *testing.T) {
 		Content:    "x",
 		Timestamp:  "2026-06-16T10:30:00Z",
 		Model:      "claude-sonnet-4-20250514",
-		TokenUsage: json.RawMessage(`{"input_tokens":1000,"output_tokens":500}`),
+		TokenUsage: jsontext.Value(`{"input_tokens":1000,"output_tokens":500}`),
 	})
 	// Ineligible: a synthetic-model message carrying real token_usage.
 	// usageMessageEligibility drops m.model == '<synthetic>', so these
@@ -1050,7 +1251,7 @@ func TestGetActivityReport_ExcludesIneligibleUsage(t *testing.T) {
 		Content:    "y",
 		Timestamp:  "2026-06-16T10:31:00Z",
 		Model:      "<synthetic>",
-		TokenUsage: json.RawMessage(`{"input_tokens":9000,"output_tokens":7000}`),
+		TokenUsage: jsontext.Value(`{"input_tokens":9000,"output_tokens":7000}`),
 	})
 
 	r, err := d.GetActivityReport(ctx, AnalyticsFilter{Timezone: "UTC"},
@@ -1066,7 +1267,7 @@ func TestGetActivityReport_ExcludesIneligibleUsage(t *testing.T) {
 // middle day populates the hourly bucket that contains it.
 func TestGetActivityReport_HourlyRange(t *testing.T) {
 	d := testDB(t)
-	ctx := context.Background()
+	ctx := t.Context()
 
 	insertSession(t, d, "mid", "proj1", func(s *Session) {
 		s.Agent = "claude"
@@ -1112,7 +1313,7 @@ func TestGetActivityReport_HourlyRange(t *testing.T) {
 // keep the 500 row, matching PostgreSQL/DuckDB which order on the parsed time.
 func TestGetActivityReport_UsageDedupSubSecondOrder(t *testing.T) {
 	d := testDB(t)
-	ctx := context.Background()
+	ctx := t.Context()
 	require.NoError(t, d.UpsertModelPricing([]ModelPricing{{
 		ModelPattern:  "claude-sonnet-4-20250514",
 		InputPerMTok:  money.MustParseDollars("3.0"),
@@ -1129,7 +1330,7 @@ func TestGetActivityReport_UsageDedupSubSecondOrder(t *testing.T) {
 		Timestamp:       "2026-06-16T10:30:00Z",
 		Model:           "claude-sonnet-4-20250514",
 		ClaudeMessageID: "m-dup", SourceUUID: "src-dup",
-		TokenUsage: json.RawMessage(`{"input_tokens":1000,"output_tokens":500}`),
+		TokenUsage: jsontext.Value(`{"input_tokens":1000,"output_tokens":500}`),
 	})
 	insertSession(t, d, "later", "proj2", func(s *Session) {
 		s.Agent = "claude"
@@ -1141,7 +1342,7 @@ func TestGetActivityReport_UsageDedupSubSecondOrder(t *testing.T) {
 		Timestamp:       "2026-06-16T10:30:00.123Z",
 		Model:           "claude-sonnet-4-20250514",
 		ClaudeMessageID: "m-dup", SourceUUID: "src-dup",
-		TokenUsage: json.RawMessage(`{"input_tokens":1000,"output_tokens":9000}`),
+		TokenUsage: jsontext.Value(`{"input_tokens":1000,"output_tokens":9000}`),
 	})
 
 	r, err := d.GetActivityReport(ctx, AnalyticsFilter{Timezone: "UTC"},
@@ -1153,7 +1354,7 @@ func TestGetActivityReport_UsageDedupSubSecondOrder(t *testing.T) {
 
 func TestGetActivityReport_UsageDedupEqualInstantUsesSessionOrder(t *testing.T) {
 	d := testDB(t)
-	ctx := context.Background()
+	ctx := t.Context()
 	require.NoError(t, d.UpsertModelPricing([]ModelPricing{{
 		ModelPattern:  "claude-sonnet-4-20250514",
 		InputPerMTok:  money.MustParseDollars("3.0"),
@@ -1170,7 +1371,7 @@ func TestGetActivityReport_UsageDedupEqualInstantUsesSessionOrder(t *testing.T) 
 		Timestamp:       "2026-06-16T10:30:00Z",
 		Model:           "claude-sonnet-4-20250514",
 		ClaudeMessageID: "m-equal", SourceUUID: "src-equal",
-		TokenUsage: json.RawMessage(`{"input_tokens":1000,"output_tokens":500}`),
+		TokenUsage: jsontext.Value(`{"input_tokens":1000,"output_tokens":500}`),
 	})
 	insertSession(t, d, "z-session", "project z", func(s *Session) {
 		s.Agent = "claude"
@@ -1182,7 +1383,7 @@ func TestGetActivityReport_UsageDedupEqualInstantUsesSessionOrder(t *testing.T) 
 		Timestamp:       "2026-06-16T05:30:00-05:00",
 		Model:           "claude-sonnet-4-20250514",
 		ClaudeMessageID: "m-equal", SourceUUID: "src-equal",
-		TokenUsage: json.RawMessage(`{"input_tokens":1000,"output_tokens":9000}`),
+		TokenUsage: jsontext.Value(`{"input_tokens":1000,"output_tokens":9000}`),
 	})
 
 	r, err := d.GetActivityReport(ctx, AnalyticsFilter{Timezone: "UTC"},
@@ -1194,7 +1395,7 @@ func TestGetActivityReport_UsageDedupEqualInstantUsesSessionOrder(t *testing.T) 
 
 func TestGetActivityReport_UsageDedupFallsBackToSourceUUID(t *testing.T) {
 	d := testDB(t)
-	ctx := context.Background()
+	ctx := t.Context()
 	require.NoError(t, d.UpsertModelPricing([]ModelPricing{{
 		ModelPattern:  "claude-sonnet-4-20250514",
 		InputPerMTok:  money.MustParseDollars("3.0"),
@@ -1216,7 +1417,7 @@ func TestGetActivityReport_UsageDedupFallsBackToSourceUUID(t *testing.T) {
 		ClaudeMessageID: "m-dup",
 		ClaudeRequestID: "",
 		SourceUUID:      "src-dup",
-		TokenUsage:      json.RawMessage(`{"input_tokens":1000,"output_tokens":500}`),
+		TokenUsage:      jsontext.Value(`{"input_tokens":1000,"output_tokens":500}`),
 	})
 	insertSession(t, d, "later", "proj2", func(s *Session) {
 		s.Agent = "claude"
@@ -1233,7 +1434,7 @@ func TestGetActivityReport_UsageDedupFallsBackToSourceUUID(t *testing.T) {
 		ClaudeMessageID: "m-dup",
 		ClaudeRequestID: "",
 		SourceUUID:      "src-dup",
-		TokenUsage:      json.RawMessage(`{"input_tokens":1000,"output_tokens":900}`),
+		TokenUsage:      jsontext.Value(`{"input_tokens":1000,"output_tokens":900}`),
 	})
 
 	r, err := d.GetActivityReport(ctx, AnalyticsFilter{Timezone: "UTC"},
@@ -1252,7 +1453,7 @@ func TestGetActivityReport_UsageDedupFallsBackToSourceUUID(t *testing.T) {
 // has a session_name.
 func TestGetActivityReport_TitleSkipsEmptyDisplayName(t *testing.T) {
 	d := testDB(t)
-	ctx := context.Background()
+	ctx := t.Context()
 	insertSession(t, d, "s", "proj", func(s *Session) {
 		s.Agent = "claude"
 		s.SessionName = Ptr("real-session-name")
@@ -1260,7 +1461,7 @@ func TestGetActivityReport_TitleSkipsEmptyDisplayName(t *testing.T) {
 		s.StartedAt = Ptr("2026-06-16T10:00:00Z")
 		s.EndedAt = Ptr("2026-06-16T10:02:00Z")
 	})
-	require.NoError(t, d.RenameSession("s", Ptr("")))
+	require.NoError(t, d.RenameSession(ctx, "s", Ptr("")))
 	seedMessage(t, d, "s", 1, "user", "2026-06-16T10:00:00Z", "")
 	seedMessage(t, d, "s", 2, "assistant", "2026-06-16T10:02:00Z", "opus")
 
@@ -1274,7 +1475,7 @@ func TestGetActivityReport_TitleSkipsEmptyDisplayName(t *testing.T) {
 
 func TestGetActivityReport_TitleNeverFallsBackToFirstMessage(t *testing.T) {
 	d := testDB(t)
-	ctx := context.Background()
+	ctx := t.Context()
 	insertSession(t, d, "private-title", "safe-project", func(s *Session) {
 		s.Agent = "claude"
 		s.FirstMessage = Ptr("distinctive private prompt sentinel")
@@ -1300,7 +1501,7 @@ func TestGetActivityReport_TitleNeverFallsBackToFirstMessage(t *testing.T) {
 // to the pre-range started_at and the session vanishes from the report.
 func TestGetActivityReport_OpenSessionWithInRangeMessageIncluded(t *testing.T) {
 	d := testDB(t)
-	ctx := context.Background()
+	ctx := t.Context()
 
 	// Started the day before and never closed (no ended_at), active in-range.
 	insertSession(t, d, "open", "proj1", func(s *Session) {
@@ -1326,7 +1527,7 @@ func TestGetActivityReport_OpenSessionWithInRangeMessageIncluded(t *testing.T) {
 // ExcludeInteractive (the mirror predicate) keeps only automated ones.
 func TestGetActivityReport_AutomationFilterAndSessionSplit(t *testing.T) {
 	d := testDB(t)
-	ctx := context.Background()
+	ctx := t.Context()
 
 	// Two automated (roborev-style) sessions and one interactive, all timed
 	// on 2026-06-16 so each is a candidate for that day's report. Automated
@@ -1409,7 +1610,7 @@ func forceReaderVarLimit(t *testing.T, d *DB, limit int) {
 	reader := d.rawReader()
 	reader.SetMaxOpenConns(1)
 	reader.SetMaxIdleConns(1)
-	conn, err := reader.Conn(context.Background())
+	conn, err := reader.Conn(t.Context())
 	require.NoError(t, err)
 	defer func() { require.NoError(t, conn.Close()) }()
 	require.NoError(t, conn.Raw(func(dc any) error {
@@ -1431,15 +1632,16 @@ func forceReaderVarLimit(t *testing.T, d *DB, limit int) {
 // limit while still aggregating usage across every chunk.
 func TestGetActivityReport_ManySessionsWithinSQLiteVarLimit(t *testing.T) {
 	d := openChunkedAnalyticsFixtureDB(t)
-	ctx := context.Background()
+	ctx := t.Context()
 
 	forceReaderVarLimit(t, d, 999)
 
 	// Guard: prove the lowered limit is live on the pool, so a setup that
 	// failed to constrain it cannot mask the regression checked below.
-	overLimitPh, overLimitArgs := inPlaceholders(make([]string, 1001))
-	_, probeErr := d.getReader().QueryContext(
-		ctx, "SELECT 1 WHERE '' IN "+overLimitPh, overLimitArgs...)
+	overLimitPh, overLimitArgs := InPlaceholders(make([]string, 1001))
+	var probe int
+	probeErr := d.getReader().QueryRowContext(
+		ctx, "SELECT 1 WHERE '' IN "+overLimitPh, overLimitArgs...).Scan(&probe)
 	require.Error(t, probeErr, "reader variable limit was not constrained")
 
 	r, err := d.GetActivityReport(ctx, AnalyticsFilter{Timezone: "UTC"},

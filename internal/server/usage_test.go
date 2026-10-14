@@ -1,23 +1,26 @@
 package server_test
 
 import (
-	"encoding/json"
-	"fmt"
+	"database/sql"
+	"encoding/json/jsontext"
+	"encoding/json/v2"
 	"net/http"
 	"net/http/httptest"
+	"strconv"
 	"testing"
 
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
 
 	"go.kenn.io/agentsview/internal/db"
+	"go.kenn.io/agentsview/internal/dbtest"
 	"go.kenn.io/agentsview/internal/money"
 	"go.kenn.io/agentsview/internal/server"
 	"go.kenn.io/agentsview/internal/service"
 )
 
 // tokenUsageJSON is a valid token_usage blob for test messages.
-var tokenUsageJSON = json.RawMessage(
+var tokenUsageJSON = jsontext.Value(
 	`{"input_tokens":100,"output_tokens":50,` +
 		`"cache_creation_input_tokens":10,` +
 		`"cache_read_input_tokens":20}`,
@@ -158,7 +161,7 @@ func seedUsagePairwiseEnv(t *testing.T, te *testEnv) {
 		project string
 		started string
 		model   string
-		usage   json.RawMessage
+		usage   jsontext.Value
 	}
 
 	entries := []entry{
@@ -167,7 +170,7 @@ func seedUsagePairwiseEnv(t *testing.T, te *testEnv) {
 			project: "alpha",
 			started: "2024-06-01T09:00:00Z",
 			model:   "claude-sonnet-4-20250514",
-			usage: json.RawMessage(
+			usage: jsontext.Value(
 				`{"input_tokens":100,"output_tokens":50,"cache_creation_input_tokens":10,"cache_read_input_tokens":20}`,
 			),
 		},
@@ -176,7 +179,7 @@ func seedUsagePairwiseEnv(t *testing.T, te *testEnv) {
 			project: "beta",
 			started: "2024-06-01T10:00:00Z",
 			model:   "gpt-4o",
-			usage: json.RawMessage(
+			usage: jsontext.Value(
 				`{"input_tokens":30,"output_tokens":15,"cache_creation_input_tokens":0,"cache_read_input_tokens":5}`,
 			),
 		},
@@ -212,7 +215,7 @@ func TestHandleUsageSummaryJSONShape(t *testing.T) {
 	assertStatus(t, w, http.StatusOK)
 
 	// Verify all expected top-level keys exist.
-	var raw map[string]json.RawMessage
+	var raw map[string]jsontext.Value
 	require.NoError(t, json.Unmarshal(w.Body.Bytes(), &raw))
 
 	required := []string{
@@ -272,7 +275,7 @@ func TestHandleUsageSummarySkipsUnsupportedCopilotSignalForMixedFilters(t *testi
 func TestHandleUsageSummaryIncludesCursorUsageEvents(t *testing.T) {
 	te := setup(t)
 
-	require.NoError(t, te.db.InsertCursorUsageEvents([]db.CursorUsageEvent{{
+	require.NoError(t, te.db.InsertCursorUsageEvents(t.Context(), []db.CursorUsageEvent{{
 		OccurredAt:       "2026-05-14T10:05:00Z",
 		Model:            "claude-4.6-opus-high-thinking",
 		Kind:             "USAGE_EVENT_KIND_USAGE_BASED",
@@ -340,6 +343,7 @@ func TestHandleUsageTopSessionsLimit(t *testing.T) {
 
 func TestHandleUsageTopSessionsRanksBySelectedTokenTypes(t *testing.T) {
 	te := setup(t)
+	require.NoError(t, te.db.SetSyncState(t.Context(), db.MachineAliasKeyPrefix+"old-owner", "test"))
 	for _, fixture := range []struct {
 		id        string
 		input     int
@@ -363,9 +367,9 @@ func TestHandleUsageTopSessionsRanksBySelectedTokenTypes(t *testing.T) {
 			msg.Role = "assistant"
 			msg.Timestamp = fixture.startedAt
 			msg.Model = "gpt-5.4"
-			msg.TokenUsage = json.RawMessage(
-				`{"input_tokens":` + fmt.Sprint(fixture.input) +
-					`,"output_tokens":` + fmt.Sprint(fixture.output) + `}`,
+			msg.TokenUsage = jsontext.Value(
+				`{"input_tokens":` + strconv.Itoa(fixture.input) +
+					`,"output_tokens":` + strconv.Itoa(fixture.output) + `}`,
 			)
 		})
 	}
@@ -378,6 +382,7 @@ func TestHandleUsageTopSessionsRanksBySelectedTokenTypes(t *testing.T) {
 			"timezone":    "UTC",
 			"sort":        "tokens",
 			"token_types": "output",
+			"machine":     "old-owner",
 			"limit":       "1",
 		}))
 	assertStatus(t, w, http.StatusOK)
@@ -419,7 +424,7 @@ func TestHandleUsagePairwiseComparisonJSONShape(t *testing.T) {
 	))
 	assertStatus(t, w, http.StatusOK)
 
-	var raw map[string]json.RawMessage
+	var raw map[string]jsontext.Value
 	require.NoError(t, json.Unmarshal(w.Body.Bytes(), &raw))
 	assert.Contains(t, raw, "left")
 	assert.Contains(t, raw, "right")
@@ -492,7 +497,7 @@ func TestUsageRoutesRegistered(t *testing.T) {
 	}
 	for _, ep := range endpoints {
 		t.Run(ep, func(t *testing.T) {
-			req := httptest.NewRequest(
+			req := httptest.NewRequestWithContext(t.Context(),
 				http.MethodGet, ep, nil,
 			)
 			w := httptest.NewRecorder()
@@ -500,4 +505,23 @@ func TestUsageRoutesRegistered(t *testing.T) {
 			assert.NotEqual(t, http.StatusNotFound, w.Code, "%s returned 404", ep)
 		})
 	}
+}
+
+func TestHandleUsageTopSessionsGroupsByProjectKey(t *testing.T) {
+	te := setup(t)
+	conn, err := sql.Open("sqlite3", te.db.Path())
+	require.NoError(t, err)
+	defer conn.Close()
+	dbtest.SeedUsageGroups(t, conn)
+	catalog, err := te.db.BuildProjectIdentityMap(t.Context(), []string{"hermes-cron"})
+	require.NoError(t, err)
+	key := catalog["hermes-cron"].ProjectKey
+	require.NotEmpty(t, key)
+	params := map[string]string{"from": "2026-10-07", "to": "2026-10-10", "timezone": "UTC", "include_automated": "true", "group_by": "group", "project_key": key, "project": "hermes-cron", "sort": "tokens", "limit": "1"}
+	w := te.get(t, buildPathURL("/api/v1/usage/top-sessions", params))
+	assertStatus(t, w, http.StatusOK)
+	var response []map[string]any
+	require.NoError(t, json.Unmarshal(w.Body.Bytes(), &response))
+	require.NotEmpty(t, response)
+	assert.Equal(t, "job-a", response[0]["groupKey"])
 }

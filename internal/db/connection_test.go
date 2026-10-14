@@ -1,9 +1,11 @@
 package db
 
 import (
+	"context"
 	"database/sql"
 	"path/filepath"
 	"testing"
+	"time"
 
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
@@ -18,11 +20,11 @@ func assertSQLiteMemoryPragmas(
 	t.Helper()
 
 	var got int
-	require.NoError(t, conn.QueryRow("PRAGMA cache_size").Scan(&got))
+	require.NoError(t, conn.QueryRowContext(t.Context(), "PRAGMA cache_size").Scan(&got))
 	assert.Equal(t, expectedSQLiteCacheSizeKiB, got)
 
 	var mmapSize int64
-	require.NoError(t, conn.QueryRow("PRAGMA mmap_size").Scan(&mmapSize))
+	require.NoError(t, conn.QueryRowContext(t.Context(), "PRAGMA mmap_size").Scan(&mmapSize))
 }
 
 func TestSQLiteConnectionMemoryPragmas(t *testing.T) {
@@ -33,7 +35,8 @@ func TestSQLiteConnectionMemoryPragmas(t *testing.T) {
 		{
 			name: "Open writer",
 			open: func(t *testing.T, path string) *sql.DB {
-				database, err := Open(path)
+				t.Helper()
+				database, err := Open(t.Context(), path)
 				require.NoError(t, err)
 				t.Cleanup(func() {
 					require.NoError(t, database.Close())
@@ -44,7 +47,8 @@ func TestSQLiteConnectionMemoryPragmas(t *testing.T) {
 		{
 			name: "Open reader",
 			open: func(t *testing.T, path string) *sql.DB {
-				database, err := Open(path)
+				t.Helper()
+				database, err := Open(t.Context(), path)
 				require.NoError(t, err)
 				t.Cleanup(func() {
 					require.NoError(t, database.Close())
@@ -55,11 +59,13 @@ func TestSQLiteConnectionMemoryPragmas(t *testing.T) {
 		{
 			name: "OpenReadOnly reader",
 			open: func(t *testing.T, path string) *sql.DB {
-				writable, err := Open(path)
+				t.Helper()
+
+				writable, err := Open(t.Context(), path)
 				require.NoError(t, err)
 				require.NoError(t, writable.Close())
 
-				readonly, err := OpenReadOnly(path)
+				readonly, err := OpenReadOnly(t.Context(), path)
 				require.NoError(t, err)
 				t.Cleanup(func() {
 					require.NoError(t, readonly.Close())
@@ -79,7 +85,7 @@ func TestSQLiteConnectionMemoryPragmas(t *testing.T) {
 
 func TestReaderPoolRetainsConfiguredBurstConnections(t *testing.T) {
 	path := filepath.Join(t.TempDir(), "sessions.db")
-	database, err := Open(path)
+	database, err := Open(t.Context(), path)
 	require.NoError(t, err)
 	t.Cleanup(func() {
 		require.NoError(t, database.Close())
@@ -102,4 +108,62 @@ func TestReaderPoolRetainsConfiguredBurstConnections(t *testing.T) {
 	stats := reader.Stats()
 	assert.Equal(t, readerMaxOpenConns, stats.Idle)
 	assert.Zero(t, stats.MaxIdleClosed)
+}
+
+func TestQuickReadKeepsAReaderWhileAnalyticsFillThePool(t *testing.T) {
+	database := testDB(t)
+	insertSession(t, database, "summary", "project", func(s *Session) {
+		s.StartedAt = new("2024-06-01T09:00:00Z")
+	})
+	reader := database.rawReader()
+	for range bulkReadSlots {
+		release, err := database.acquireBulkRead(t.Context())
+		require.NoError(t, err)
+		defer release()
+		conn, err := reader.Conn(t.Context())
+		require.NoError(t, err)
+		defer conn.Close()
+	}
+	quickCtx, quickCancel := context.WithTimeout(t.Context(), 2*time.Second)
+	defer quickCancel()
+	session, err := database.GetSession(quickCtx, "summary")
+	require.NoError(t, err)
+	require.NotNil(t, session)
+	assert.Equal(t, "summary", session.ID)
+	probe, err := database.ActivityReportSourceProbe(quickCtx)
+	require.NoError(t, err)
+	assert.EqualValues(t, 1, probe.SessionCount)
+}
+
+func TestAcquireBulkReadHonorsContext(t *testing.T) {
+	database := &DB{}
+	ctx, cancel := context.WithCancel(t.Context())
+	cancel()
+	for range 100 {
+		release, err := database.acquireBulkRead(ctx)
+		if release != nil {
+			release()
+		}
+		require.ErrorIs(t, err, context.Canceled)
+		assert.Nil(t, release)
+	}
+	releases := make([]func(), 0, bulkReadSlots)
+	for range bulkReadSlots {
+		release, err := database.acquireBulkRead(t.Context())
+		require.NoError(t, err)
+		releases = append(releases, release)
+	}
+	defer func() {
+		for _, release := range releases {
+			release()
+		}
+	}()
+	release, err := database.acquireBulkRead(ctx)
+	require.ErrorIs(t, err, context.Canceled)
+	assert.Nil(t, release)
+	releases[0]()
+	releases = releases[1:]
+	release, err = database.acquireBulkRead(t.Context())
+	require.NoError(t, err)
+	release()
 }

@@ -2,7 +2,7 @@ package export
 
 import (
 	"crypto/sha256"
-	"fmt"
+	"encoding/hex"
 	"math"
 	"testing"
 	"time"
@@ -96,8 +96,8 @@ func TestMarshalCanonicalVectors(t *testing.T) {
 		{
 			name:   "string escaping",
 			input:  map[string]any{"text": "<>&\b\f\u2028\u2029"},
-			bytes:  `{"text":"<>&\b\f\u2028\u2029"}`,
-			digest: "sha256:654cd6bbd6c7311e46686b6cbf6dbfc9f092258e669b2d0ce2f286a5e81dd2bb",
+			bytes:  "{\"text\":\"<>&\\b\\f\u2028\u2029\"}",
+			digest: "sha256:e5de86e813b24e83a074160c5e30141ab85fb400e09f0e10a1594ce2cfedeccf",
 		},
 		{
 			name:   "exact integer above double range",
@@ -176,6 +176,19 @@ func TestEffectivePricingDigestChangesWhenPricingBandChanges(t *testing.T) {
 	assert.NotEqual(t, digest, changedDigest)
 }
 
+func TestEffectivePricingDigestChangesWhen1hCacheWriteRateSet(t *testing.T) {
+	rows := digestFixtureRows(t)
+	changed := digestFixtureRows(t)
+	changed[0].Rates.CacheWrite1hPerMTok = money.MustParseDollars("6")
+
+	digest, err := EffectivePricingDigest(rows)
+	require.NoError(t, err)
+	changedDigest, err := EffectivePricingDigest(changed)
+	require.NoError(t, err)
+
+	assert.NotEqual(t, digest, changedDigest)
+}
+
 func TestEffectivePricingDigestFixture(t *testing.T) {
 	rows := digestFixtureRows(t)
 	canonical, err := canonicalPricingJSON(canonicalPricingRows(rows))
@@ -184,7 +197,7 @@ func TestEffectivePricingDigestFixture(t *testing.T) {
 	digest, err := EffectivePricingDigest(rows)
 	require.NoError(t, err)
 
-	require.Equal(t, "sha256:"+fmt.Sprintf("%x", sum), digest)
+	require.Equal(t, "sha256:"+hex.EncodeToString(sum[:]), digest)
 	assert.Equal(t,
 		"sha256:247836888d2c78a5fda3d0e391bbc28a7fd58b4fb3af9b0d5a0e037a9f3faf0b",
 		digest,

@@ -12,7 +12,7 @@ import (
 	"sync"
 
 	"go.kenn.io/docbank"
-	docsqlite "go.kenn.io/docbank/pkg/sqlite"
+	docsqlite "go.kenn.io/docbank/sqlite"
 )
 
 const (
@@ -157,6 +157,16 @@ func (r *Repository) Content() ArtifactStore {
 		return nil
 	}
 	return r.content
+}
+
+// CreateBackup captures this repository while retaining its exclusive owner.
+func (r *Repository) CreateBackup(ctx context.Context, target *docbank.BackupRepository, opts docbank.BackupOptions) (docbank.BackupSnapshot, error) {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	if r.closed {
+		return docbank.BackupSnapshot{}, docbank.ErrClosed
+	}
+	return r.content.vault.CreateBackup(ctx, target, opts)
 }
 
 // Closed reports whether repository ownership has already been released or

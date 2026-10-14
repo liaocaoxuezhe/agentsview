@@ -17,25 +17,25 @@ import (
 func TestOpenCreatesLocalDuckDBFile(t *testing.T) {
 	path := filepath.Join(t.TempDir(), "agentsview.duckdb")
 
-	db, err := Open(path)
+	db, err := Open(t.Context(), path)
 	require.NoError(t, err, "Open")
 	t.Cleanup(func() {
 		require.NoError(t, db.Close(), "close DuckDB")
 	})
 
-	require.NoError(t, db.PingContext(context.Background()))
+	require.NoError(t, db.PingContext(t.Context()))
 	assert.FileExists(t, path)
 }
 
 func TestOpenRejectsEmptyPath(t *testing.T) {
-	db, err := Open("")
+	db, err := Open(t.Context(), "")
 	require.Error(t, err)
 	assert.Nil(t, db)
 	assert.Contains(t, err.Error(), "duckdb path is required")
 }
 
 func TestEnsureSchemaCreatesRequiredMirrorTables(t *testing.T) {
-	ctx := context.Background()
+	ctx := t.Context()
 	db := openTestDuckDB(t)
 
 	require.NoError(t, createSchema(ctx, db), "createSchema")
@@ -48,6 +48,7 @@ func TestEnsureSchemaCreatesRequiredMirrorTables(t *testing.T) {
 		"cursor_usage_events",
 		"model_pricing",
 		"model_pricing_bands",
+		"genai_pricing",
 		"tool_calls",
 		"tool_result_events",
 		"secret_findings",
@@ -67,7 +68,7 @@ func TestEnsureSchemaCreatesRequiredMirrorTables(t *testing.T) {
 }
 
 func TestUsageEventsDedupIndexAllowsRepeatedKeys(t *testing.T) {
-	ctx := context.Background()
+	ctx := t.Context()
 	db := openTestDuckDB(t)
 	require.NoError(t, createSchema(ctx, db), "createSchema")
 
@@ -87,7 +88,7 @@ func TestUsageEventsDedupIndexAllowsRepeatedKeys(t *testing.T) {
 }
 
 func TestEnsureSchemaIsIdempotent(t *testing.T) {
-	ctx := context.Background()
+	ctx := t.Context()
 	db := openTestDuckDB(t)
 
 	require.NoError(t, createSchema(ctx, db), "first createSchema")
@@ -98,7 +99,7 @@ func TestEnsureSchemaIsIdempotent(t *testing.T) {
 }
 
 func TestCheckSchemaCompatReportsMissingTablesAndColumns(t *testing.T) {
-	ctx := context.Background()
+	ctx := t.Context()
 	db := openTestDuckDB(t)
 
 	err := CheckSchemaCompat(ctx, db)
@@ -122,7 +123,7 @@ func TestCheckSchemaCompatReportsMissingTablesAndColumns(t *testing.T) {
 }
 
 func TestCheckSchemaCompatPassesAfterCreateSchema(t *testing.T) {
-	ctx := context.Background()
+	ctx := t.Context()
 	db := openTestDuckDB(t)
 
 	require.NoError(t, createSchema(ctx, db), "createSchema")
@@ -130,7 +131,7 @@ func TestCheckSchemaCompatPassesAfterCreateSchema(t *testing.T) {
 }
 
 func TestCheckSchemaCompatViaQuackRejectsPreReportedCostMirror(t *testing.T) {
-	ctx := context.Background()
+	ctx := t.Context()
 	db := openTestDuckDB(t)
 	require.NoError(t, createSchema(ctx, db), "createSchema")
 	_, err := db.ExecContext(ctx,
@@ -152,7 +153,7 @@ func TestCheckSchemaCompatViaQuackRejectsPreReportedCostMirror(t *testing.T) {
 func TestCheckSchemaCompatViaQuackReportsServerBehindOnMissingColumns(
 	t *testing.T,
 ) {
-	ctx := context.Background()
+	ctx := t.Context()
 	db := openTestDuckDB(t)
 	_, err := db.ExecContext(ctx,
 		`CREATE TABLE sessions (
@@ -179,7 +180,7 @@ func TestCheckSchemaCompatViaQuackReportsServerBehindOnMissingColumns(
 func TestCheckSchemaCompatKeepsLocalRebuildHintOnMissingColumns(
 	t *testing.T,
 ) {
-	ctx := context.Background()
+	ctx := t.Context()
 	db := openTestDuckDB(t)
 	_, err := db.ExecContext(ctx,
 		`CREATE TABLE sessions (
@@ -207,7 +208,7 @@ func TestCheckSchemaCompatKeepsLocalRebuildHintOnMissingColumns(
 func TestCheckSchemaCompatRejectsSchemaVersionMismatchInBothDirections(
 	t *testing.T,
 ) {
-	ctx := context.Background()
+	ctx := t.Context()
 	checks := map[string]func(context.Context, *sql.DB) error{
 		"local":  CheckSchemaCompat,
 		"remote": CheckSchemaCompatViaQuack,
@@ -241,7 +242,7 @@ func TestCheckSchemaCompatRejectsSchemaVersionMismatchInBothDirections(
 func TestCheckSchemaCompatViaQuackReportsServerBehindOnMissingVersionRow(
 	t *testing.T,
 ) {
-	ctx := context.Background()
+	ctx := t.Context()
 	db := openTestDuckDB(t)
 	require.NoError(t, createSchema(ctx, db), "createSchema")
 	_, err := db.ExecContext(ctx,
@@ -262,7 +263,7 @@ func TestCheckSchemaCompatViaQuackReportsServerBehindOnMissingVersionRow(
 // Recent Edits index. DuckDB has no partial indexes, so it omits the
 // WHERE file_path IS NOT NULL clause but indexes the same column.
 func TestEnsureSchemaCreatesToolCallsFilePathIndex(t *testing.T) {
-	ctx := context.Background()
+	ctx := t.Context()
 	db := openTestDuckDB(t)
 	require.NoError(t, createSchema(ctx, db), "createSchema")
 
@@ -282,7 +283,7 @@ func openTestDuckDB(t *testing.T) *sql.DB {
 	require.NoError(t, err, "open in-memory DuckDB")
 	db.SetMaxOpenConns(1)
 	db.SetMaxIdleConns(1)
-	require.NoError(t, configureDuckDBThreads(db))
+	require.NoError(t, configureDuckDBThreads(t.Context(), db))
 	t.Cleanup(func() {
 		require.NoError(t, db.Close(), "close DuckDB")
 	})
@@ -292,7 +293,7 @@ func openTestDuckDB(t *testing.T) *sql.DB {
 func tableExists(t *testing.T, db *sql.DB, table string) bool {
 	t.Helper()
 	var exists bool
-	require.NoError(t, db.QueryRow(
+	require.NoError(t, db.QueryRowContext(t.Context(),
 		`SELECT count(*) > 0
 		 FROM information_schema.tables
 		 WHERE table_schema = current_schema()
@@ -305,7 +306,7 @@ func tableExists(t *testing.T, db *sql.DB, table string) bool {
 func columnExists(t *testing.T, db *sql.DB, table, column string) bool {
 	t.Helper()
 	var exists bool
-	require.NoError(t, db.QueryRow(
+	require.NoError(t, db.QueryRowContext(t.Context(),
 		`SELECT count(*) > 0
 		 FROM information_schema.columns
 		 WHERE table_schema = current_schema()

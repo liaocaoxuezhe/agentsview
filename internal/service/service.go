@@ -5,10 +5,12 @@ package service
 
 import (
 	"context"
-	"encoding/json"
+	"encoding/json/v2"
 	"errors"
 	"io"
+	"strings"
 
+	"go.kenn.io/agentsview/internal/activity"
 	"go.kenn.io/agentsview/internal/db"
 )
 
@@ -68,9 +70,17 @@ type SessionService interface {
 	// case-sensitive substring, ordered by most recent activity and capped by
 	// limit.
 	FindSessionIDsByPartial(ctx context.Context, partial string, limit int) ([]string, error)
+	// FindSessionIDsByRawSuffix matches an exact stored ID or a literal
+	// colon/tilde-delimited suffix before applying limit.
+	FindSessionIDsByRawSuffix(ctx context.Context, raw string, limit int) ([]string, error)
 	List(ctx context.Context, f ListFilter) (*SessionList, error)
 	Messages(ctx context.Context, id string, f MessageFilter) (*MessageList, error)
 	ToolCalls(ctx context.Context, id string) (*ToolCallList, error)
+	// ChildSessions lists the sub-agent and fork sessions whose parent is id.
+	ChildSessions(ctx context.Context, id string) ([]db.Session, error)
+	// RecentEdits pages edited files, newest edit first, with the sessions
+	// whose Edit/Write tool calls touched each file.
+	RecentEdits(ctx context.Context, f RecentEditsFilter) (*db.RecentEditsResult, error)
 	Sync(ctx context.Context, in SyncInput) (*SessionDetail, error)
 	Watch(ctx context.Context, id string) (<-chan Event, error)
 	Stats(ctx context.Context, f StatsFilter) (*SessionStats, error)
@@ -80,6 +90,12 @@ type SessionService interface {
 	UsagePairwiseComparison(
 		ctx context.Context, req UsagePairwiseComparisonRequest,
 	) (*UsagePairwiseComparisonResponse, error)
+	// ActivityReport returns the Activity report for one range with every
+	// session row in BySession.
+	ActivityReport(ctx context.Context, req ActivityReportRequest) (*activity.Report, error)
+	ToolAnalytics(ctx context.Context, req AnalyticsRequest) (*db.ToolsAnalyticsResponse, error)
+	SignalAnalytics(ctx context.Context, req AnalyticsRequest) (*db.SignalsAnalyticsResponse, error)
+	SignalSessions(ctx context.Context, req SignalSessionsRequest) (*db.SignalSessionsResponse, error)
 	ListRecallEntries(ctx context.Context, f RecallFilter) (*RecallList, error)
 	GetRecallEntry(ctx context.Context, id string) (*db.RecallEntry, error)
 	QueryRecallEntries(ctx context.Context, req RecallQuery) (*RecallQueryResult, error)
@@ -140,11 +156,13 @@ type SecretFindingList struct {
 // It mirrors the GET /api/v1/search query parameters so both transports
 // produce identical results.
 type SearchRequest struct {
-	Query   string `json:"query"`
-	Project string `json:"project,omitempty"`
-	Sort    string `json:"sort,omitempty"` // "relevance" (default) or "recency"
-	Cursor  int    `json:"cursor,omitempty"`
-	Limit   int    `json:"limit,omitempty"`
+	DateFrom string `json:"date_from,omitempty"`
+	DateTo   string `json:"date_to,omitempty"`
+	Query    string `json:"query"`
+	Project  string `json:"project,omitempty"`
+	Sort     string `json:"sort,omitempty"` // "relevance" (default) or "recency"
+	Cursor   int    `json:"cursor,omitempty"`
+	Limit    int    `json:"limit,omitempty"`
 }
 
 // SessionSearchResult mirrors db.SearchPage for transport: ranked
@@ -157,7 +175,7 @@ type SessionSearchResult struct {
 // ContentSearchRequest is the transport-neutral content-search input.
 type ContentSearchRequest struct {
 	Pattern       string   `json:"pattern"`
-	Mode          string   `json:"mode,omitempty"` // substring|regex|fts|semantic|hybrid
+	Mode          string   `json:"mode,omitempty"` // substring|regex|fts|terms|semantic|hybrid
 	Sources       []string `json:"sources,omitempty"`
 	ExcludeSystem bool     `json:"exclude_system,omitempty"`
 	Reveal        bool     `json:"reveal,omitempty"`
@@ -166,8 +184,11 @@ type ContentSearchRequest struct {
 	Context int `json:"context,omitempty"`
 
 	Project, ExcludeProject, Machine, Agent           string
+	SessionID, GitBranchExact                         string
 	Date, DateFrom, DateTo, Timezone, ActiveSince     string
+	ExcludeActiveSince                                string
 	IncludeChildren, IncludeAutomated, IncludeOneShot bool
+	ExcludeSessionIDs                                 []string
 	// GitBranch is a branchListSep-joined list of opaque (project, branch) tokens (EncodeBranchFilterToken).
 	GitBranch string
 
@@ -182,8 +203,11 @@ type ContentSearchRequest struct {
 
 // ContentSearchResult mirrors db.ContentSearchPage for transport.
 type ContentSearchResult struct {
-	Matches    []db.ContentMatch `json:"matches"`
-	NextCursor int               `json:"next_cursor,omitempty"`
+	ActiveFilterApplied bool              `json:"active_filter_applied"`
+	Matches             []db.ContentMatch `json:"matches"`
+	NextCursor          int               `json:"next_cursor,omitempty"`
+	RevisionBound       bool              `json:"revision_bound"`
+	Coverage            MemoryCoverage    `json:"coverage"`
 }
 
 // RecallFilter mirrors GET /api/v1/recall/entries query parameters.
@@ -324,7 +348,7 @@ type SessionDetail struct {
 func (d SessionDetail) MarshalJSON() ([]byte, error) {
 	type sessionAlias db.Session
 	return json.Marshal(struct {
-		sessionAlias
+		sessionAlias     `json:",inline"`
 		QualitySignals   *db.QualitySignals `json:"quality_signals,omitempty"`
 		HealthScoreBasis []string           `json:"health_score_basis,omitempty"`
 		HealthPenalties  map[string]int     `json:"health_penalties,omitempty"`
@@ -344,7 +368,7 @@ func (d SessionDetail) MarshalJSON() ([]byte, error) {
 func (d *SessionDetail) UnmarshalJSON(data []byte) error {
 	type sessionAlias db.Session
 	var v struct {
-		sessionAlias
+		sessionAlias     `json:",inline"`
 		QualitySignals   *db.QualitySignals `json:"quality_signals"`
 		HealthScoreBasis []string           `json:"health_score_basis"`
 		HealthPenalties  map[string]int     `json:"health_penalties"`
@@ -368,37 +392,63 @@ type SessionList struct {
 	Total      int          `json:"total"`
 }
 
+// SessionAnnotationsAPIVersion is the first daemon API that applies label
+// and pull request filters; older daemons ignore them.
+const SessionAnnotationsAPIVersion = 11
+
 // ListFilter mirrors the HTTP query parameters in handleListSessions.
 // Field names map to HTTP query param names via json tags.
 type ListFilter struct {
-	Project          string `json:"project,omitempty"`
-	ExcludeProject   string `json:"exclude_project,omitempty"`
-	Machine          string `json:"machine,omitempty"`
-	GitBranch        string `json:"git_branch,omitempty"`
-	Agent            string `json:"agent,omitempty"`
-	Date             string `json:"date,omitempty"`
-	DateFrom         string `json:"date_from,omitempty"`
-	DateTo           string `json:"date_to,omitempty"`
-	Timezone         string `json:"timezone,omitempty"`
-	ActiveSince      string `json:"active_since,omitempty"`
-	MinMessages      int    `json:"min_messages,omitempty"`
-	MaxMessages      int    `json:"max_messages,omitempty"`
-	MinUserMessages  int    `json:"min_user_messages,omitempty"`
-	IncludeOneShot   bool   `json:"include_one_shot,omitempty"`
-	IncludeAutomated bool   `json:"include_automated,omitempty"`
-	IncludeChildren  bool   `json:"include_children,omitempty"`
-	Outcome          string `json:"outcome,omitempty"`      // comma-separated
-	HealthGrade      string `json:"health_grade,omitempty"` // comma-separated
-	Termination      string `json:"termination,omitempty"`  // comma-separated
-	MinToolFailures  *int   `json:"min_tool_failures,omitempty"`
-	HasSecret        bool   `json:"has_secret,omitempty"`
-	Starred          bool   `json:"starred,omitempty"`
-	Cursor           string `json:"cursor,omitempty"`
-	Limit            int    `json:"limit,omitempty"`
+	// IDs selects explicit sessions and their host copies; nil uses discovery defaults.
+	IDs []string `json:"ids,omitzero"`
+
+	Project            string `json:"project,omitempty"`
+	ExcludeProject     string `json:"exclude_project,omitempty"`
+	Machine            string `json:"machine,omitempty"`
+	GitBranch          string `json:"git_branch,omitempty"`
+	Agent              string `json:"agent,omitempty"`
+	Date               string `json:"date,omitempty"`
+	DateFrom           string `json:"date_from,omitempty"`
+	DateTo             string `json:"date_to,omitempty"`
+	Timezone           string `json:"timezone,omitempty"`
+	ActiveSince        string `json:"active_since,omitempty"`
+	MinMessages        int    `json:"min_messages,omitempty"`
+	MaxMessages        int    `json:"max_messages,omitempty"`
+	MinUserMessages    int    `json:"min_user_messages,omitempty"`
+	IncludeOneShot     bool   `json:"include_one_shot,omitempty"`
+	OneShotFilterSet   bool   `json:"-"`
+	AutomatedFilterSet bool   `json:"-"`
+	IncludeAutomated   bool   `json:"include_automated,omitempty"`
+	IncludeChildren    bool   `json:"include_children,omitempty"`
+	IncludeSource      bool   `json:"include_source,omitempty"`
+	Outcome            string `json:"outcome,omitempty"`      // comma-separated
+	HealthGrade        string `json:"health_grade,omitempty"` // comma-separated
+	Termination        string `json:"termination,omitempty"`  // comma-separated
+	MinToolFailures    *int   `json:"min_tool_failures,omitempty"`
+	HasSecret          bool   `json:"has_secret,omitempty"`
+	Starred            bool   `json:"starred,omitempty"`
+	// Labels keeps sessions carrying every listed label.
+	Labels []string `json:"label,omitempty"`
+	// PR keeps sessions linked to a pull request: owner/repo,
+	// owner/repo#123.
+	PR     string `json:"pr,omitempty"`
+	Cursor string `json:"cursor,omitempty"`
+	Limit  int    `json:"limit,omitempty"`
 	// OrderBy selects the sort column ("" = recent activity). Descending
 	// overrides the sort key's canonical direction when non-nil.
 	OrderBy    string `json:"order_by,omitempty"`
 	Descending *bool  `json:"descending,omitempty"`
+}
+
+// SessionIDsRequireCSVEncoding reports whether an ID contains a comma or line
+// break that must be preserved by the HTTP sessions-list query encoding.
+func SessionIDsRequireCSVEncoding(ids []string) bool {
+	for _, id := range ids {
+		if strings.ContainsAny(id, ",\r\n") {
+			return true
+		}
+	}
+	return false
 }
 
 // MessageFilter mirrors GET /api/v1/sessions/{id}/messages query params.
@@ -418,17 +468,34 @@ type MessageFilter struct {
 	Before    *int     `json:"before,omitempty"` // default 5 when Around set
 	After     *int     `json:"after,omitempty"`  // default 5 when Around set
 	Roles     []string `json:"roles,omitempty"`
+	// ExpectedRevision rejects a read when the session no longer has the
+	// transcript revision cited by search or an earlier read.
+	ExpectedRevision string `json:"expected_revision,omitempty"`
+	// EvidenceSource is the opaque backend binding returned by an earlier
+	// read. It prevents a continuation cursor from being replayed against a
+	// different archive/server instance.
+	EvidenceSource string `json:"evidence_source,omitempty"`
 }
 
 // MessageList mirrors {messages, count}. FirstOrdinal/LastOrdinal report the
 // returned window's bounds (nil when Messages is empty) so callers can page
 // on with from = last_ordinal + 1.
 type MessageList struct {
-	Messages     []db.Message `json:"messages"`
-	Count        int          `json:"count"`
-	FirstOrdinal *int         `json:"first_ordinal,omitempty"`
-	LastOrdinal  *int         `json:"last_ordinal,omitempty"`
+	Messages           []db.Message `json:"messages"`
+	Count              int          `json:"count"`
+	FirstOrdinal       *int         `json:"first_ordinal,omitempty"`
+	LastOrdinal        *int         `json:"last_ordinal,omitempty"`
+	TranscriptRevision string       `json:"transcript_revision,omitempty"`
+	EvidenceSource     string       `json:"evidence_source,omitempty"`
 }
+
+// ErrSourceChanged marks a revision-bound evidence read whose archive,
+// session, or transcript revision no longer matches the cited source.
+var ErrSourceChanged = errors.New("source_changed")
+
+// ErrRevisionBoundReadUnavailable marks a backend that cannot provide stable
+// transcript revisions for evidence reads.
+var ErrRevisionBoundReadUnavailable = errors.New("revision-bound reads unavailable")
 
 // ToolCall mirrors a flattened tool call with its enclosing message's
 // ordinal/timestamp attached. Serialized from parser.ParsedToolCall.
@@ -443,6 +510,18 @@ type ToolCall struct {
 	SubagentSessionID string `json:"subagent_session_id,omitempty"`
 	ResultLength      int    `json:"result_length"`
 }
+
+// RecentEditsFilter parameterises RecentEdits. Search matches a
+// case-insensitive file path substring; Limit counts files, not edits.
+type RecentEditsFilter struct {
+	Project string
+	Search  string
+	Limit   int
+	Offset  int
+}
+
+// recentEditsPerFile matches the inline edit cap of GET /api/v1/recent-edits.
+const recentEditsPerFile = 20
 
 // ToolCallList mirrors {tool_calls, count}.
 type ToolCallList struct {

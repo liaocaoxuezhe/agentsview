@@ -1,12 +1,12 @@
 package db
 
 import (
-	"context"
 	"database/sql"
-	"encoding/json"
+	"encoding/json/v2"
 	"fmt"
 	"os"
 	"path/filepath"
+	"runtime"
 	"sync"
 	"testing"
 	"time"
@@ -19,7 +19,7 @@ import (
 // TestRealDBUsagePayload measures the JSON payload the dashboard must
 // serialize, transfer, parse, and render — the cost query timing hides.
 //
-//	REAL_DB=/Users/wesm/.agentsview/sessions.db \
+//	REAL_DB=/path/to/protected/sessions.db \
 //	  CGO_ENABLED=1 go test -tags fts5 -run TestRealDBUsagePayload \
 //	  -v -timeout 600s ./internal/db/
 func TestRealDBUsagePayload(t *testing.T) {
@@ -29,19 +29,22 @@ func TestRealDBUsagePayload(t *testing.T) {
 	}
 	reader, err := sql.Open(sqliteUsageDriverName, makeDSN(path, true))
 	if err != nil {
-		t.Fatalf("open reader: %v", err)
+		require.NoError(t, err, "open reader")
 	}
 	reader.SetMaxOpenConns(4)
 	defer reader.Close()
 	d := &DB{path: path}
 	d.reader.Store(reader)
-	ctx := context.Background()
+	d.usageCache = newUsageCacheManager(filepath.Join(t.TempDir(), "sessions.db"))
+	d.usageCache.attachArchive(d)
+	defer d.usageCache.Close()
+	ctx := t.Context()
 	tz := "America/New_York"
 
 	f := UsageFilter{From: "2000-01-01", To: "2035-01-01", Timezone: tz, Breakdowns: true}
 	r, err := d.GetDailyUsage(ctx, f)
 	if err != nil {
-		t.Fatalf("GetDailyUsage: %v", err)
+		require.NoError(t, err, "GetDailyUsage")
 	}
 	var proj, agent, model int
 	for _, day := range r.Daily {
@@ -58,7 +61,7 @@ func TestRealDBUsagePayload(t *testing.T) {
 
 	ix, err := d.GetSidebarSessionIndex(ctx, SessionFilter{})
 	if err != nil {
-		t.Fatalf("sidebar: %v", err)
+		require.NoError(t, err, "sidebar")
 	}
 	start = time.Now()
 	sb, _ := json.Marshal(ix)
@@ -66,7 +69,7 @@ func TestRealDBUsagePayload(t *testing.T) {
 		len(ix.Sessions), float64(len(sb))/1e6, round(time.Since(start)))
 	if out := os.Getenv("DUMP_SIDEBAR"); out != "" {
 		if err := dumpSidebarJSON(out, path, sb); err != nil {
-			t.Fatalf("dump sidebar: %v", err)
+			require.NoError(t, err, "dump sidebar")
 		}
 		t.Logf("wrote sidebar JSON to %s", out)
 	}
@@ -75,7 +78,7 @@ func TestRealDBUsagePayload(t *testing.T) {
 // TestRealDBUsagePerf times every query the usage dashboard triggers,
 // against a real prod DB. Gated behind REAL_DB so it never runs in CI.
 //
-//	REAL_DB=/Users/wesm/.agentsview/sessions.db \
+//	REAL_DB=/path/to/protected/sessions.db \
 //	  CGO_ENABLED=1 go test -tags fts5 -run TestRealDBUsagePerf \
 //	  -v -timeout 1200s ./internal/db/
 func TestRealDBUsagePerf(t *testing.T) {
@@ -88,19 +91,21 @@ func TestRealDBUsagePerf(t *testing.T) {
 	// No Open(), so no migrations / drops touch the archive.
 	reader, err := sql.Open(sqliteUsageDriverName, makeDSN(path, true))
 	if err != nil {
-		t.Fatalf("open reader: %v", err)
+		require.NoError(t, err, "open reader")
 	}
 	reader.SetMaxOpenConns(4) // matches production reader pool
 	defer reader.Close()
 
 	d := &DB{path: path}
 	d.reader.Store(reader)
-	ctx := context.Background()
+	d.usageCache = newUsageCacheManager(filepath.Join(t.TempDir(), "sessions.db"))
+	d.usageCache.attachArchive(d)
+	defer d.usageCache.Close()
+	ctx := t.Context()
 	tz := "America/New_York"
 
 	walActive := fileExists(path + "-wal")
-	t.Logf("DB=%s  reader_pool=4  wal_active=%v (writes in flight inflate reads)",
-		path, walActive)
+	t.Logf("DB=protected-clone  reader_pool=4  wal_active=%v", walActive)
 
 	allHist := UsageFilter{From: "2000-01-01", To: "2035-01-01", Timezone: tz}
 	win30 := UsageFilter{
@@ -177,7 +182,7 @@ func TestRealDBUsagePerf(t *testing.T) {
 			res, err := p.fn()
 			d := time.Since(start)
 			if err != nil {
-				t.Fatalf("%s: %v", p.name, err)
+				require.NoErrorf(t, err, "%s", p.name)
 			}
 			if run == 0 {
 				cold, info = d, res
@@ -218,6 +223,113 @@ func TestRealDBUsagePerf(t *testing.T) {
 		},
 		func() error { _, e := d.GetTopSessionsByCost(ctx, allHist, 20); return e },
 	})
+}
+
+// TestRealDBUsageRollupOracle compares the rollup path with the legacy wide-row
+// implementation on a protected archive clone. It never opens the archive for
+// writing, and its cache generation always lives in the test's temporary
+// directory.
+//
+//	REAL_DB=/path/to/protected/sessions.db \
+//	  CGO_ENABLED=1 go test -tags fts5 -run TestRealDBUsageRollupOracle \
+//	  -v -timeout 1200s ./internal/db/
+func TestRealDBUsageRollupOracle(t *testing.T) {
+	path := os.Getenv("REAL_DB")
+	if path == "" {
+		t.Skip("set REAL_DB to a protected sessions.db clone")
+	}
+	reader, err := sql.Open(sqliteUsageDriverName, makeDSN(path, true))
+	require.NoError(t, err, "open protected reader")
+	reader.SetMaxOpenConns(4)
+	t.Cleanup(func() { require.NoError(t, reader.Close()) })
+
+	database := &DB{path: path}
+	database.reader.Store(reader)
+	database.usageCache = newUsageCacheManager(
+		filepath.Join(t.TempDir(), "sessions.db"))
+	database.usageCache.attachArchive(database)
+	t.Cleanup(func() { require.NoError(t, database.usageCache.Close()) })
+
+	now := time.Now()
+	filters := []struct {
+		name   string
+		filter UsageFilter
+	}{
+		{
+			"7d", UsageFilter{
+				From: now.AddDate(0, 0, -6).Format("2006-01-02"),
+				To:   now.Format("2006-01-02"), Timezone: "America/New_York",
+				Breakdowns: true,
+			},
+		},
+		{
+			"30d", UsageFilter{
+				From: now.AddDate(0, 0, -29).Format("2006-01-02"),
+				To:   now.Format("2006-01-02"), Timezone: "America/New_York",
+				Breakdowns: true,
+			},
+		},
+		{"all", UsageFilter{Timezone: "America/New_York", Breakdowns: true}},
+	}
+	ctx := t.Context()
+	for _, test := range filters {
+		t.Run(test.name, func(t *testing.T) {
+			discoveryStart := time.Now()
+			snapshot, captureErr := database.captureUsageQuery(
+				ctx, test.filter, usageQueryKindToken)
+			require.NoError(t, captureErr, "candidate discovery")
+			discoveryElapsed := time.Since(discoveryStart)
+
+			legacyStart := time.Now()
+			legacy, legacyErr := database.getDailyUsageLegacy(ctx, test.filter)
+			require.NoError(t, legacyErr, "legacy usage")
+			legacyElapsed := time.Since(legacyStart)
+
+			cache, cacheErr := database.usageCache.Generation(
+				ctx, snapshot.DatabaseID)
+			require.NoError(t, cacheErr, "open usage cache")
+			clearUsageFactsBenchmarkCache(t, cache)
+			var before, after runtime.MemStats
+			runtime.ReadMemStats(&before)
+			coldStart := time.Now()
+			rollup, rollupErr := database.GetDailyUsage(ctx, test.filter)
+			require.NoError(t, rollupErr, "rollup usage")
+			coldElapsed := time.Since(coldStart)
+			runtime.ReadMemStats(&after)
+
+			legacyJSON, marshalErr := json.Marshal(legacy)
+			require.NoError(t, marshalErr, "marshal legacy result")
+			rollupJSON, marshalErr := json.Marshal(rollup)
+			require.NoError(t, marshalErr, "marshal rollup result")
+			require.Equal(t, legacyJSON, rollupJSON,
+				"rollup and legacy results must be byte-equivalent")
+
+			warmStart := time.Now()
+			warm, warmErr := database.GetDailyUsage(ctx, test.filter)
+			require.NoError(t, warmErr, "warm rollup usage")
+			warmElapsed := time.Since(warmStart)
+			warmJSON, marshalErr := json.Marshal(warm)
+			require.NoError(t, marshalErr, "marshal warm facts result")
+			require.Equal(t, rollupJSON, warmJSON,
+				"cold and warm rollup results must be byte-equivalent")
+
+			t.Logf(
+				"%s: candidates=%d discovery=%s legacy=%s cold=%s warm=%s cache=%.1fMB alloc=%.1fMB heap-inuse-delta=%.1fMB",
+				test.name, len(snapshot.Sessions), round(discoveryElapsed),
+				round(legacyElapsed), round(coldElapsed), round(warmElapsed),
+				float64(usageCacheDiskBytes(cache.path))/(1<<20),
+				float64(after.TotalAlloc-before.TotalAlloc)/(1<<20),
+				float64(signedUint64Delta(after.HeapInuse, before.HeapInuse))/(1<<20),
+			)
+		})
+	}
+}
+
+func signedUint64Delta(after, before uint64) int64 {
+	if after >= before {
+		return int64(after - before)
+	}
+	return -int64(before - after)
 }
 
 func TestDumpSidebarJSONRejectsDBAndSidecars(t *testing.T) {
@@ -311,6 +423,7 @@ func cleanAbsPath(path string) (string, error) {
 }
 
 func timeConcurrent(t *testing.T, label string, fns []func() error) {
+	t.Helper()
 	start := time.Now()
 	var wg sync.WaitGroup
 	errs := make([]error, len(fns))
@@ -324,7 +437,7 @@ func timeConcurrent(t *testing.T, label string, fns []func() error) {
 	wg.Wait()
 	for _, e := range errs {
 		if e != nil {
-			t.Fatalf("%s: %v", label, e)
+			require.NoErrorf(t, e, "%s", label)
 		}
 	}
 	t.Logf("%-52s  wall=%s", label, round(time.Since(start)))

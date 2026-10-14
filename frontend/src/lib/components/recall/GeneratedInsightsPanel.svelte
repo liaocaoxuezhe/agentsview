@@ -8,13 +8,13 @@
     Typeahead,
   } from "@kenn-io/kit-ui";
   import { downloadInsightExport } from "../../api/client.js";
+  import { AGENT_NAMES, parseToolEffectivenessReport } from "../../api/types/insights.js";
   import type {
     AgentName,
     AutomatedScope,
     CannedInsightKind,
-    InsightType,
   } from "../../api/types.js";
-  import { m } from "../../i18n/index.js";
+  import { getLocale, m } from "../../i18n/index.js";
   import { router, getBasePath } from "../../stores/router.svelte.js";
   import { insights } from "../../stores/insights.svelte.js";
   import { sessions } from "../../stores/sessions.svelte.js";
@@ -22,9 +22,10 @@
   import { ui } from "../../stores/ui.svelte.js";
   import { agentLabel } from "../../utils/agents.js";
   import { copyToClipboard } from "../../utils/clipboard.js";
-  import { renderMarkdown } from "../../utils/markdown.js";
+  import { loadAssetImages, renderMarkdown } from "../../utils/markdown.js";
   import ProjectTypeahead from "../layout/ProjectTypeahead.svelte";
   import RangePicker from "../shared/RangePicker.svelte";
+  import ToolEffectivenessReport from "./ToolEffectivenessReport.svelte";
   import {
     resolveRange,
     selectionFromRange,
@@ -34,6 +35,9 @@
   let copiedInsightLinkId: number | null = $state(null);
   let copiedInsightLinkTimer: ReturnType<typeof setTimeout> | undefined;
 
+  const selectedToolReport = $derived(
+    insights.selectedItem ? parseToolEffectivenessReport(insights.selectedItem) : null,
+  );
   const earliestSession = $derived(sync.stats?.earliest_session ?? null);
   const rangeSelection = $derived(
     selectionFromRange(
@@ -43,21 +47,14 @@
     ),
   );
   const insightGenerationAvailable = $derived(
-    sync.serverVersion?.insight_generation_available === true ||
-      sync.serverVersion?.read_only !== true,
+    sync.serverVersion?.insight_generation_available ??
+      (sync.serverVersion?.read_only !== true),
   );
   const generationUnavailable = $derived(
     sync.serverVersion === null || !insightGenerationAvailable,
   );
 
-  const generationAgentNames = [
-    "claude",
-    "codex",
-    "copilot",
-    "gemini",
-    "kiro",
-  ] satisfies AgentName[];
-  const generationAgentOptions = generationAgentNames.map((name) => ({
+  const generationAgentOptions = AGENT_NAMES.map((name) => ({
     name,
     label: agentLabel(name),
     displayLabel: agentLabel(name),
@@ -221,7 +218,7 @@
   }
 
   function cannedKindLabel(
-    kind: CannedInsightKind | "" | undefined,
+    kind: string | undefined,
   ): string {
     switch (kind) {
       case "prompt_maturity_review":
@@ -242,11 +239,12 @@
   }
 
   function insightTypeLabel(
-    type: InsightType,
-    kind: CannedInsightKind | "" | undefined,
+    type: string,
+    kind: string | undefined,
   ): string {
     if (type === "llm_canned") return cannedKindLabel(kind);
     if (type === "agent_analysis") return m.insights_page_agent_analysis();
+    if (type === "tool_effectiveness") return m.insights_page_tool_effectiveness();
     return m.insights_page_activity();
   }
 
@@ -450,6 +448,14 @@
                     insights.selectedItem.kind,
                   )}
                 </span>
+                {#if selectedToolReport}
+                  <span class="generated-meta-chip">
+                    {m.tool_effectiveness_calls_judged({
+                      count: selectedToolReport.call_count,
+                      countLabel: selectedToolReport.call_count.toLocaleString(getLocale()),
+                    })}
+                  </span>
+                {/if}
                 {#if insights.selectedItem.type === "llm_canned"}
                   {#if cacheStatusLabel(insights.selectedItem.cache_status)}
                     <span class="generated-meta-chip">
@@ -503,9 +509,15 @@
                 >×</IconButton>
               </div>
             </div>
-            <div class="markdown-body">
-              {@html renderMarkdown(insights.selectedItem.content)}
-            </div>
+            {#if insights.selectedItem.type === "tool_effectiveness"}
+              <ToolEffectivenessReport insight={insights.selectedItem} />
+            {:else}
+              <div class="markdown-body" use:loadAssetImages={insights.selectedItem.content}>
+                {@html renderMarkdown(insights.selectedItem.content, {
+                  renderUnknownXmlBlocksAsPreformatted: ui.renderUnknownXmlBlocksAsPreformatted,
+                })}
+              </div>
+            {/if}
           {:else}
             <p>{m.insights_page_select_to_read()}</p>
           {/if}

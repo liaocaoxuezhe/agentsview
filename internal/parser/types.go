@@ -1,7 +1,11 @@
 package parser
 
 import (
-	"encoding/json"
+	"context"
+	"crypto/sha256"
+	"encoding/hex"
+	"encoding/json/jsontext"
+	"encoding/json/v2"
 	"strings"
 	"time"
 
@@ -17,16 +21,20 @@ const (
 	AgentCowork         AgentType = "cowork"
 	AgentCodex          AgentType = "codex"
 	AgentTraeX          AgentType = "traex"
+	AgentAugureCode     AgentType = "augure-code"
 	AgentCopilot        AgentType = "copilot"
 	AgentGemini         AgentType = "gemini"
 	AgentGeminiApps     AgentType = "gemini-apps"
 	AgentMiMoCode       AgentType = "mimocode"
 	AgentOpenCode       AgentType = "opencode"
+	AgentOpenCodeReview AgentType = "opencodereview"
 	AgentKilo           AgentType = "kilo"
 	AgentKiloLegacy     AgentType = "kilo-legacy"
 	AgentOpenHands      AgentType = "openhands"
 	AgentCursor         AgentType = "cursor"
+	AgentCursorIDE      AgentType = "cursor-ide"
 	AgentIflow          AgentType = "iflow"
+	AgentJunie          AgentType = "junie"
 	AgentAmp            AgentType = "amp"
 	AgentZencoder       AgentType = "zencoder"
 	AgentVSCodeCopilot  AgentType = "vscode-copilot"
@@ -34,8 +42,11 @@ const (
 	AgentTrae           AgentType = "trae"
 	AgentVSCopilot      AgentType = "visualstudio-copilot"
 	AgentPi             AgentType = "pi"
+	AgentTau            AgentType = "tau"
 	AgentPrimeAgent     AgentType = "prime-agent"
 	AgentOMP            AgentType = "omp"
+	AgentOMO            AgentType = "omo"
+	AgentStepCode       AgentType = "stepcode"
 	AgentQwen           AgentType = "qwen"
 	AgentCommandCode    AgentType = "commandcode"
 	AgentDeepSeekTUI    AgentType = "deepseek-tui"
@@ -49,9 +60,11 @@ const (
 	AgentKiroIDE        AgentType = "kiro-ide"
 	AgentCortex         AgentType = "cortex"
 	AgentHermes         AgentType = "hermes"
+	AgentAugureDesktop  AgentType = "augure-desktop"
 	AgentGrok           AgentType = "grok"
 	AgentGoose          AgentType = "goose"
 	AgentWorkBuddy      AgentType = "workbuddy"
+	AgentCodeBuddy      AgentType = "codebuddy"
 	AgentForge          AgentType = "forge"
 	AgentDevin          AgentType = "devin"
 	AgentPiebald        AgentType = "piebald"
@@ -69,12 +82,15 @@ const (
 	AgentShelley        AgentType = "shelley"
 	AgentAider          AgentType = "aider"
 	AgentReasonix       AgentType = "reasonix"
+	AgentEvener         AgentType = "evener"
 	AgentIcodemate      AgentType = "icodemate"
 	AgentRooCode        AgentType = "roocode"
+	AgentCline          AgentType = "cline"
 	AgentPoolside       AgentType = "poolside"
 	AgentOmnigent       AgentType = "omnigent"
 	AgentCodebuff       AgentType = "codebuff"
 	AgentFreebuff       AgentType = "freebuff"
+	AgentCrush          AgentType = "crush"
 )
 
 const AgentDeepSeekHarness AgentType = "deepseek-harness"
@@ -83,16 +99,24 @@ const AgentDeepSeekHarness AgentType = "deepseek-harness"
 // layout, configuration keys, and session ID conventions.
 type AgentDef struct {
 	Type              AgentType
-	DisplayName       string   // "Claude Code", "Codex", etc.
-	EnvVar            string   // env var for dir override
-	DefaultRootEnvVar string   // env var that re-roots DefaultDirs before $HOME fallback
-	ConfigKey         string   // TOML key in config.toml ("" = none)
-	DefaultDirs       []string // paths relative to $HOME
-	IDPrefix          string   // session ID prefix ("" for Claude)
-	WatchSubdirs      []string // subdirs to watch (nil = watch root)
-	ShallowWatch      bool     // true = watch root only, rely on periodic sync for subdirs
-	FileBased         bool     // false for DB-backed agents
-	Usage             UsageCapabilities
+	DisplayName       string // "Claude Code", "Codex", etc.
+	EnvVar            string // env var for dir override
+	NativeEnvVar      string // native session-dir env var, used when EnvVar is empty
+	DefaultRootEnvVar string // env var that re-roots DefaultDirs before $HOME fallback
+	DefaultRootDir    string // home-relative prefix replaced by the root env (empty = first component)
+	ConfigKey         string // optional legacy top-level TOML directory key
+	// HomesSupported enables [agents.<id>].homes. Each home re-roots
+	// DefaultDirs the same way DefaultRootEnvVar does; roots are additive.
+	HomesSupported bool
+	DefaultDirs    []string // paths relative to $HOME
+	IDPrefix       string   // session ID prefix ("" for Claude)
+	WatchSubdirs   []string // subdirs to watch (nil = watch root)
+	ShallowWatch   bool     // true = watch root only, rely on periodic sync for subdirs
+	FileBased      bool     // false for DB-backed agents
+	Usage          UsageCapabilities
+	// PostAnswerToolWork marks transcript formats that may emit their
+	// user-facing answer before later tool calls in the same turn.
+	PostAnswerToolWork bool
 
 	// PeriodicReconcile opts the agent into scheduled scoped reconciliation
 	// when its declared watcher coverage is deliberately non-authoritative,
@@ -136,6 +160,7 @@ var Registry = []AgentDef{
 		EnvVar:            "CLAUDE_PROJECTS_DIR",
 		DefaultRootEnvVar: "CLAUDE_CONFIG_DIR",
 		ConfigKey:         "claude_project_dirs",
+		HomesSupported:    true,
 		DefaultDirs:       []string{".claude/projects"},
 		IDPrefix:          "",
 		FileBased:         true,
@@ -161,10 +186,12 @@ var Registry = []AgentDef{
 		ShallowWatch: true,
 	},
 	{
-		Type:        AgentCodex,
-		DisplayName: "Codex",
-		EnvVar:      "CODEX_SESSIONS_DIR",
-		ConfigKey:   "codex_sessions_dirs",
+		Type:              AgentCodex,
+		DisplayName:       "Codex",
+		EnvVar:            "CODEX_SESSIONS_DIR",
+		DefaultRootEnvVar: "CODEX_HOME",
+		ConfigKey:         "codex_sessions_dirs",
+		HomesSupported:    true,
 		DefaultDirs: []string{
 			".codex/sessions",
 			".codex/archived_sessions",
@@ -172,6 +199,7 @@ var Registry = []AgentDef{
 		IDPrefix:              "codex:",
 		FileBased:             true,
 		ShallowWatchRootsFunc: ResolveCodexShallowWatchRoots,
+		PostAnswerToolWork:    true,
 	},
 	{
 		// TRAE CLI 2.0 is a closed-source fork of codex-rs and writes
@@ -190,12 +218,32 @@ var Registry = []AgentDef{
 			// this flat directory, exactly as `codex archive` does.
 			".trae/cli/archived_sessions",
 		},
-		IDPrefix:  "traex:",
-		FileBased: true,
+		IDPrefix:           "traex:",
+		FileBased:          true,
+		PostAnswerToolWork: true,
 		// No ShallowWatchRootsFunc: that hook exists for Codex's sibling
 		// session_index.jsonl, which TraeX never writes. Watching
 		// ~/.trae/cli shallowly would deliver nothing but churn from the
 		// SQLite WALs TRAE CLI keeps there.
+	},
+	{
+		// Augure Code (augureai.ca) is a closed-source rebrand of codex-rs,
+		// byte-compatible with Codex rollout JSONL, so it reuses the Codex
+		// parser through a relabel hook like TraeX. Sessions live under a
+		// dated YYYY/MM/DD tree at ~/.augure/sessions. Distinct agent because
+		// resuming needs `augure resume` and the rollout UUIDs are a separate
+		// namespace from Codex's.
+		Type:               AgentAugureCode,
+		DisplayName:        "Augure Code",
+		EnvVar:             "AUGURE_CODE_SESSIONS_DIR",
+		ConfigKey:          "augure_code_sessions_dirs",
+		DefaultDirs:        []string{".augure/sessions"},
+		IDPrefix:           "augure-code:",
+		FileBased:          true,
+		PostAnswerToolWork: true,
+		// No ShallowWatchRootsFunc: that hook exists for Codex's sibling
+		// session_index.jsonl, which Augure does not write (verified: none
+		// exists under ~/.augure).
 	},
 	{
 		Type:         AgentCopilot,
@@ -250,6 +298,15 @@ var Registry = []AgentDef{
 		},
 		FileBased:      true,
 		WatchRootsFunc: ResolveOpenCodeWatchRoots,
+	},
+	{
+		Type:        AgentOpenCodeReview,
+		DisplayName: "Open Code Review",
+		EnvVar:      "OPENCODEREVIEW_DIR",
+		ConfigKey:   "opencodereview_dirs",
+		DefaultDirs: []string{".opencodereview/sessions"},
+		IDPrefix:    "opencodereview:",
+		FileBased:   true,
 	},
 	{
 		Type:        AgentKilo,
@@ -313,6 +370,32 @@ var Registry = []AgentDef{
 		FileBased:   true,
 	},
 	{
+		// Cursor IDE (the GUI editor) is a distinct product from Cursor Agent
+		// (the CLI, see AgentCursor above): it stores every chat session in
+		// one shared VS Code-style global-state SQLite database
+		// (state.vscdb), fanned out into one session per composer addressed
+		// by a "<db>#<composerID>" virtual path.
+		Type:        AgentCursorIDE,
+		DisplayName: "Cursor IDE",
+		EnvVar:      "CURSOR_IDE_DIR",
+		ConfigKey:   "cursor_ide_dirs",
+		DefaultDirs: cursorIDEDefaultDirs(),
+		IDPrefix:    "cursor-ide:",
+		FileBased:   true,
+		// state.vscdb is VS Code's shared global-state database: besides
+		// Cursor's own chat data, its ItemTable co-locates Cursor's live
+		// auth tokens (observed keys cursorAuth/accessToken and
+		// cursorAuth/refreshToken) plus whatever other installed extensions
+		// have stored there, and composerData blobs carry per-composer sync
+		// encryption keys. Remote sync stays disabled until there is an
+		// allowlisted export schema, matching Omnigent's chat.db precedent.
+		RemoteSyncExcluded: true,
+		// Watcher events parse only composers whose composerData document
+		// changed, so bubble-only edits rely on the scheduled
+		// fingerprint-gated container reparse.
+		PeriodicReconcile: true,
+	},
+	{
 		Type:        AgentAmp,
 		DisplayName: "Amp",
 		EnvVar:      "AMP_DIR",
@@ -320,6 +403,18 @@ var Registry = []AgentDef{
 		DefaultDirs: []string{".local/share/amp/threads"},
 		IDPrefix:    "amp:",
 		FileBased:   true,
+	},
+	{
+		Type:              AgentJunie,
+		DisplayName:       "Junie",
+		EnvVar:            "JUNIE_DIR",
+		DefaultRootEnvVar: "JUNIE_HOME",
+		DefaultRootDir:    ".junie",
+		ConfigKey:         "junie_dirs",
+		HomesSupported:    true,
+		DefaultDirs:       []string{".junie/sessions"},
+		IDPrefix:          "junie:",
+		FileBased:         true,
 	},
 	{
 		Type:        AgentZencoder,
@@ -444,12 +539,25 @@ var Registry = []AgentDef{
 		},
 	},
 	{
-		Type:        AgentPi,
-		DisplayName: "Pi",
-		EnvVar:      "PI_DIR",
-		ConfigKey:   "pi_dirs",
-		DefaultDirs: []string{".pi/agent/sessions"},
-		IDPrefix:    "pi:",
+		Type:              AgentPi,
+		DisplayName:       "Pi",
+		EnvVar:            "PI_DIR",
+		NativeEnvVar:      "PI_CODING_AGENT_SESSION_DIR",
+		DefaultRootEnvVar: "PI_CODING_AGENT_DIR",
+		DefaultRootDir:    ".pi/agent",
+		ConfigKey:         "pi_dirs",
+		HomesSupported:    true,
+		DefaultDirs:       []string{".pi/agent/sessions"},
+		IDPrefix:          "pi:",
+		FileBased:         true,
+	},
+	{
+		Type:        AgentTau,
+		DisplayName: "Tau",
+		EnvVar:      "TAU_SESSIONS_DIR",
+		ConfigKey:   "tau_dirs",
+		DefaultDirs: []string{".tau/sessions"},
+		IDPrefix:    "tau:",
 		FileBased:   true,
 	},
 	{
@@ -469,6 +577,31 @@ var Registry = []AgentDef{
 		DefaultDirs: []string{".omp/agent/sessions"},
 		IDPrefix:    "omp:",
 		FileBased:   true,
+	},
+	{
+		Type:        AgentOMO,
+		DisplayName: "OMO",
+		EnvVar:      "OMO_DIR",
+		ConfigKey:   "omo_dirs",
+		DefaultDirs: []string{".omo/agent/sessions"},
+		IDPrefix:    "omo:",
+		FileBased:   true,
+	},
+	{
+		// StepCode packages the Pi harness as a product, so its transcripts
+		// use Pi's JSONL format and layout verbatim and go through the Pi
+		// provider. It keeps its own agent root, so a Pi default root would
+		// otherwise never see StepCode sessions.
+		Type:              AgentStepCode,
+		DisplayName:       "StepCode",
+		EnvVar:            "STEPCODE_DIR",
+		NativeEnvVar:      "STEP_CODING_AGENT_SESSION_DIR",
+		DefaultRootEnvVar: "STEP_CODING_AGENT_DIR",
+		DefaultRootDir:    ".stepcode/agent",
+		ConfigKey:         "stepcode_dirs",
+		DefaultDirs:       []string{".stepcode/agent/sessions"},
+		IDPrefix:          "stepcode:",
+		FileBased:         true,
 	},
 	{
 		Type:        AgentQwen,
@@ -593,7 +726,7 @@ var Registry = []AgentDef{
 		EnvVar:      "KIRO_SESSIONS_DIR",
 		ConfigKey:   "kiro_dirs",
 		DefaultDirs: []string{
-			".kiro/sessions/cli",
+			".kiro/sessions",
 			".local/share/kiro-cli",
 		},
 		IDPrefix:  "kiro:",
@@ -624,11 +757,40 @@ var Registry = []AgentDef{
 		DisplayName:           "Hermes Agent",
 		EnvVar:                "HERMES_SESSIONS_DIR",
 		ConfigKey:             "hermes_sessions_dirs",
-		DefaultDirs:           []string{".hermes/sessions"},
+		DefaultDirs:           []string{".hermes/sessions", "AppData/Local/hermes/sessions"},
 		IDPrefix:              "hermes:",
 		FileBased:             true,
 		WatchRootsFunc:        ResolveHermesWatchRoots,
 		ShallowWatchRootsFunc: ResolveHermesShallowWatchRoots,
+	},
+	{
+		// Augure Desktop v3 embeds a fork of Hermes Agent renamed to
+		// ~/.augure-desktop. The state.db schema matches Hermes's, so the
+		// Hermes state-DB parser is reused through a spec/relabel seam.
+		// Distinct agent because session IDs are a separate namespace from
+		// ~/.hermes and the products version their state.db independently.
+		// The fork marker is the store's own root name (.augure-desktop),
+		// not the schema: default discovery is marker-named so a stock
+		// Hermes store is never claimed, while explicitly configured roots
+		// are trusted as given (TraeX precedent).
+		Type:        AgentAugureDesktop,
+		DisplayName: "Augure Desktop",
+		EnvVar:      "AUGURE_DESKTOP_DIR",
+		ConfigKey:   "augure_desktop_dirs",
+		DefaultDirs: []string{
+			// macOS and Linux (POSIX per hermes_constants.py)
+			".augure-desktop",
+			// Windows
+			"AppData/Local/augure-desktop",
+		},
+		IDPrefix:  "augure-desktop:",
+		FileBased: true,
+		// The fork's roots hold the raw state.db (plus WAL/journal files)
+		// alongside non-transcript application state; copying or sanitizing
+		// the store can retain deleted pages and unrelated state. Remote
+		// sync stays disabled until there is a fresh, allowlisted export
+		// schema, matching the Omnigent chat.db precedent.
+		RemoteSyncExcluded: true,
 	},
 	{
 		Type:        AgentGrok,
@@ -659,6 +821,15 @@ var Registry = []AgentDef{
 		ConfigKey:   "workbuddy_project_dirs",
 		DefaultDirs: []string{".workbuddy/projects"},
 		IDPrefix:    "workbuddy:",
+		FileBased:   true,
+	},
+	{
+		Type:        AgentCodeBuddy,
+		DisplayName: "CodeBuddy",
+		EnvVar:      "CODEBUDDY_DIR",
+		ConfigKey:   "codebuddy_dirs",
+		DefaultDirs: codebuddyDefaultDirs(),
+		IDPrefix:    "codebuddy:",
 		FileBased:   true,
 	},
 	{
@@ -763,7 +934,11 @@ var Registry = []AgentDef{
 		DisplayName: "Antigravity",
 		EnvVar:      "ANTIGRAVITY_DIR",
 		ConfigKey:   "antigravity_dirs",
-		DefaultDirs: []string{".gemini/antigravity"},
+		// The IDE variant writes to .gemini/antigravity-ide, its own standard
+		// directory, in the same layout. .gemini/antigravity-backup is
+		// deliberately not a default: it is a copy, so every conversation it
+		// holds would be stored twice.
+		DefaultDirs: []string{".gemini/antigravity", ".gemini/antigravity-ide"},
 		IDPrefix:    "antigravity:",
 		WatchSubdirs: []string{
 			"conversations",
@@ -859,6 +1034,16 @@ var Registry = []AgentDef{
 		PeriodicReconcile: true,
 	},
 	{
+		Type:              AgentEvener,
+		DisplayName:       "Evener",
+		EnvVar:            "EVENER_DIR",
+		ConfigKey:         "evener_dirs",
+		DefaultDirs:       []string{".local/state/evener"},
+		IDPrefix:          "evener:",
+		FileBased:         true,
+		PeriodicReconcile: true,
+	},
+	{
 		Type:         AgentReasonix,
 		DisplayName:  "Reasonix",
 		EnvVar:       "REASONIX_DIR",
@@ -873,7 +1058,7 @@ var Registry = []AgentDef{
 		DisplayName:    "IcodeMate",
 		EnvVar:         "ICODEMATE_DIR",
 		ConfigKey:      "icodemate_dirs",
-		DefaultDirs:    []string{".local/share/icodemate"},
+		DefaultDirs:    []string{".local/share/icodemate", ".icodemate/cli/projects"},
 		IDPrefix:       "icodemate:",
 		WatchSubdirs:   []string{"storage/session_diff"},
 		FileBased:      true,
@@ -902,6 +1087,17 @@ var Registry = []AgentDef{
 		},
 		IDPrefix:  "roocode:",
 		FileBased: true,
+	},
+	{
+		// Cline CLI stores sessions under ~/.cline/data/sessions/<id>/
+		// with <id>.json (metadata) and <id>.messages.json (transcript).
+		Type:        AgentCline,
+		DisplayName: "Cline",
+		EnvVar:      "CLINE_DIR",
+		ConfigKey:   "cline_dirs",
+		DefaultDirs: []string{".cline"},
+		IDPrefix:    "cline:",
+		FileBased:   true,
 	},
 	{
 		Type:        AgentPoolside,
@@ -954,12 +1150,34 @@ var Registry = []AgentDef{
 		EnvVar:            "CODEBUFF_DIR",
 		ConfigKey:         "codebuff_dirs",
 		DefaultDirs:       []string{".config/manicode/projects"},
+		DefaultRootEnvVar: "FREEBUFF_CONFIG_DIR",
+		DefaultRootDir:    ".config/manicode",
 		IDPrefix:          "codebuff:",
 		FileBased:         true,
 		PeriodicReconcile: true,
 		Usage: UsageCapabilities{
 			NoPerMessageTokenData: true,
 		},
+	},
+	{
+		// Charm Crush keeps one SQLite store per project at
+		// <project>/.crush/crush.db and records the project list in
+		// ~/.local/share/crush/projects.json; the provider expands that
+		// registry into roots at configuration time.
+		Type:        AgentCrush,
+		DisplayName: "Charm Crush",
+		EnvVar:      "CRUSH_DIR",
+		ConfigKey:   "crush_dirs",
+		DefaultDirs: crushDefaultDirs(),
+		IDPrefix:    "crush:",
+		FileBased:   false,
+		Usage: UsageCapabilities{
+			NoPerMessageTokenData: true,
+		},
+		// Session rows live in a WAL-mode SQLite store whose change
+		// events are not authoritative; periodic reconcile covers
+		// registry and schema churn.
+		PeriodicReconcile: true,
 	},
 }
 
@@ -978,6 +1196,13 @@ func AgentByType(t AgentType) (AgentDef, bool) {
 func RemoteSyncExcludedAgent(agent AgentType) bool {
 	def, ok := AgentByType(agent)
 	return ok && def.RemoteSyncExcluded
+}
+
+// AgentHasPostAnswerToolWork reports whether the agent may continue calling
+// tools after emitting its user-facing answer. Unknown agents return false.
+func AgentHasPostAnswerToolWork(agent AgentType) bool {
+	def, ok := AgentByType(agent)
+	return ok && def.PostAnswerToolWork
 }
 
 // AgentNameLacksPerMessageTokenData reports whether the named agent
@@ -1034,8 +1259,9 @@ func AgentIsCopilot(t AgentType) bool {
 	switch t {
 	case AgentCopilot, AgentVSCodeCopilot, AgentVSCopilot:
 		return true
+	default:
+		return false
 	}
-	return false
 }
 
 // AgentNameIsCopilot reports whether the agent name identifies a
@@ -1063,6 +1289,17 @@ func StripHostPrefix(id string) (host, rawID string) {
 		return before, after
 	}
 	return "", id
+}
+
+// ProviderStoredAgents returns the session agent labels a provider may store.
+// Codebuff relabels free-tier sessions as Freebuff while discovery, caches, and
+// the provider_freshness table stay keyed on Codebuff, so both labels belong to
+// the Codebuff provider. Every other provider stores its own label.
+func ProviderStoredAgents(agent AgentType) []AgentType {
+	if agent == AgentCodebuff {
+		return []AgentType{AgentCodebuff, AgentFreebuff}
+	}
+	return []AgentType{agent}
 }
 
 // AgentByPrefix returns the AgentDef whose IDPrefix matches
@@ -1108,6 +1345,31 @@ const (
 	RelFork         RelationshipType = "fork"
 )
 
+// altSessionMarker joins a session id to the source-path hash of a second
+// file that resolved to the same id. "~" is reserved for host prefixes.
+const altSessionMarker = "_alt-"
+
+// AltSessionID returns the id under which the source file at path is stored
+// when another file already owns id.
+func AltSessionID(id, path string) string {
+	sum := sha256.Sum256([]byte(path))
+	return id + altSessionMarker + hex.EncodeToString(sum[:8])
+}
+
+// BaseSessionID strips an AltSessionID suffix, returning the id the agent
+// itself recorded. Only agents whose provider declares SharedSessionIDs have
+// derived ids; their native ids never end in the suffix.
+func BaseSessionID(id string) string {
+	i := strings.LastIndex(id, altSessionMarker)
+	if i < 0 || len(id)-i != len(altSessionMarker)+16 {
+		return id
+	}
+	if _, err := hex.DecodeString(id[i+len(altSessionMarker):]); err != nil {
+		return id
+	}
+	return id[:i]
+}
+
 // RoleType identifies the role of a message sender.
 type RoleType string
 
@@ -1123,12 +1385,26 @@ const (
 	RoleTool   RoleType = "tool"
 )
 
+// SourceSubtypeToolResult marks a user- or system-role row whose text is tool
+// output rather than something a person or model wrote. Providers that have
+// no separate tool role set it on fallback rows so storage policies that drop
+// tool output can recognize them.
+const SourceSubtypeToolResult = "tool_result"
+
 // Transcript fidelity values for ParsedSession.TranscriptFidelity. Empty
 // is treated as full (no degradation signalled).
 const (
 	TranscriptFidelityFull    = "full"
 	TranscriptFidelitySummary = "summary"
 )
+
+// SessionKindNonInteractive marks a provider session whose durable metadata
+// identifies a non-interactive invocation.
+const SessionKindNonInteractive = "non-interactive"
+
+// SessionKindRoborev marks a Codex session whose session_meta thread_source
+// is the roborev feature tag (`codex exec --thread-source roborev`).
+const SessionKindRoborev = "roborev"
 
 // FileInfo holds file system metadata for a session source file.
 type FileInfo struct {
@@ -1138,6 +1414,10 @@ type FileInfo struct {
 	Inode  int64
 	Device int64
 	Hash   string
+	// ChangeTime is the change time captured from the same descriptor the
+	// parser read its snapshot from. Zero means the platform could not
+	// provide one; checkpoint consumers then rebuild conservatively.
+	ChangeTime int64
 }
 
 // ParsedSession holds session metadata extracted from a JSONL file.
@@ -1148,16 +1428,18 @@ type ParsedSession struct {
 	Agent      AgentType
 	AgentLabel string
 	Entrypoint string
-	// SessionKind is the top-level Claude Code session-kind marker
-	// (e.g. "bg" for background/headless sessions); empty for
-	// interactive sessions and for agents that do not emit it.
-	SessionKind      string
-	ParentSessionID  string
-	RelationshipType RelationshipType
-	Cwd              string
-	GitBranch        string
-	SourceSessionID  string
-	SourceVersion    string
+	// SessionKind is a provider-owned top-level session classification marker
+	// (for example, Claude Code "bg" or Grok "non-interactive"); empty for
+	// interactive sessions and for agents that do not emit one.
+	SessionKind        string
+	ParentSessionID    string
+	RelationshipType   RelationshipType
+	Cwd                string
+	GitBranch          string
+	SourceSessionID    string
+	SourceVersion      string
+	GroupKey           string `json:"group_key,omitempty"`
+	KeepStoredGroupKey bool   `json:"keep_stored_group_key,omitempty"`
 	// TranscriptFidelity classifies how complete a stored transcript is
 	// relative to the agent's full session data: "full" when the
 	// high-resolution source was used, "summary" for a degraded/fallback
@@ -1179,11 +1461,14 @@ type ParsedSession struct {
 	// current releases may omit session_index.jsonl entirely, while an older
 	// index entry with a blank thread_name explicitly clears a stored title.
 	SessionNamePresent bool
-	StartedAt          time.Time
-	EndedAt            time.Time
-	MessageCount       int
-	UserMessageCount   int
-	File               FileInfo
+	// PRLinks lists the pull or merge requests the source associated with
+	// this session, deduplicated by URL in first-appearance order.
+	PRLinks          []PRLink
+	StartedAt        time.Time
+	EndedAt          time.Time
+	MessageCount     int
+	UserMessageCount int
+	File             FileInfo
 
 	// TerminationStatus describes how the session appears to have
 	// ended. Empty string = unknown (parser did not classify, or
@@ -1197,6 +1482,12 @@ type ParsedSession struct {
 	// linear-bound sessions. Only set by the Claude parser; nil for
 	// all other agents.
 	ClaudeLinearParse *bool
+	// ClaudeSubagentSources records the files that contributed to this full
+	// parse. Sync keeps this local provenance with the archived messages.
+	ClaudeSubagentSources []string
+	// claudeRenameSeen preserves explicit title precedence when combining
+	// transcripts, including a /rename command that cleared the title.
+	claudeRenameSeen bool
 
 	TotalOutputTokens    int
 	PeakContextTokens    int
@@ -1216,6 +1507,12 @@ type ParsedSession struct {
 	// aggregateTokenPresenceKnown marks session aggregate token
 	// coverage as parser-owned and authoritative.
 	aggregateTokenPresenceKnown bool
+
+	// projectSynthesizedByHermes marks Session.Project as synthesized by
+	// the Hermes state-DB metadata ("hermes" / "hermes-<source>") rather
+	// than a caller-supplied project hint, so fork relabels can rebrand
+	// the producer name without touching explicit hints.
+	projectSynthesizedByHermes bool
 }
 
 // ParsedToolCall holds a single tool invocation extracted from
@@ -1229,12 +1526,50 @@ type ParsedToolCall struct {
 	SkillName         string // skill name when ToolName is "Skill"
 	SubagentSessionID string // linked subagent session file (e.g. "agent-{task_id}")
 	ResultEvents      []ParsedToolResultEvent
+	// Rendering is the exact text, if any, the parser inlined into the
+	// message content for this call. Storage policies that drop tool inputs
+	// replace it verbatim, so it must match the content byte for byte.
+	Rendering string
+}
+
+// ParsedToolCallPosition identifies one emitted tool-call occurrence by its
+// stable normalized message ordinal and call index.
+type ParsedToolCallPosition struct {
+	MessageOrdinal int
+	CallIndex      int
+}
+
+// ParsedToolCallUpdate carries result events for a tool call that was parsed
+// before the current append-only chunk. TargetKnown is required for safe
+// incremental application when a provider reuses call IDs.
+type ParsedToolCallUpdate struct {
+	ToolUseID      string
+	MessageOrdinal int
+	CallIndex      int
+	TargetKnown    bool
+	ResultEvents   []ParsedToolResultEvent
+}
+
+// ParsedMessageTokenUsageUpdate carries token metadata for an assistant
+// message that was committed before the current append-only chunk. Codex
+// emits a token_count record immediately after a late tool result, so the
+// target assistant message may not be present in the incremental message
+// slice even though its ordinal is known from the stored transcript.
+type ParsedMessageTokenUsageUpdate struct {
+	Ordinal          int
+	TokenUsage       jsontext.Value
+	ContextTokens    int
+	OutputTokens     int
+	HasContextTokens bool
+	HasOutputTokens  bool
 }
 
 // ParsedToolResult holds metadata about a tool result block in a
 // user message (the response to a prior tool_use).
 type ParsedToolResult struct {
 	ToolUseID     string
+	Source        string
+	Status        string
 	ContentLength int
 	ContentRaw    string // raw JSON of the content field; decode with DecodeContent
 }
@@ -1242,6 +1577,9 @@ type ParsedToolResult struct {
 // ParsedToolResultEvent is a canonical chronological update attached
 // to a tool call. Used for Codex subagent terminal status updates.
 type ParsedToolResultEvent struct {
+	// RawContentDigest is optional import metadata captured before sanitization.
+	// Sync workers compute it before queuing large bodies for archive writes.
+	RawContentDigest  []byte `json:"-"`
 	ToolUseID         string
 	AgentID           string
 	SubagentSessionID string
@@ -1265,8 +1603,12 @@ type ParsedMessage struct {
 	ToolCalls     []ParsedToolCall
 	ToolResults   []ParsedToolResult
 
-	Model            string
-	TokenUsage       json.RawMessage
+	Model           string
+	ReasoningEffort string
+	// ProviderID identifies the billing provider for this response, such as
+	// Posit Assistant's "positai" managed service or BYO "anthropic".
+	ProviderID       string
+	TokenUsage       jsontext.Value
 	ContextTokens    int
 	OutputTokens     int
 	HasContextTokens bool
@@ -1286,7 +1628,9 @@ type ParsedMessage struct {
 	// on user turns (e.g. "typed", "queued", "system", "sdk"); empty
 	// on older transcripts that predate the field and for agents that
 	// do not emit it.
-	PromptSource      string
+	PromptSource string
+	// claudeSDKOrigin records this line's SDK origin; merged queued prompts default to false.
+	claudeSDKOrigin   bool
 	SourceUUID        string
 	SourceParentUUID  string
 	IsSidechain       bool
@@ -1312,6 +1656,7 @@ type ParsedUsageEvent struct {
 	MessageOrdinal           *int
 	Source                   string
 	Model                    string
+	ProviderID               string
 	InputTokens              int
 	OutputTokens             int
 	CacheCreationInputTokens int
@@ -1331,8 +1676,21 @@ func accumulateMessageTokenUsage(
 	sess *ParsedSession,
 	messages []ParsedMessage,
 ) {
+	_ = accumulateMessageTokenUsageContext(
+		context.Background(), sess, messages,
+	)
+}
+
+func accumulateMessageTokenUsageContext(
+	ctx context.Context,
+	sess *ParsedSession,
+	messages []ParsedMessage,
+) error {
 	sess.aggregateTokenPresenceKnown = true
-	for _, m := range messages {
+	for i, m := range messages {
+		if err := contextErrEvery(ctx, i); err != nil {
+			return err
+		}
 		if m.HasOutputTokens {
 			sess.HasTotalOutputTokens = true
 			sess.TotalOutputTokens += m.OutputTokens
@@ -1344,29 +1702,27 @@ func accumulateMessageTokenUsage(
 			}
 		}
 	}
+	return ctx.Err()
 }
 
 // applyUsageEventTokenTotals recomputes session token totals from the
 // usage-event set whenever events exist. Callers must only use it when
 // events are a superset of per-message token metadata — true for the
-// Antigravity gen_metadata parsers, where every token-bearing message
-// derives from a gen row that also emits an event and undecodable
-// steps emit events with no message. Deriving totals from events
-// therefore covers transcripts that dropped steps (sidecar wins,
-// undecodable rows) without double counting. Message-derived totals
-// are kept where the events are silent.
+// Antigravity gen_metadata and Junie model-usage parsers. Deriving totals
+// from events covers token-bearing steps without normalized messages
+// (sidecar wins, undecodable rows) without double counting. Message-derived
+// totals are kept where the events are silent.
 //
 // Peak context counts the full context window per event: fresh input
 // plus cache-creation and cache-read tokens. That keeps event-derived
 // session totals consistent with per-message ContextTokens attribution
-// (input + cacheRead) from parsers whose events carry cache fields,
-// such as the Antigravity CLI sidecar parser.
+// (input + cacheRead) from parsers whose events carry cache fields, such as
+// Antigravity and Junie.
 func applyUsageEventTokenTotals(
 	sess *ParsedSession,
 	events []ParsedUsageEvent,
 ) {
-	totalOutput, hasOutput, peakContext, hasContext :=
-		UsageEventTokenAggregate(events)
+	totalOutput, hasOutput, peakContext, hasContext := UsageEventTokenAggregate(events)
 	if hasOutput {
 		sess.HasTotalOutputTokens = true
 		sess.TotalOutputTokens = totalOutput
@@ -1388,7 +1744,21 @@ func applyUsageEventTokenTotals(
 func UsageEventTokenAggregate(
 	events []ParsedUsageEvent,
 ) (totalOut int, hasOut bool, peakCtx int, hasCtx bool) {
+	totalOut, hasOut, peakCtx, hasCtx, _ = UsageEventTokenAggregateContext(
+		context.Background(), events,
+	)
+	return
+}
+
+// UsageEventTokenAggregateContext is the bounded form of the canonical
+// event-derived token rollup.
+func UsageEventTokenAggregateContext(
+	ctx context.Context, events []ParsedUsageEvent,
+) (totalOut int, hasOut bool, peakCtx int, hasCtx bool, err error) {
 	for _, ev := range events {
+		if err = ctx.Err(); err != nil {
+			return
+		}
 		if ev.OutputTokens > 0 {
 			hasOut = true
 			totalOut += ev.OutputTokens
@@ -1403,7 +1773,8 @@ func UsageEventTokenAggregate(
 			}
 		}
 	}
-	return totalOut, hasOut, peakCtx, hasCtx
+	err = ctx.Err()
+	return
 }
 
 // InferTokenPresence determines whether context/output tokens were
@@ -1423,7 +1794,7 @@ func InferTokenPresence(
 		return hasContext, hasOutput
 	}
 
-	var payload map[string]json.RawMessage
+	var payload map[string]jsontext.Value
 	if err := json.Unmarshal(tokenUsage, &payload); err != nil {
 		return hasContext, hasOutput
 	}
@@ -1444,7 +1815,7 @@ func InferTokenPresence(
 // TokenPresence reports whether context/output token fields were
 // present in the provider payload. Falls back to raw token_usage
 // key inspection when parser-specific flags were not populated.
-func (m ParsedMessage) TokenPresence() (bool, bool) {
+func (m *ParsedMessage) TokenPresence() (bool, bool) {
 	if m.tokenPresenceKnown {
 		return m.HasContextTokens, m.HasOutputTokens
 	}
@@ -1458,7 +1829,7 @@ func (m ParsedMessage) TokenPresence() (bool, bool) {
 // metrics were present. This preserves explicit flags and falls
 // back to non-zero aggregates for providers like Kimi that only
 // expose truthful session-level totals in current Task 1 paths.
-func (s ParsedSession) AggregateTokenPresence() (bool, bool) {
+func (s *ParsedSession) AggregateTokenPresence() (bool, bool) {
 	if s.aggregateTokenPresenceKnown {
 		return s.HasTotalOutputTokens, s.HasPeakContextTokens
 	}
@@ -1470,16 +1841,30 @@ func (s ParsedSession) AggregateTokenPresence() (bool, bool) {
 // TokenCoverage reports the truthful aggregate/session coverage
 // after combining session-level aggregate presence with per-message
 // token presence.
-func (s ParsedSession) TokenCoverage(
+func (s *ParsedSession) TokenCoverage(
 	msgs []ParsedMessage,
 ) (bool, bool) {
+	hasTotal, hasPeak, _ := s.TokenCoverageContext(
+		context.Background(), msgs,
+	)
+	return hasTotal, hasPeak
+}
+
+// TokenCoverageContext reports aggregate coverage while allowing bounded
+// transcript preparation to stop between messages.
+func (s *ParsedSession) TokenCoverageContext(
+	ctx context.Context, msgs []ParsedMessage,
+) (bool, bool, error) {
 	hasTotal, hasPeak := s.AggregateTokenPresence()
 	for _, m := range msgs {
+		if err := ctx.Err(); err != nil {
+			return false, false, err
+		}
 		msgHasCtx, msgHasOut := m.TokenPresence()
 		hasTotal = hasTotal || msgHasOut
 		hasPeak = hasPeak || msgHasCtx
 	}
-	return hasTotal, hasPeak
+	return hasTotal, hasPeak, ctx.Err()
 }
 
 // ParseResult pairs a parsed session with its messages.
@@ -1487,6 +1872,27 @@ type ParseResult struct {
 	Session     ParsedSession
 	Messages    []ParsedMessage
 	UsageEvents []ParsedUsageEvent
+	// Checkpoint is opaque provider continuation state (a parser
+	// checkpoint) that the sync engine persists after this result's
+	// session rows commit, so later appends can resume without rescanning
+	// the transcript prefix. Empty for providers without checkpoints.
+	Checkpoint []byte
+	// CheckpointHashState is the resumable SHA-256 state covering the
+	// parsed snapshot [0, Session.File.Size), captured on the same read
+	// pass as the parse. CheckpointAnchorDigest is the digest of the
+	// snapshot's trailing anchor window. Both are empty for providers
+	// without single-pass hashing; the engine persists them with the
+	// checkpoint so it never re-reads the source after a full parse.
+	CheckpointHashState    []byte
+	CheckpointAnchorDigest string
+}
+
+// PromoteParentlessWorker classifies workers without an existing parent or relationship.
+func PromoteParentlessWorker(parent string, rel RelationshipType, worker bool) RelationshipType {
+	if parent == "" && rel == RelNone && worker {
+		return RelSubagent
+	}
+	return rel
 }
 
 // InferRelationshipTypes sets RelationshipType on results that have
@@ -1506,4 +1912,21 @@ func InferRelationshipTypes(results []ParseResult) {
 			results[i].Session.RelationshipType = RelContinuation
 		}
 	}
+}
+
+// TokenPresenceKnown reports whether provider flags override legacy inference.
+// Transport adapters must preserve it alongside the exported token fields.
+func (m *ParsedMessage) TokenPresenceKnown() bool { return m.tokenPresenceKnown }
+
+// RestoreTokenPresenceKnown restores transport metadata without inferring or
+// changing the provider's exported token values and coverage flags.
+func (m *ParsedMessage) RestoreTokenPresenceKnown(known bool) { m.tokenPresenceKnown = known }
+
+// AggregateTokenPresenceKnown reports whether session aggregate coverage is
+// authoritative rather than inferred from nonzero legacy values.
+func (s *ParsedSession) AggregateTokenPresenceKnown() bool { return s.aggregateTokenPresenceKnown }
+
+// RestoreAggregateTokenPresenceKnown restores the session transport metadata.
+func (s *ParsedSession) RestoreAggregateTokenPresenceKnown(known bool) {
+	s.aggregateTokenPresenceKnown = known
 }

@@ -11,7 +11,10 @@ import (
 	"github.com/stretchr/testify/require"
 
 	"go.kenn.io/agentsview/internal/db"
+	"go.kenn.io/agentsview/internal/dbtest"
 	"go.kenn.io/agentsview/internal/export"
+	"go.kenn.io/agentsview/internal/readbase"
+	"go.kenn.io/agentsview/internal/storage"
 )
 
 // seedDuckCandidateSession inserts a minimal session with one message, using
@@ -22,11 +25,11 @@ func seedDuckCandidateSession(
 ) {
 	t.Helper()
 	ended := started
-	require.NoError(t, local.UpsertSession(db.Session{
+	require.NoError(t, local.UpsertSession(t.Context(), db.Session{
 		ID: id, Project: project, Machine: duckPushMachine, Agent: "codex", Cwd: cwd,
 		StartedAt: &started, EndedAt: &ended, MessageCount: 1,
 	}), "UpsertSession %s", id)
-	require.NoError(t, local.InsertMessages([]db.Message{{
+	require.NoError(t, local.InsertMessages(t.Context(), []db.Message{{
 		SessionID: id, Ordinal: 0, Role: "assistant", Content: "hi", ContentLength: 2,
 	}}), "InsertMessages %s", id)
 }
@@ -65,7 +68,7 @@ func seedDuckCandidateSessionNoSnapshot(
 // archive-wideness: the snapshot group spans an old (2020) and a new (2025)
 // session, both of which must appear in the combined group.
 func TestDuckWorktreeCandidatesArchiveWideMatchesSQLite(t *testing.T) {
-	ctx := context.Background()
+	ctx := t.Context()
 	local := newLocalDB(t)
 	const project = "candidate-project"
 
@@ -91,12 +94,12 @@ func TestDuckWorktreeCandidatesArchiveWideMatchesSQLite(t *testing.T) {
 
 	seedDuckCandidateSession(t, local, "unavailable-session", project,
 		"", "2025-06-02T10:00:00Z")
-	require.NoError(t, local.UpsertSession(db.Session{
+	require.NoError(t, local.UpsertSession(ctx, db.Session{
 		ID: "zero-message-session", Project: project, Machine: duckPushMachine,
 		Agent: "codex",
 	}), "seed zero-message session")
 
-	syncer := newInMemoryTestSync(t, local, SyncOptions{})
+	syncer := newInMemoryTestSync(t, local, storage.MirrorPushOptions{})
 	pushDataReadMirror(t, ctx, syncer)
 
 	projects, err := local.BuildProjectIdentityMap(ctx, []string{project})
@@ -127,10 +130,26 @@ func TestDuckWorktreeCandidatesArchiveWideMatchesSQLite(t *testing.T) {
 	assert.False(t, localCandidates[3].Available)
 	assert.Equal(t, 2, localCandidates[3].ContributingSessions,
 		"DuckDB and SQLite include zero-message inventory sessions")
+
+	candidates, err := duckStore.ListArchiveWorktreeCandidates(ctx,
+		db.ArchiveWorktreeCandidateRequest{
+			ProjectLabel: export.SafeProjectDisplayLabel(project),
+			ProjectKey:   "wrong-key",
+		})
+	require.NoError(t, err)
+	assert.Empty(t, candidates,
+		"right label with wrong key must return no candidates, no error")
+
+	_, err = duckStore.ListArchiveWorktreeCandidates(ctx,
+		db.ArchiveWorktreeCandidateRequest{
+			ProjectLabel: export.SafeProjectDisplayLabel(project),
+			ProjectKey:   "",
+		})
+	require.Error(t, err, "empty project key must error")
 }
 
-func TestDuckWorktreeCandidatesIncludeResolvedProjectAliases(t *testing.T) {
-	ctx := context.Background()
+func TestDuckWorktreeCandidatesExcludeDifferentProjectKeys(t *testing.T) {
+	ctx := t.Context()
 	local := newLocalDB(t)
 	const (
 		primary = "current-project-name"
@@ -159,7 +178,7 @@ func TestDuckWorktreeCandidatesIncludeResolvedProjectAliases(t *testing.T) {
 			},
 		))
 	}
-	syncer := newInMemoryTestSync(t, local, SyncOptions{})
+	syncer := newInMemoryTestSync(t, local, storage.MirrorPushOptions{})
 	pushDataReadMirror(t, ctx, syncer)
 
 	projects, err := local.BuildProjectIdentityMap(
@@ -174,8 +193,7 @@ func TestDuckWorktreeCandidatesIncludeResolvedProjectAliases(t *testing.T) {
 		ProjectLabel: export.SafeProjectDisplayLabel(primary),
 		ProjectKey:   projects[primary].ProjectKey,
 	}
-	localCandidates, err :=
-		local.ListArchiveWorktreeCandidates(ctx, request)
+	localCandidates, err := local.ListArchiveWorktreeCandidates(ctx, request)
 	require.NoError(t, err)
 	duckCandidates, err := NewStoreFromDB(syncer.DB()).
 		ListArchiveWorktreeCandidates(ctx, request)
@@ -183,41 +201,28 @@ func TestDuckWorktreeCandidatesIncludeResolvedProjectAliases(t *testing.T) {
 
 	assert.Equal(t, localCandidates, duckCandidates)
 	require.Len(t, duckCandidates, 1)
-	assert.Equal(t, 2, duckCandidates[0].ContributingSessions)
+	assert.Equal(t, 1, duckCandidates[0].ContributingSessions)
+	require.Len(t, duckCandidates[0].Examples, 1)
+	assert.Equal(t, "primary-session", duckCandidates[0].Examples[0].SessionID)
 }
 
-// TestDuckListArchiveWorktreeCandidatesKeyMismatch verifies the DuckDB
-// mirror matches SQLite's key-mismatch semantics exactly: a right label with
-// a wrong project key returns an empty candidate list with no error, and an
-// empty project key is rejected outright.
-func TestDuckListArchiveWorktreeCandidatesKeyMismatch(t *testing.T) {
-	ctx := context.Background()
+func TestDuckWorktreeCandidatesReloadPreservesSelection(t *testing.T) {
+	ctx := t.Context()
 	local := newLocalDB(t)
-	const project = "mismatch-project"
-
-	seedDuckCandidateSession(t, local, "session-a", project,
-		"/srv/worktrees/repo/feature", "2025-06-02T10:00:00Z")
-	setDuckCandidateSnapshot(t, ctx, local, "session-a", project,
-		"/srv/worktrees/repo", "/srv/worktrees/repo/feature")
-
-	syncer := newInMemoryTestSync(t, local, SyncOptions{})
+	seedDuckCandidateSession(t, local, "moving", "alpha", "/repo/alpha", "2025-06-02T10:00:00Z")
+	seedDuckCandidateSession(t, local, "retimed", "alpha", "/repo/alpha", "2025-06-02T10:00:00Z")
+	syncer := newInMemoryTestSync(t, local, storage.MirrorPushOptions{})
 	pushDataReadMirror(t, ctx, syncer)
-
-	duckStore := NewStoreFromDB(syncer.DB())
-
-	candidates, err := duckStore.ListArchiveWorktreeCandidates(ctx,
-		db.ArchiveWorktreeCandidateRequest{
-			ProjectLabel: export.SafeProjectDisplayLabel(project),
-			ProjectKey:   "wrong-key",
-		})
+	store := NewStoreFromDB(syncer.DB())
+	projects, err := store.BuildProjectIdentityMap(ctx, []string{"alpha"})
 	require.NoError(t, err)
-	assert.Empty(t, candidates,
-		"right label with wrong key must return no candidates, no error")
-
-	_, err = duckStore.ListArchiveWorktreeCandidates(ctx,
-		db.ArchiveWorktreeCandidateRequest{
-			ProjectLabel: export.SafeProjectDisplayLabel(project),
-			ProjectKey:   "",
-		})
-	require.Error(t, err, "empty project key must error")
+	catalog := readbase.NewCatalog(dbtest.PublishingCatalog{CatalogBackend: catalogSQL{store}, Publish: func() {
+		_, err := local.AssignSessionProject(ctx, "moving", "beta")
+		require.NoError(t, err)
+		require.NoError(t, local.UpsertSession(ctx, db.Session{ID: "retimed", Project: "alpha", Machine: "host.example", Agent: "codex", Cwd: "/repo/alpha", MessageCount: 1, StartedAt: new("2025-07-02T10:00:00Z"), EndedAt: new("2025-07-02T10:00:00Z")}))
+		pushDataReadMirror(t, ctx, syncer)
+	}}, "duckdb")
+	candidates, err := catalog.ListArchiveWorktreeCandidates(ctx, db.ArchiveWorktreeCandidateRequest{ProjectLabel: "alpha", ProjectKey: projects["alpha"].ProjectKey, DateFrom: "2025-06-01", DateTo: "2025-06-30"})
+	require.NoError(t, err)
+	assert.Empty(t, candidates)
 }

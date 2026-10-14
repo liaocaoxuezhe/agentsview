@@ -4,6 +4,8 @@ import (
 	"context"
 	"os"
 
+	"github.com/danielgtaylor/huma/v2"
+
 	syncpkg "go.kenn.io/agentsview/internal/sync"
 )
 
@@ -17,9 +19,10 @@ type PingInfo struct {
 }
 
 func (s *Server) registerHealthRoutes() {
-	group := newRouteGroup(s.api, "/api", "Health")
+	group := huma.NewGroup(s.api, "/api")
+	configureRouteGroup(group, "Health")
 
-	get(s, group, "/ping", "Ping daemon", s.humaPing)
+	s.get(group, "/ping", "Ping daemon", s.humaPing)
 }
 
 func (s *Server) humaPing(

@@ -1,8 +1,8 @@
-import { describe, it, expect } from "vite-plus/test";
-import {
-  generateAnalyticsCSV,
-  type AnalyticsData,
-} from "./csv-export.js";
+import { describe, it, expect, vi } from "vite-plus/test";
+import { exportAnalyticsCSV, generateAnalyticsCSV, type AnalyticsData } from "./csv-export.js";
+import { reportTelemetry } from "./telemetry.js";
+
+vi.mock("./telemetry.js", () => ({ reportTelemetry: vi.fn() }));
 
 function emptyData(): AnalyticsData {
   return {
@@ -36,6 +36,7 @@ describe("generateAnalyticsCSV", () => {
       most_active_project: "my-project",
       concentration: 0.456,
       agents: {},
+      models: [],
     };
 
     const csv = generateAnalyticsCSV(data);
@@ -46,9 +47,7 @@ describe("generateAnalyticsCSV", () => {
     expect(lines[2]).toBe("Sessions,10");
     expect(lines[3]).toBe("Messages,200");
     expect(lines).toContainEqual("Output Tokens,42000");
-    expect(lines).toContainEqual(
-      "Token Reporting Sessions,12",
-    );
+    expect(lines).toContainEqual("Token Reporting Sessions,12");
     expect(lines).toContainEqual("Concentration,45.6%");
   });
 
@@ -154,12 +153,11 @@ describe("generateAnalyticsCSV", () => {
       most_active_project: "p",
       concentration: 0.5,
       agents: {},
+      models: [],
     };
     data.tools = {
       total_calls: 1,
-      by_category: [
-        { category: "Read", count: 1, pct: 100 },
-      ],
+      by_category: [{ category: "Read", count: 1, pct: 100 }],
       by_agent: [],
       by_tool: [],
       trend: [],
@@ -185,12 +183,11 @@ describe("generateAnalyticsCSV", () => {
       most_active_project: 'project, "special"',
       concentration: 0,
       agents: {},
+      models: [],
     };
 
     const csv = generateAnalyticsCSV(data);
-    expect(csv).toContain(
-      '"project, ""special"""',
-    );
+    expect(csv).toContain('"project, ""special"""');
   });
 
   it("escapes formula injection characters", () => {
@@ -208,10 +205,23 @@ describe("generateAnalyticsCSV", () => {
       most_active_project: "=cmd()",
       concentration: 0,
       agents: {},
+      models: [],
     };
 
     const csv = generateAnalyticsCSV(data);
     expect(csv).toContain("'=cmd()");
     expect(csv).not.toContain(",=cmd()");
+  });
+});
+
+describe("exportAnalyticsCSV", () => {
+  it("reports export_run csv", () => {
+    URL.createObjectURL = vi.fn(() => "blob:analytics");
+    URL.revokeObjectURL = vi.fn();
+    vi.spyOn(HTMLAnchorElement.prototype, "click").mockImplementation(() => {});
+
+    exportAnalyticsCSV(emptyData());
+
+    expect(reportTelemetry).toHaveBeenCalledExactlyOnceWith("export_run", { format: "csv" });
   });
 });

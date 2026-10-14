@@ -1,39 +1,35 @@
 import type { DataChangedEvent } from "../api/client.js";
-import {
-  MetadataService,
-  SessionsService,
-} from "../api/generated/index";
-import {
-  callGenerated,
-  configureGeneratedClient,
-  isAbortError,
-} from "../api/runtime.js";
+import { MetadataService, SessionsService, SettingsService } from "../api/generated/index";
+import { ApiError, isAbortError, isNotFoundError } from "../api/runtime.js";
+import type { Session } from "../api/types.js";
 import type {
-  Session,
-  ProjectInfo,
-  AgentInfo,
-  SidebarSessionIndexResponse,
-  SidebarSessionIndexRow,
-} from "../api/types.js";
+  DbProjectInfo as ProjectInfo,
+  DbAgentInfo as AgentInfo,
+  DbSidebarSessionIndexRow as SidebarSessionIndexRow,
+} from "../api/generated/index.js";
 import { sync } from "./sync.svelte.js";
 import { events } from "./events.svelte.js";
 import { starred } from "./starred.svelte.js";
 import { yokedDates } from "./yokedDates.svelte.js";
 import {
   SESSION_ANALYTICS_WINDOW_PARAM,
+  SESSION_LABEL_PARAM,
+  SESSION_PR_PARAM,
+  joinLabelFilterParam,
+  normalizeLabelFilters,
   parseWindowDaysParam,
+  splitLabelFilterParam,
 } from "./sessionRouteParams.js";
 import { rollingRange } from "../utils/dates.js";
 import { LatestRead } from "../utils/latest-read.js";
 
-type SidebarIndexParams = Parameters<
-  typeof SessionsService.getApiV1SessionsSidebarIndex
->[0];
-type MetadataParams = Parameters<
-  typeof MetadataService.getApiV1Projects
->[0];
+type SidebarIndexParams = NonNullable<
+  Parameters<typeof SessionsService.getApiV1SessionsSidebarIndex>[0]
+>;
+type MetadataParams = NonNullable<Parameters<typeof MetadataService.getApiV1Projects>[0]>;
 type ClearSessionFiltersOptions = {
   clearDateYoke?: boolean;
+  preserveLabelsAndPR?: boolean;
 };
 type LoadOptions = {
   force?: boolean;
@@ -48,8 +44,10 @@ const RECENTLY_DELETED_TTL_MS = 10_000;
 export interface SessionGroupInput {
   id: string;
   parent_session_id?: string | null;
+  parent_session_ids?: string[];
   relationship_type?: string | null;
   project: string;
+  project_assigned?: boolean;
   machine: string;
   agent: string;
   agent_label?: string | null;
@@ -103,6 +101,11 @@ export interface Filters {
   minUserMessages: number;
   includeOneShot: boolean;
   includeAutomated: boolean;
+  automatedFilterSet: boolean;
+  /** Exact labels a session must carry; every label must match. */
+  labels: string[];
+  /** Pull request reference: owner/repo or owner/repo#123. */
+  pr: string;
 }
 
 function defaultFilters(): Filters {
@@ -121,6 +124,9 @@ function defaultFilters(): Filters {
     minUserMessages: 0,
     includeOneShot: true,
     includeAutomated: false,
+    automatedFilterSet: false,
+    labels: [],
+    pr: "",
   };
 }
 
@@ -144,10 +150,13 @@ function loadSavedFilters(): SavedFilters {
   try {
     const raw = localStorage.getItem(SESSION_FILTERS_KEY);
     if (raw) {
-      const { version, windowDays, ...saved } = JSON.parse(
-        raw,
-      ) as Partial<Filters> & { version?: unknown; windowDays?: unknown };
+      const { version, windowDays, ...saved } = JSON.parse(raw) as Partial<Filters> & {
+        version?: unknown;
+        windowDays?: unknown;
+      };
       const filters = { ...defaultFilters(), ...saved };
+      filters.labels = normalizeLabelFilters(filters.labels);
+      filters.pr = typeof filters.pr === "string" ? filters.pr.trim() : "";
       // Deliberately `!==`, not `<`: an entry written by a newer (or older)
       // format is not trusted either way — dropping date bounds is the
       // fail-safe direction in both.
@@ -183,10 +192,7 @@ function saveFilters(f: Filters, windowDays: number | null = null): void {
   // on load; the materialized dates themselves are session-scoped. Storing
   // them verbatim would pin the window to the day it was saved, silently
   // hiding newer sessions (#1086).
-  const toSave =
-    windowDays !== null
-      ? { ...f, date: "", dateFrom: "", dateTo: "", windowDays }
-      : f;
+  const toSave = windowDays !== null ? { ...f, date: "", dateFrom: "", dateTo: "", windowDays } : f;
   try {
     localStorage.setItem(
       SESSION_FILTERS_KEY,
@@ -199,9 +205,7 @@ function saveFilters(f: Filters, windowDays: number | null = null): void {
 
 /** Serialize a Filters object into URL query params.
  *  Default-valued fields are omitted so the URL stays clean. */
-export function filtersToParams(
-  f: Filters,
-): Record<string, string> {
+export function filtersToParams(f: Filters): Record<string, string> {
   const p: Record<string, string> = {};
   if (f.project) p["project"] = f.project;
   if (f.machine) p["machine"] = f.machine;
@@ -218,7 +222,12 @@ export function filtersToParams(
     p["min_user_messages"] = String(f.minUserMessages);
   }
   if (!f.includeOneShot) p["include_one_shot"] = "false";
-  if (f.includeAutomated) p["include_automated"] = "true";
+  if (f.includeAutomated || f.automatedFilterSet)
+    p["include_automated"] = String(f.includeAutomated);
+  const labels = joinLabelFilterParam(f.labels);
+  if (labels) p[SESSION_LABEL_PARAM] = labels;
+  const pr = f.pr.trim();
+  if (pr) p[SESSION_PR_PARAM] = pr;
   return p;
 }
 
@@ -226,9 +235,7 @@ function hasDateFilters(f: Filters): boolean {
   return !!(f.date || f.dateFrom || f.dateTo);
 }
 
-export function splitExcludeProjectParam(
-  raw: string | undefined,
-): {
+export function splitExcludeProjectParam(raw: string | undefined): {
   hideUnknownProject: boolean;
   usageExcludedProjects: string;
 } {
@@ -254,23 +261,19 @@ export function splitExcludeProjectParam(
 
 /** Parse URL query params into a typed Filters object.
  *  Unknown/missing params fall back to defaults. */
-export function parseFiltersFromParams(
-  params: Record<string, string>,
-): Filters {
+export function parseFiltersFromParams(params: Record<string, string>): Filters {
   const minMsgs = parseInt(params["min_messages"] ?? "", 10);
   const maxMsgs = parseInt(params["max_messages"] ?? "", 10);
   const minUserMsgs = parseInt(params["min_user_messages"] ?? "", 10);
 
-  const { hideUnknownProject: hideUnknown } =
-    splitExcludeProjectParam(params["exclude_project"]);
+  const { hideUnknownProject: hideUnknown } = splitExcludeProjectParam(params["exclude_project"]);
   let project = params["project"] ?? "";
   if (hideUnknown && project === "unknown") {
     project = "";
   }
 
   const oneShotParam = params["include_one_shot"];
-  const includeOneShot =
-    oneShotParam === undefined ? true : oneShotParam === "true";
+  const includeOneShot = oneShotParam === undefined ? true : oneShotParam === "true";
 
   return {
     project,
@@ -287,6 +290,9 @@ export function parseFiltersFromParams(
     minUserMessages: Number.isFinite(minUserMsgs) ? minUserMsgs : 0,
     includeOneShot,
     includeAutomated: params["include_automated"] === "true",
+    automatedFilterSet: params["include_automated"] !== undefined,
+    labels: splitLabelFilterParam(params[SESSION_LABEL_PARAM]),
+    pr: (params[SESSION_PR_PARAM] ?? "").trim(),
   };
 }
 
@@ -295,21 +301,29 @@ class SessionsStore {
   projects: ProjectInfo[] = $state([]);
   agents: AgentInfo[] = $state([]);
   machines: string[] = $state([]);
+  machineLabels: Record<string, string> = $state({});
+  private machineAliases = new Map<string, string>();
   activeSessionId: string | null = $state(null);
+  // Lets the message pane explain a 404 instead of rendering blank.
+  activeSessionNotFound: boolean = $state(false);
+  // Bumped when a not-found session recovers; per-session loaders
+  // keyed on (activeSessionId, activeSessionLoadVersion) re-run
+  // without the id changing.
+  activeSessionLoadVersion: number = $state(0);
   activeSessionUsageVersion: number = $state(0);
   childSessions: Map<string, Session> = $state(new Map());
   nextCursor: string | null = $state(null);
   total: number = $state(0);
   loading: boolean = $state(false);
+  /** Why the server rejected the current sidebar filters, or null. */
+  sidebarLoadError: string | null = $state(null);
   #savedFilters = loadSavedFilters();
   private filterPersistenceHeld = false;
   filters: Filters = $state(this.#savedFilters.filters);
   /** Rolling window (in days) behind the current date bounds, or null when
    *  the bounds were chosen explicitly. Persisted as intent and
    *  rematerialized on load so the window keeps rolling forward (#1086). */
-  dateFiltersWindowDays: number | null = $state(
-    this.#savedFilters.windowDays,
-  );
+  dateFiltersWindowDays: number | null = $state(this.#savedFilters.windowDays);
 
   private signalDetailCache = new Map<
     string,
@@ -318,10 +332,7 @@ class SessionsStore {
       penalties: Record<string, number> | null;
     }
   >();
-  private signalDetailInflight = new Map<
-    string,
-    Promise<void>
-  >();
+  private signalDetailInflight = new Map<string, Promise<void>>();
   signalDetailLoading = $state(false);
 
   private loadVersion: number = 0;
@@ -336,10 +347,7 @@ class SessionsStore {
   private machinesLoaded: boolean = false;
   private machinesPromise: Promise<void> | null = null;
   private machinesVersion: number = 0;
-  private sidebarHydrationInflightByVersion = new Map<
-    number,
-    Map<string, Promise<void>>
-  >();
+  private sidebarHydrationInflightByVersion = new Map<number, Map<string, Promise<void>>>();
   private sidebarHydrationEpochByVersion = new Map<number, number>();
   private sidebarHydrationQueue: Array<() => void> = [];
   private sidebarHydrationActive = 0;
@@ -369,34 +377,29 @@ class SessionsStore {
   private get apiParams(): SidebarIndexParams {
     const f = this.filters;
     // Don't exclude "unknown" when explicitly viewing it.
-    const exclude =
-      f.hideUnknownProject && f.project !== "unknown"
-        ? "unknown"
-        : undefined;
+    const exclude = f.hideUnknownProject && f.project !== "unknown" ? "unknown" : undefined;
     return {
       project: f.project || undefined,
-      excludeProject: exclude,
+      exclude_project: exclude,
       machine: f.machine || undefined,
       agent: f.agent || undefined,
       termination: f.termination || undefined,
       date: f.date || undefined,
-      dateFrom: f.dateFrom || undefined,
-      dateTo: f.dateTo || undefined,
+      date_from: f.dateFrom || undefined,
+      date_to: f.dateTo || undefined,
       timezone: Intl.DateTimeFormat().resolvedOptions().timeZone,
-      activeSince: f.recentlyActive
-        ? new Date(
-            Date.now() - 24 * 60 * 60 * 1000,
-          ).toISOString()
+      active_since: f.recentlyActive
+        ? new Date(Date.now() - 24 * 60 * 60 * 1000).toISOString()
         : undefined,
-      minMessages:
-        f.minMessages > 0 ? f.minMessages : undefined,
-      maxMessages:
-        f.maxMessages > 0 ? f.maxMessages : undefined,
-      minUserMessages:
-        f.minUserMessages > 0 ? f.minUserMessages : undefined,
-      includeOneShot: f.includeOneShot || undefined,
-      includeAutomated: f.includeAutomated || undefined,
+      min_messages: f.minMessages > 0 ? f.minMessages : undefined,
+      max_messages: f.maxMessages > 0 ? f.maxMessages : undefined,
+      min_user_messages: f.minUserMessages > 0 ? f.minUserMessages : undefined,
+      include_one_shot: f.includeOneShot,
+      include_automated:
+        f.includeAutomated || f.automatedFilterSet ? f.includeAutomated : undefined,
       starred: starred.filterOnly || undefined,
+      label: f.labels.length > 0 ? [...f.labels] : undefined,
+      pr: f.pr || undefined,
     };
   }
 
@@ -445,7 +448,8 @@ class SessionsStore {
     this.filterPersistenceHeld = true;
     if (
       previous.includeOneShot !== this.filters.includeOneShot ||
-      previous.includeAutomated !== this.filters.includeAutomated
+      previous.includeAutomated !== this.filters.includeAutomated ||
+      previous.automatedFilterSet !== this.filters.automatedFilterSet
     ) {
       this.invalidateFilterCaches();
     }
@@ -458,9 +462,11 @@ class SessionsStore {
     this.filters = this.#savedFilters.filters;
     this.dateFiltersWindowDays = this.#savedFilters.windowDays;
     this.filterPersistenceHeld = false;
+    this.normalizeMachineFilter();
     if (
       previous.includeOneShot !== this.filters.includeOneShot ||
-      previous.includeAutomated !== this.filters.includeAutomated
+      previous.includeAutomated !== this.filters.includeAutomated ||
+      previous.automatedFilterSet !== this.filters.automatedFilterSet
     ) {
       this.invalidateFilterCaches();
     }
@@ -470,10 +476,7 @@ class SessionsStore {
   /** Set date filters materialized from a panel date state. `windowDays`
    *  carries the rolling intent behind the bounds (null for explicitly
    *  chosen fixed ranges). */
-  applyPanelDateFilters(
-    dateParams: Record<string, string>,
-    windowDays: number | null,
-  ): void {
+  applyPanelDateFilters(dateParams: Record<string, string>, windowDays: number | null): void {
     this.filters.date = dateParams["date"] ?? "";
     this.filters.dateFrom = dateParams["date_from"] ?? "";
     this.filters.dateTo = dateParams["date_to"] ?? "";
@@ -487,15 +490,18 @@ class SessionsStore {
   initFromParams(params: Record<string, string>) {
     const prevOneShot = this.filters.includeOneShot;
     const prevAutomated = this.filters.includeAutomated;
+    const prevAutomatedSet = this.filters.automatedFilterSet;
     const next = parseFiltersFromParams(params);
     this.filters = next;
-    this.dateFiltersWindowDays = parseWindowDaysParam(
-      params[SESSION_ANALYTICS_WINDOW_PARAM],
-    );
+    this.dateFiltersWindowDays = parseWindowDaysParam(params[SESSION_ANALYTICS_WINDOW_PARAM]);
     starred.filterOnly = params["starred"] === "true";
     this.filterPersistenceHeld = false;
-    if (prevOneShot !== next.includeOneShot ||
-        prevAutomated !== next.includeAutomated) {
+    this.normalizeMachineFilter();
+    if (
+      prevOneShot !== next.includeOneShot ||
+      prevAutomated !== next.includeAutomated ||
+      prevAutomatedSet !== next.automatedFilterSet
+    ) {
       this.invalidateFilterCaches();
     }
     this.setActiveSession(null);
@@ -541,10 +547,7 @@ class SessionsStore {
     void this.load();
   }
 
-  private async loadSidebarPage(
-    params: SidebarIndexParams,
-    signal: AbortSignal,
-  ) {
+  private async loadSidebarPage(params: SidebarIndexParams, signal: AbortSignal) {
     const version = ++this.loadVersion;
     const indexVersion = this.sidebarIndexVersion + 1;
     // Keep the existing list visible during reloads, but mark
@@ -560,22 +563,16 @@ class SessionsStore {
       total: this.total,
     };
     try {
-      const index = await callGenerated(
-        () => SessionsService.getApiV1SessionsSidebarIndex(params),
-        signal,
-      ) as unknown as SidebarSessionIndexResponse;
+      const index = await SessionsService.getApiV1SessionsSidebarIndex(params, { signal });
       if (this.loadVersion !== version) return;
 
       this.sidebarIndexVersion = indexVersion;
       this.hydratedSessionsByVersion.set(indexVersion, new Map());
       this.sidebarHydrationEpochByVersion.set(indexVersion, 0);
       this.pruneSidebarHydrationVersions(indexVersion);
-      const existing = new Map(this.sessions.map((session) => [
-        session.id,
-        session,
-      ]));
+      const existing = new Map(this.sessions.map((session) => [session.id, session]));
       this.sessions = index.sessions.map((row) =>
-        sidebarIndexRowToSession(row, existing.get(row.id))
+        sidebarIndexRowToSession(row, existing.get(row.id)),
       );
       this.sidebarIndexIds = new Set(index.sessions.map((row) => row.id));
       // Keep the active session's hydrated row when the new index
@@ -593,14 +590,24 @@ class SessionsStore {
       }
       this.nextCursor = index.next_cursor ?? null;
       this.total = index.total;
-    } catch {
+      this.sidebarLoadError = null;
+    } catch (error) {
+      if (this.loadVersion !== version) return;
+      // A rejected filter has no matching rows; showing the previous
+      // filter's rows under it would mislabel them.
+      if (error instanceof ApiError && error.status >= 400 && error.status < 500) {
+        this.sessions = [];
+        this.sidebarIndexIds = new Set();
+        this.nextCursor = null;
+        this.total = 0;
+        this.sidebarLoadError = error.message;
+        return;
+      }
       // Restore previous state so a transient failure
       // doesn't wipe the visible session list.
-      if (this.loadVersion === version) {
-        this.sessions = prev.sessions;
-        this.nextCursor = prev.nextCursor;
-        this.total = prev.total;
-      }
+      this.sessions = prev.sessions;
+      this.nextCursor = prev.nextCursor;
+      this.total = prev.total;
     } finally {
       if (this.loadVersion === version) {
         this.loading = false;
@@ -613,8 +620,7 @@ class SessionsStore {
   // this.sessions outside this set were appended out of position
   // (see loadSidebarPage / loadMore).
   private sidebarIndexIds: Set<string> = new Set();
-  hydratedSessionsByVersion: Map<number, Map<string, Session>> =
-    $state(new Map());
+  hydratedSessionsByVersion: Map<number, Map<string, Session>> = $state(new Map());
 
   private pruneSidebarHydrationVersions(retainVersion: number) {
     for (const version of this.hydratedSessionsByVersion.keys()) {
@@ -634,50 +640,55 @@ class SessionsStore {
     }
   }
 
-  async hydrateVisibleSessions(
-    ids: string[],
-    version: number = this.sidebarIndexVersion,
-  ) {
+  async hydrateVisibleSessions(ids: string[], version: number = this.sidebarIndexVersion) {
     const uniqueIds = [...new Set(ids)];
-    const cache =
-      this.hydratedSessionsByVersion.get(version) ?? new Map<string, Session>();
+    const cache = this.hydratedSessionsByVersion.get(version) ?? new Map<string, Session>();
     this.hydratedSessionsByVersion.set(version, cache);
-    const inflight = this.sidebarHydrationInflightByVersion.get(version) ??
-      new Map<string, Promise<void>>();
+    const inflight =
+      this.sidebarHydrationInflightByVersion.get(version) ?? new Map<string, Promise<void>>();
     this.sidebarHydrationInflightByVersion.set(version, inflight);
     const epoch = this.sidebarHydrationEpochByVersion.get(version) ?? 0;
     const signal = this.routeSignal();
 
-    await Promise.all(uniqueIds.map((id) => {
-      if (cache.has(id)) return;
-      const existing = inflight.get(id);
-      if (existing) return existing;
+    const uncached = uniqueIds.filter((id) => !cache.has(id));
+    await Promise.all(
+      uncached.map((id) => {
+        const existing = inflight.get(id);
+        if (existing) return existing;
 
-      const promise = this.runSidebarHydration(async () => {
-        if (signal.aborted) return;
-        try {
-          configureGeneratedClient();
-          const hydrated = await callGenerated(
-            () => SessionsService.getApiV1SessionsId({ id }),
-            signal,
-          ) as unknown as Session;
-          if (
-            version !== this.sidebarIndexVersion ||
-            epoch !== (this.sidebarHydrationEpochByVersion.get(version) ?? 0)
-          ) {
-            return;
+        const promise = this.runSidebarHydration(async () => {
+          if (signal.aborted) return;
+          try {
+            const hydrated = await SessionsService.getApiV1SessionsById({ id }, { signal });
+            if (
+              version !== this.sidebarIndexVersion ||
+              epoch !== (this.sidebarHydrationEpochByVersion.get(version) ?? 0)
+            ) {
+              return;
+            }
+            cache.set(id, hydrated);
+            this.mergeHydratedSession(hydrated);
+            this.markActiveSessionFound(id);
+          } catch (err) {
+            // Visible hydration is best-effort; the skinny row remains usable.
+            // Except a 404 for the selected row: without the not-found
+            // flag the message pane would render blank. Version and
+            // epoch guards keep a stale 404 from flagging a session a
+            // newer fetch already resolved.
+            if (
+              version === this.sidebarIndexVersion &&
+              epoch === (this.sidebarHydrationEpochByVersion.get(version) ?? 0)
+            ) {
+              this.markActiveSessionMissing(id, err);
+            }
+          } finally {
+            inflight.delete(id);
           }
-          cache.set(id, hydrated);
-          this.mergeHydratedSession(hydrated);
-        } catch {
-          // Visible hydration is best-effort; the skinny row remains usable.
-        } finally {
-          inflight.delete(id);
-        }
-      });
-      inflight.set(id, promise);
-      return promise;
-    }));
+        });
+        inflight.set(id, promise);
+        return promise;
+      }),
+    );
   }
 
   private async runSidebarHydration(task: () => Promise<void>): Promise<void> {
@@ -703,6 +714,9 @@ class SessionsStore {
     this.sessions[idx] = {
       ...current,
       ...hydrated,
+      parent_session_id: hydrated.parent_session_id,
+      parent_session_ids: hydrated.parent_session_ids,
+      relationship_type: hydrated.relationship_type,
       display_name: hydrated.display_name ?? current.display_name,
       is_teammate: hydrated.is_teammate ?? current.is_teammate,
       is_index_only: false,
@@ -728,45 +742,42 @@ class SessionsStore {
     const signal = this.routeSignal();
     this.loading = true;
     try {
-      configureGeneratedClient();
-      const index = await callGenerated(
-        () => SessionsService.getApiV1SessionsSidebarIndex({
+      const index = await SessionsService.getApiV1SessionsSidebarIndex(
+        {
           ...this.apiParams,
           cursor: this.nextCursor!,
           limit: SESSION_PAGE_SIZE,
-        }),
-        signal,
-      ) as unknown as SidebarSessionIndexResponse;
+        },
+        { signal },
+      );
       if (this.loadVersion !== version) return;
       // Merge index-page order first, appended rows last. Rows outside
       // sidebarIndexIds were appended out of position (the active
       // session kept by loadSidebarPage, navigateToSession targets);
       // they stay at the tail until pagination reaches their real
       // position, then merge in place carrying their hydrated fields.
-      const existingById = new Map(
-        this.sessions.map((session) => [session.id, session]),
-      );
+      const existingById = new Map(this.sessions.map((session) => [session.id, session]));
       for (const row of index.sessions) {
         this.sidebarIndexIds.add(row.id);
       }
       const paged = this.sessions.filter(
-        (s) => this.sidebarIndexIds.has(s.id) &&
-          !index.sessions.some((row) => row.id === s.id),
+        (s) => this.sidebarIndexIds.has(s.id) && !index.sessions.some((row) => row.id === s.id),
       );
-      const appended = this.sessions.filter(
-        (s) => !this.sidebarIndexIds.has(s.id),
-      );
+      const appended = this.sessions.filter((s) => !this.sidebarIndexIds.has(s.id));
       this.sessions = [
         ...paged,
-        ...index.sessions.map((row) =>
-          sidebarIndexRowToSession(row, existingById.get(row.id))
-        ),
+        ...index.sessions.map((row) => sidebarIndexRowToSession(row, existingById.get(row.id))),
         ...appended,
       ];
       this.nextCursor = index.next_cursor ?? null;
       this.total = index.total;
     } catch (error) {
-      if (signal.aborted || isAbortError(error)) return;
+      if (signal.aborted || isAbortError(error) || this.loadVersion !== version) return;
+      if (error instanceof ApiError && error.status === 400 && error.message === "invalid cursor") {
+        this.nextCursor = null;
+        await this.load({ force: true });
+        return;
+      }
       throw error;
     } finally {
       if (this.loadVersion === version) {
@@ -805,10 +816,7 @@ class SessionsStore {
     const ver = this.projectsVersion;
     this.projectsPromise = (async () => {
       try {
-        configureGeneratedClient();
-        const res = await MetadataService.getApiV1Projects(
-          this.metadataParams,
-        ) as unknown as { projects: ProjectInfo[] };
+        const res = await MetadataService.getApiV1Projects(this.metadataParams);
         if (ver === this.projectsVersion) {
           this.projects = res.projects;
           this.projectsLoaded = true;
@@ -830,10 +838,7 @@ class SessionsStore {
     const ver = this.agentsVersion;
     this.agentsPromise = (async () => {
       try {
-        configureGeneratedClient();
-        const res = await MetadataService.getApiV1Agents(
-          this.metadataParams,
-        ) as unknown as { agents: AgentInfo[] };
+        const res = await MetadataService.getApiV1Agents(this.metadataParams);
         if (ver === this.agentsVersion) {
           this.agents = res.agents;
           this.agentsLoaded = true;
@@ -855,12 +860,12 @@ class SessionsStore {
     const ver = this.machinesVersion;
     this.machinesPromise = (async () => {
       try {
-        configureGeneratedClient();
-        const res = await MetadataService.getApiV1Machines(
-          this.metadataParams,
-        ) as unknown as { machines: string[] };
+        const res = await MetadataService.getApiV1Machines(this.metadataParams);
         if (ver === this.machinesVersion) {
           this.machines = res.machines;
+          this.machineLabels = res.machine_labels ?? {};
+          this.machineAliases = new Map(Object.entries(res.machine_aliases ?? {}));
+          this.normalizeMachineFilter();
           this.machinesLoaded = true;
         }
       } catch {
@@ -874,12 +879,29 @@ class SessionsStore {
     return this.machinesPromise;
   }
 
+  machineLabel(machine: string): string {
+    return this.machineLabels[machine] ?? machine;
+  }
+
+  private normalizeMachineFilter(): void {
+    const machine = [
+      ...new Set(
+        this.filters.machine.split(",").map((key) => this.machineAliases.get(key.trim()) ?? key),
+      ),
+    ].join(",");
+    if (machine !== this.filters.machine) {
+      this.filters.machine = machine;
+      this.persistFiltersIfAllowed();
+    }
+  }
+
   private setActiveSession(id: string | null) {
     if (id === this.activeSessionId) return;
     this.navigateRead.cancel();
     this.refreshRead.cancel();
     this.childSessionsRead.cancel();
     this.activeSessionId = id;
+    this.activeSessionNotFound = false;
     this.activeSessionUsageVersion = 0;
     this.refreshVersion++;
     this.childSessionsVersion++;
@@ -890,8 +912,7 @@ class SessionsStore {
     void this.hydrateSelectedIndexOnlySession(id);
   }
 
-  private navigateInFlight: { id: string; promise: Promise<void> } | null =
-    null;
+  private navigateInFlight: { id: string; promise: Promise<void> } | null = null;
 
   /**
    * Navigate to a session by ID, loading it into the sessions list if
@@ -914,23 +935,22 @@ class SessionsStore {
     const entry = { id, promise: Promise.resolve() };
     entry.promise = (async () => {
       try {
-        configureGeneratedClient();
-        const session = await callGenerated(
-          () => SessionsService.getApiV1SessionsId({ id }),
-          signal,
-        ) as unknown as Session;
-        if (
-          this.activeSessionId === id && this.navigateRead.isCurrent(signal)
-        ) {
+        const session = await SessionsService.getApiV1SessionsById({ id }, { signal });
+        if (this.activeSessionId === id && this.navigateRead.isCurrent(signal)) {
           const idx = this.sessions.findIndex((s) => s.id === id);
           if (idx >= 0) {
             this.mergeHydratedSession(session);
           } else {
             this.sessions = [...this.sessions, session];
           }
+          this.markActiveSessionFound(id);
         }
-      } catch {
-        // Session not found — selection stands without metadata
+      } catch (err) {
+        // Selection stands without metadata; flag a not-found
+        // response so the message pane can say so.
+        if (this.navigateRead.isCurrent(signal)) {
+          this.markActiveSessionMissing(id, err);
+        }
       } finally {
         this.navigateRead.finish(signal);
         if (this.navigateInFlight === entry) {
@@ -940,6 +960,42 @@ class SessionsStore {
     })();
     this.navigateInFlight = entry;
     return entry.promise;
+  }
+
+  /**
+   * Record a failed session-detail fetch: a 404 while the session
+   * is still selected marks it not-found so the message pane can
+   * offer a retry.
+   */
+  markActiveSessionMissing(id: string, err: unknown) {
+    if (this.activeSessionId === id && isNotFoundError(err)) {
+      this.activeSessionNotFound = true;
+    }
+  }
+
+  private markActiveSessionFound(id: string) {
+    if (this.activeSessionId !== id || !this.activeSessionNotFound) return;
+    this.activeSessionNotFound = false;
+    this.activeSessionLoadVersion++;
+  }
+
+  /**
+   * Re-attempt loading the active session after a not-found. The
+   * flag stays set until a detail fetch succeeds, so a retry that
+   * still fails keeps the retryable pane instead of blanking it;
+   * a success recovers through markActiveSessionFound.
+   */
+  async retryActiveSession() {
+    const id = this.activeSessionId;
+    if (!id) return;
+    const existing = this.sessions.find((s) => s.id === id);
+    if (!existing) {
+      await this.navigateToSession(id);
+    } else if (existing.is_index_only) {
+      await this.hydrateSelectedIndexOnlySession(id);
+    } else {
+      await this.refreshActiveSession();
+    }
   }
 
   private async hydrateSelectedIndexOnlySession(id: string) {
@@ -959,11 +1015,7 @@ class SessionsStore {
     const version = ++this.refreshVersion;
     const signal = this.refreshRead.begin();
     try {
-      configureGeneratedClient();
-      const session = await callGenerated(
-        () => SessionsService.getApiV1SessionsId({ id }),
-        signal,
-      ) as unknown as Session;
+      const session = await SessionsService.getApiV1SessionsById({ id }, { signal });
       if (
         this.refreshVersion !== version ||
         this.activeSessionId !== id ||
@@ -975,8 +1027,12 @@ class SessionsStore {
       if (idx >= 0) {
         this.mergeHydratedSession(session);
       }
-    } catch {
+      this.markActiveSessionFound(id);
+    } catch (err) {
       // Session may have been deleted
+      if (this.refreshVersion === version && this.refreshRead.isCurrent(signal)) {
+        this.markActiveSessionMissing(id, err);
+      }
     } finally {
       this.refreshRead.finish(signal);
     }
@@ -986,11 +1042,10 @@ class SessionsStore {
     const version = ++this.childSessionsVersion;
     const signal = this.childSessionsRead.begin();
     try {
-      configureGeneratedClient();
-      const children = await callGenerated(
-        () => SessionsService.getApiV1SessionsIdChildren({ id: parentId }),
-        signal,
-      ) as unknown as Session[];
+      const children = await SessionsService.getApiV1SessionsByIdChildren(
+        { id: parentId },
+        { signal },
+      );
       if (
         this.childSessionsVersion !== version ||
         this.activeSessionId !== parentId ||
@@ -1004,10 +1059,7 @@ class SessionsStore {
       }
       this.childSessions = map;
     } catch {
-      if (
-        this.childSessionsVersion !== version ||
-        this.activeSessionId !== parentId
-      ) {
+      if (this.childSessionsVersion !== version || this.activeSessionId !== parentId) {
         return;
       }
       this.childSessions = new Map();
@@ -1035,8 +1087,7 @@ class SessionsStore {
       if (this.signalDetailInflight.get(id) === promise) {
         this.signalDetailInflight.delete(id);
       }
-      this.signalDetailLoading =
-        this.signalDetailInflight.size > 0;
+      this.signalDetailLoading = this.signalDetailInflight.size > 0;
     }
   }
 
@@ -1044,11 +1095,7 @@ class SessionsStore {
     const signal = this.routeSignal();
     this.signalDetailLoading = true;
     try {
-      configureGeneratedClient();
-      const session = await callGenerated(
-        () => SessionsService.getApiV1SessionsId({ id }),
-        signal,
-      ) as unknown as Session;
+      const session = await SessionsService.getApiV1SessionsById({ id }, { signal });
       if (signal.aborted) return;
       this.signalDetailCache.set(id, {
         basis: session.health_score_basis ?? null,
@@ -1063,28 +1110,21 @@ class SessionsStore {
   private mergeDetailIntoList(id: string) {
     const detail = this.signalDetailCache.get(id);
     if (!detail) return;
-    const idx = this.sessions.findIndex(
-      (s) => s.id === id,
-    );
+    const idx = this.sessions.findIndex((s) => s.id === id);
     if (idx >= 0) {
       const s = this.sessions[idx]!;
-      if (
-        s.health_score_basis === undefined &&
-        detail.basis != null
-      ) {
+      if (s.health_score_basis === undefined && detail.basis != null) {
         this.sessions[idx] = {
           ...s,
           health_score_basis: detail.basis,
-          health_penalties: detail.penalties,
+          health_penalties: detail.penalties ?? undefined,
         };
       }
     }
   }
 
   navigateSession(delta: number, filter?: (s: Session) => boolean) {
-    const list = filter
-      ? this.sessions.filter(filter)
-      : this.sessions;
+    const list = filter ? this.sessions.filter(filter) : this.sessions;
     if (list.length === 0) return;
     const idx = list.findIndex((s) => s.id === this.activeSessionId);
     if (idx === -1) {
@@ -1112,23 +1152,24 @@ class SessionsStore {
     this.filters = { ...defaultFilters(), project, agent: prev.agent };
     this.dateFiltersWindowDays = null;
     this.setActiveSession(null);
-    if (prev.includeOneShot !== this.filters.includeOneShot ||
-        prev.includeAutomated !== this.filters.includeAutomated) {
+    if (
+      prev.includeOneShot !== this.filters.includeOneShot ||
+      prev.includeAutomated !== this.filters.includeAutomated ||
+      prev.automatedFilterSet !== this.filters.automatedFilterSet
+    ) {
       this.invalidateFilterCaches();
     }
-    this.load();
+    void this.load();
   }
 
   setMachineFilter(machine: string) {
     this.filters.machine = this.filters.machine === machine ? "" : machine;
     this.activeSessionId = null;
-    this.load();
+    void this.load();
   }
 
   toggleMachineFilter(machine: string) {
-    const current = this.filters.machine
-      ? this.filters.machine.split(",")
-      : [];
+    const current = this.filters.machine ? this.filters.machine.split(",") : [];
     const idx = current.indexOf(machine);
     if (idx >= 0) {
       current.splice(idx, 1);
@@ -1137,7 +1178,7 @@ class SessionsStore {
     }
     this.filters.machine = current.join(",");
     this.setActiveSession(null);
-    this.load();
+    void this.load();
   }
 
   isMachineSelected(machine: string): boolean {
@@ -1157,13 +1198,11 @@ class SessionsStore {
       this.filters.agent = agent;
     }
     this.setActiveSession(null);
-    this.load();
+    void this.load();
   }
 
   toggleAgentFilter(agent: string) {
-    const current = this.filters.agent
-      ? this.filters.agent.split(",")
-      : [];
+    const current = this.filters.agent ? this.filters.agent.split(",") : [];
     const idx = current.indexOf(agent);
     if (idx >= 0) {
       current.splice(idx, 1);
@@ -1172,7 +1211,7 @@ class SessionsStore {
     }
     this.filters.agent = current.join(",");
     this.setActiveSession(null);
-    this.load();
+    void this.load();
   }
 
   isAgentSelected(agent: string): boolean {
@@ -1188,13 +1227,13 @@ class SessionsStore {
   setRecentlyActiveFilter(active: boolean) {
     this.filters.recentlyActive = active;
     this.setActiveSession(null);
-    this.load();
+    void this.load();
   }
 
   setMinUserMessagesFilter(n: number) {
     this.filters.minUserMessages = n;
     this.setActiveSession(null);
-    this.load();
+    void this.load();
   }
 
   setHideUnknownProjectFilter(hide: boolean) {
@@ -1203,37 +1242,34 @@ class SessionsStore {
       this.filters.project = "";
     }
     this.setActiveSession(null);
-    this.load();
+    void this.load();
   }
 
   setIncludeOneShotFilter(include: boolean) {
     this.filters.includeOneShot = include;
     this.setActiveSession(null);
     this.invalidateFilterCaches();
-    this.load();
+    void this.load();
   }
 
   setIncludeAutomatedFilter(include: boolean) {
     this.filters.includeAutomated = include;
+    this.filters.automatedFilterSet = true;
     this.setActiveSession(null);
     this.invalidateFilterCaches();
-    this.load();
+    void this.load();
   }
 
   setTerminationFilter(termination: string) {
     this.filters.termination = termination;
     this.setActiveSession(null);
-    this.load();
+    void this.load();
   }
 
   /** Add or remove a status from the comma-separated termination
    * filter. Empty list means "no filter". */
   toggleTerminationStatus(status: string) {
-    const set = new Set(
-      this.filters.termination
-        .split(",")
-        .filter((s) => s.length > 0),
-    );
+    const set = new Set(this.filters.termination.split(",").filter((s) => s.length > 0));
     if (set.has(status)) set.delete(status);
     else set.add(status);
     this.setTerminationFilter([...set].join(","));
@@ -1243,12 +1279,47 @@ class SessionsStore {
    * the given status. Used by the multi-select pill UI. */
   hasTerminationStatus(status: string): boolean {
     if (!this.filters.termination) return false;
-    return this.filters.termination
-      .split(",")
-      .includes(status);
+    return this.filters.termination.split(",").includes(status);
+  }
+
+  /** Adds an exact-match label filter. Sessions must carry every label. */
+  addLabelFilter(label: string) {
+    const next = normalizeLabelFilters([...this.filters.labels, label]);
+    if (next.length === this.filters.labels.length) return;
+    this.filters.labels = next;
+    this.setActiveSession(null);
+    void this.load();
+  }
+
+  removeLabelFilter(label: string) {
+    const next = this.filters.labels.filter((l) => l !== label);
+    if (next.length === this.filters.labels.length) return;
+    this.filters.labels = next;
+    this.setActiveSession(null);
+    void this.load();
+  }
+
+  /** Sets the pull request filter; an empty value clears it. */
+  setPRFilter(pr: string) {
+    const next = pr.trim();
+    if (next === this.filters.pr) return;
+    this.filters.pr = next;
+    this.setActiveSession(null);
+    void this.load();
+  }
+
+  /** Label and pull request filters narrow only the session list; the
+   *  usage and analytics pages do not apply them. */
+  get hasSessionListOnlyFilters(): boolean {
+    return this.filters.labels.length > 0 || !!this.filters.pr;
   }
 
   get hasActiveFilters(): boolean {
+    return this.hasSharedFilters || this.hasSessionListOnlyFilters;
+  }
+
+  /** Filters the session list shares with the usage and analytics pages. */
+  get hasSharedFilters(): boolean {
     const f = this.filters;
     return !!(
       f.machine ||
@@ -1261,24 +1332,30 @@ class SessionsStore {
       f.date ||
       f.minUserMessages > 0 ||
       !f.includeOneShot ||
-      f.includeAutomated
+      f.includeAutomated ||
+      f.automatedFilterSet
     );
   }
 
   clearSessionFilters(options: ClearSessionFiltersOptions = {}) {
     const project = this.filters.project;
     const wasOneShot = this.filters.includeOneShot;
-    const wasAutomated = this.filters.includeAutomated;
+    const wasAutomated = this.filters.includeAutomated || this.filters.automatedFilterSet;
     if (options.clearDateYoke || hasDateFilters(this.filters)) {
       yokedDates.clear();
     }
-    this.filters = { ...defaultFilters(), project };
+    const filters = { ...defaultFilters(), project };
+    if (options.preserveLabelsAndPR) {
+      filters.labels = this.filters.labels;
+      filters.pr = this.filters.pr;
+    }
+    this.filters = filters;
     this.dateFiltersWindowDays = null;
     this.setActiveSession(null);
     if (wasOneShot !== this.filters.includeOneShot || wasAutomated) {
       this.invalidateFilterCaches();
     }
-    this.load();
+    void this.load();
   }
 
   /** Recently deleted session batches for undo toast. */
@@ -1287,9 +1364,7 @@ class SessionsStore {
 
   private newRecentlyDeletedTimer(key: number) {
     return setTimeout(() => {
-      this.recentlyDeleted = this.recentlyDeleted.filter(
-        (d) => d.key !== key,
-      );
+      this.recentlyDeleted = this.recentlyDeleted.filter((d) => d.key !== key);
     }, RECENTLY_DELETED_TTL_MS);
   }
 
@@ -1297,10 +1372,7 @@ class SessionsStore {
     if (ids.length === 0) return;
     const key = this.recentlyDeletedNextKey++;
     const timer = this.newRecentlyDeletedTimer(key);
-    this.recentlyDeleted = [
-      ...this.recentlyDeleted,
-      { key, ids: [...ids], timer },
-    ];
+    this.recentlyDeleted = [...this.recentlyDeleted, { key, ids: [...ids], timer }];
   }
 
   /** Multi-select state for batch operations. */
@@ -1333,8 +1405,7 @@ class SessionsStore {
   }
 
   async deleteSession(id: string) {
-    configureGeneratedClient();
-    await SessionsService.deleteApiV1SessionsId({ id });
+    await SessionsService.deleteApiV1SessionsById({ id });
     if (this.activeSessionId === id) {
       this.setActiveSession(null);
     }
@@ -1345,10 +1416,7 @@ class SessionsStore {
 
   async batchDeleteSessions(ids: string[]) {
     if (ids.length === 0) return;
-    configureGeneratedClient();
-    await SessionsService.postApiV1SessionsBatchDelete({
-      requestBody: { session_ids: ids },
-    });
+    await SessionsService.postApiV1SessionsBatchDelete({ session_ids: ids });
     const idSet = new Set(ids);
     if (this.activeSessionId && idSet.has(this.activeSessionId)) {
       this.setActiveSession(null);
@@ -1361,8 +1429,7 @@ class SessionsStore {
   }
 
   async restoreSession(id: string) {
-    configureGeneratedClient();
-    await SessionsService.postApiV1SessionsIdRestore({ id });
+    await SessionsService.postApiV1SessionsByIdRestore({ id });
     this.clearRecentlyDeleted(id);
     this.invalidateFilterCaches();
     await this.load();
@@ -1371,12 +1438,11 @@ class SessionsStore {
   async restoreRecentlyDeleted(deleted: RecentlyDeletedSessions) {
     const ids = [...deleted.ids];
     if (ids.length === 0) return;
-    configureGeneratedClient();
     clearTimeout(deleted.timer);
     const failed: string[] = [];
     for (const id of ids) {
       try {
-        await SessionsService.postApiV1SessionsIdRestore({ id });
+        await SessionsService.postApiV1SessionsByIdRestore({ id });
       } catch {
         failed.push(id);
       }
@@ -1392,8 +1458,8 @@ class SessionsStore {
 
   private get metadataParams(): MetadataParams {
     return {
-      includeOneShot: this.filters.includeOneShot || undefined,
-      includeAutomated: this.filters.includeAutomated || undefined,
+      include_one_shot: this.filters.includeOneShot || undefined,
+      include_automated: this.filters.includeAutomated || undefined,
     };
   }
 
@@ -1405,16 +1471,16 @@ class SessionsStore {
     this.machinesVersion++;
     this.machinesLoaded = false;
     this.machinesPromise = null;
-    this.loadAgents();
-    this.loadMachines();
-    sync.loadStats(this.metadataParams);
+    void this.loadAgents();
+    void this.loadMachines();
+    void sync.loadStats(this.metadataParams);
   }
 
   invalidateProjectCache() {
     this.projectsVersion++;
     this.projectsLoaded = false;
     this.projectsPromise = null;
-    this.loadProjects();
+    void this.loadProjects();
   }
 
   /** Remove one or all entries from the undo toast list. */
@@ -1435,10 +1501,7 @@ class SessionsStore {
     }
   }
 
-  private updateRecentlyDeletedBatch(
-    deleted: RecentlyDeletedSessions,
-    ids: string[],
-  ) {
+  private updateRecentlyDeletedBatch(deleted: RecentlyDeletedSessions, ids: string[]) {
     this.recentlyDeleted = this.recentlyDeleted.flatMap((d) => {
       if (d.key !== deleted.key) return [d];
       if (ids.length === 0) {
@@ -1456,11 +1519,10 @@ class SessionsStore {
   }
 
   async renameSession(id: string, displayName: string | null) {
-    configureGeneratedClient();
-    const updated = await SessionsService.patchApiV1SessionsIdRename({
-      id,
-      requestBody: { display_name: displayName },
-    }) as unknown as Session;
+    const updated = await SessionsService.patchApiV1SessionsByIdRename(
+      { id },
+      { display_name: displayName },
+    );
     const idx = this.sessions.findIndex((s) => s.id === id);
     if (idx !== -1) {
       const merged = { ...this.sessions[idx]!, ...updated };
@@ -1469,10 +1531,47 @@ class SessionsStore {
       // Explicitly null it out so the store reflects the cleared state rather
       // than keeping the stale value until the next SSE-triggered refresh.
       if (displayName === null && updated.display_name === undefined) {
-        merged.display_name = null;
+        merged.display_name = undefined;
       }
       this.sessions[idx] = merged;
     }
+  }
+
+  async assignSessionProject(id: string, project: string) {
+    const assignment = await SettingsService.putApiV1SettingsSessionProjectAssignmentsBySessionId(
+      {
+        sessionId: id,
+      },
+      { project },
+    );
+    const idx = this.sessions.findIndex((session) => session.id === id);
+    if (idx !== -1) {
+      this.sessions[idx] = {
+        ...this.sessions[idx]!,
+        project: assignment.project,
+        project_assigned: true,
+      };
+    }
+    this.invalidateProjectCache();
+    await this.load({ force: true });
+    return assignment.project;
+  }
+
+  async clearSessionProjectAssignment(id: string) {
+    const cleared = await SettingsService.deleteApiV1SettingsSessionProjectAssignmentsBySessionId({
+      sessionId: id,
+    });
+    const idx = this.sessions.findIndex((session) => session.id === id);
+    if (idx !== -1) {
+      this.sessions[idx] = {
+        ...this.sessions[idx]!,
+        project: cleared.project,
+        project_assigned: false,
+      };
+    }
+    this.invalidateProjectCache();
+    await this.load({ force: true });
+    return cleared.project;
   }
 
   private startLiveRefresh() {
@@ -1481,14 +1580,11 @@ class SessionsStore {
     this.unsubEvents = events.subscribe((event) => {
       this.handleLiveRefreshEvent(event);
     });
-    this.safetyNetTimer = setInterval(
-      () => {
-        this.load();
-        this.refreshActiveChildSessions();
-        this.bumpActiveSessionUsageVersion();
-      },
-      SAFETY_NET_REFRESH_MS,
-    );
+    this.safetyNetTimer = setInterval(() => {
+      void this.load();
+      this.refreshActiveChildSessions();
+      this.bumpActiveSessionUsageVersion();
+    }, SAFETY_NET_REFRESH_MS);
   }
 
   private handleLiveRefreshEvent(event: DataChangedEvent) {
@@ -1499,6 +1595,7 @@ class SessionsStore {
       return;
     }
     if (event.scope === "sessions" || event.scope === "sync") {
+      if (event.scope === "sessions") void this.refreshActiveSession();
       this.invalidateProjectCache();
       this.scheduleIndexRefresh();
       this.bumpActiveSessionUsageVersion();
@@ -1513,7 +1610,7 @@ class SessionsStore {
     }
     this.liveRefreshTimer = setTimeout(() => {
       this.liveRefreshTimer = null;
-      this.load();
+      void this.load();
     }, LIVE_REFRESH_DEBOUNCE_MS);
   }
 
@@ -1582,26 +1679,36 @@ export function createSessionsStore(): SessionsStore {
   return new SessionsStore();
 }
 
-function sidebarIndexRowToSession(
-  row: SidebarSessionIndexRow,
-  existing?: Session,
-): Session {
+function sidebarIndexRowToSession(row: SidebarSessionIndexRow, existing?: Session): Session {
   const skinny: Session = {
+    compaction_count: 0,
+    consecutive_failure_max: 0,
+    edit_churn_count: 0,
+    ended_with_role: "",
+    final_failure_streak: 0,
+    mid_task_compaction_count: 0,
+    outcome: "",
+    outcome_confidence: "",
+    secret_leak_count: 0,
+    tool_failure_signal_count: 0,
+    tool_retry_count: 0,
     id: row.id,
     project: row.project,
+    project_assigned: row.project_assigned ?? false,
     machine: row.machine,
     agent: row.agent,
     agent_label: row.agent_label ?? undefined,
     entrypoint: row.entrypoint ?? undefined,
     first_message: null,
-    display_name: row.display_name ?? null,
+    display_name: row.display_name ?? undefined,
     started_at: row.started_at,
     ended_at: row.ended_at,
     message_count: row.message_count,
     user_message_count: row.user_message_count,
     parent_session_id: row.parent_session_id ?? undefined,
+    parent_session_ids: row.parent_session_ids,
     relationship_type: row.relationship_type ?? undefined,
-    termination_status: row.termination_status ?? null,
+    termination_status: row.termination_status ?? undefined,
     total_output_tokens: 0,
     peak_context_tokens: 0,
     has_total_output_tokens: false,
@@ -1617,6 +1724,7 @@ function sidebarIndexRowToSession(
     ...skinny,
     ...existing,
     project: skinny.project,
+    project_assigned: skinny.project_assigned,
     machine: skinny.machine,
     agent: skinny.agent,
     agent_label: skinny.agent_label,
@@ -1627,6 +1735,7 @@ function sidebarIndexRowToSession(
     message_count: skinny.message_count,
     user_message_count: skinny.user_message_count,
     parent_session_id: skinny.parent_session_id,
+    parent_session_ids: skinny.parent_session_ids,
     relationship_type: skinny.relationship_type,
     termination_status: skinny.termination_status,
     transcript_revision: skinny.transcript_revision,
@@ -1675,13 +1784,7 @@ setInterval(() => {
   now = Date.now();
 }, 30_000);
 
-export type SessionStatus =
-  | "working"
-  | "waiting"
-  | "idle"
-  | "stale"
-  | "unclean"
-  | "quiet";
+export type SessionStatus = "working" | "waiting" | "idle" | "stale" | "unclean" | "quiet";
 
 /** Combine wall-clock recency with the parser's structural fact
  * (termination_status) into a single user-facing status.
@@ -1782,9 +1885,31 @@ function findRoot(
   return cur;
 }
 
-export function buildSessionGroups(
-  sessions: SessionGroupInput[],
-): SessionGroup[] {
+// A hosted equal-content child may belong to several proven parent cohorts.
+// Keep every reachable loaded root, without choosing a representative parent.
+function findPublicRoots(id: string, byId: Map<string, SessionGroupInput>): string[] {
+  const pending = [id];
+  const visited = new Set<string>();
+  const roots = new Set<string>();
+  while (pending.length) {
+    const current = pending.pop()!;
+    if (visited.has(current)) continue;
+    visited.add(current);
+    const row = byId.get(current);
+    const parents = (
+      row?.parent_session_ids?.length
+        ? row.parent_session_ids
+        : row?.parent_session_id
+          ? [row.parent_session_id]
+          : []
+    ).filter((parent) => byId.has(parent));
+    if (!parents.length) roots.add(current);
+    else pending.push(...parents);
+  }
+  return [...roots].sort();
+}
+
+export function buildSessionGroups(sessions: SessionGroupInput[]): SessionGroup[] {
   const byId = new Map<string, SessionGroupInput>();
   for (const s of sessions) {
     byId.set(s.id, s);
@@ -1794,33 +1919,37 @@ export function buildSessionGroups(
   const groupMap = new Map<string, SessionGroup>();
   const insertionOrder: string[] = [];
 
+  const pluralParents = sessions.some((s) => s.parent_session_ids?.length);
   for (const s of sessions) {
-    const root = findRoot(s.id, byId, rootCache);
-    // Sessions without a parent_session_id that aren't
-    // pointed to by anyone get root == their own id, so
-    // they form a single-session group naturally.
-    const key = root;
+    const roots = pluralParents ? findPublicRoots(s.id, byId) : [findRoot(s.id, byId, rootCache)];
+    if (!roots.length) roots.push(findRoot(s.id, byId, rootCache));
+    for (const root of roots) {
+      // Sessions without a parent_session_id that aren't
+      // pointed to by anyone get root == their own id, so
+      // they form a single-session group naturally.
+      const key = root;
 
-    let group = groupMap.get(key);
-    if (!group) {
-      group = {
-        key,
-        project: s.project,
-        sessions: [],
-        primarySessionId: s.id,
-        totalMessages: 0,
-        firstMessage: null,
-        startedAt: null,
-        endedAt: null,
-      };
-      groupMap.set(key, group);
-      insertionOrder.push(key);
+      let group = groupMap.get(key);
+      if (!group) {
+        group = {
+          key,
+          project: s.project,
+          sessions: [],
+          primarySessionId: s.id,
+          totalMessages: 0,
+          firstMessage: null,
+          startedAt: null,
+          endedAt: null,
+        };
+        groupMap.set(key, group);
+        insertionOrder.push(key);
+      }
+
+      group.sessions.push(s);
+      group.totalMessages += s.message_count;
+      group.startedAt = minString(group.startedAt, s.started_at);
+      group.endedAt = maxString(group.endedAt, s.ended_at);
     }
-
-    group.sessions.push(s);
-    group.totalMessages += s.message_count;
-    group.startedAt = minString(group.startedAt, s.started_at);
-    group.endedAt = maxString(group.endedAt, s.ended_at);
   }
 
   // Adopt orphaned teammate sessions so they NEVER appear at root level.
@@ -1937,15 +2066,10 @@ export function buildSessionGroups(
 
     // For groups containing subagent children, the root session
     // should always be the main entry (not the most recent child).
-    const hasSubagents = group.sessions.some(
-      (s) => s.relationship_type === "subagent",
-    );
+    const hasSubagents = group.sessions.some((s) => s.relationship_type === "subagent");
     if (hasSubagents) {
       const rootIdx = group.sessions.findIndex((s) => s.id === group.key);
-      group.primarySessionId =
-        rootIdx >= 0
-          ? group.sessions[rootIdx]!.id
-          : group.sessions[0]!.id;
+      group.primarySessionId = rootIdx >= 0 ? group.sessions[rootIdx]!.id : group.sessions[0]!.id;
     } else {
       // For continuation chains, use the most recently active session.
       let bestIdx = 0;
@@ -1961,9 +2085,7 @@ export function buildSessionGroups(
     }
   }
 
-  const ordered = insertionOrder
-    .filter((k) => !keysToRemove.has(k))
-    .map((k) => groupMap.get(k)!);
+  const ordered = insertionOrder.filter((k) => !keysToRemove.has(k)).map((k) => groupMap.get(k)!);
 
   // Two-key sort:
   //   1. status priority — working → waiting → idle → stale →
@@ -1989,9 +2111,7 @@ export function buildSessionGroups(
 }
 
 function statusSortKey(group: SessionGroup): number {
-  const primary =
-    group.sessions.find((s) => s.id === group.primarySessionId) ??
-    group.sessions[0]!;
+  const primary = group.sessions.find((s) => s.id === group.primarySessionId) ?? group.sessions[0]!;
   const status = getSessionStatus(primary, group.sessions);
   switch (status) {
     case "working":

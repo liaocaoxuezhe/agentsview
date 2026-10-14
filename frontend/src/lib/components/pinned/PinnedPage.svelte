@@ -8,11 +8,12 @@
     XIcon,
   } from "../../icons.js";
   import { pins } from "../../stores/pins.svelte.js";
+  import { generatedErrorMessage } from "../../api/runtime.js";
   import { sessions } from "../../stores/sessions.svelte.js";
   import { router } from "../../stores/router.svelte.js";
   import { ui } from "../../stores/ui.svelte.js";
   import { formatRelativeTime, truncate } from "../../utils/format.js";
-  import { renderMarkdown } from "../../utils/markdown.js";
+  import { loadAssetImages, renderMarkdown } from "../../utils/markdown.js";
   import { highlightCodeFences } from "../../utils/highlight-fences.js";
   import { copyToClipboard } from "../../utils/clipboard.js";
   import { normalizeMessagePreview } from "../../utils/messages.js";
@@ -24,6 +25,19 @@
 
   /** Set of expanded pin IDs. */
   let expanded: Set<number> = $state(new Set());
+  let pinError = $state("");
+  let failedPinId: number | null = $state(null);
+
+  async function unpin(pin: import("../../api/generated/index.js").DbPinnedMessage) {
+    pinError = "";
+    try {
+      if (pin.message_key) await pins.removeReference(pin);
+      else await pins.unpin(pin.session_id, pin.message_id);
+    } catch (error) {
+      failedPinId = pin.id;
+      pinError = generatedErrorMessage(error);
+    }
+  }
 
   function toggleExpand(pinId: number) {
     const next = new Set(expanded);
@@ -37,7 +51,7 @@
     router.navigateToSession(sessionId);
   }
 
-  function getSessionInfo(pin: import("../../api/types.js").PinnedMessage) {
+  function getSessionInfo(pin: import("../../api/generated/index.js").DbPinnedMessage) {
     // Use backend-provided session metadata (available for all-pins
     // query). Fall back to the sessions store for older data.
     if (pin.session_project || pin.session_agent) {
@@ -116,12 +130,13 @@
     </EmptyState>
   {:else}
     <div class="pin-list">
-      {#each pins.pins as pin (pin.id)}
+      {#each pins.pins as pin (`${pin.session_id}:${pin.message_key ?? pin.id}`)}
         {@const info = getSessionInfo(pin)}
         {@const isExpanded = expanded.has(pin.id)}
         {@const preview = previewContent(pin.content)}
         {@const hasMore = (pin.content?.length ?? 0) > 300}
         <div class="pin-card" class:expanded={isExpanded}>
+          {#if pinError && failedPinId === pin.id}<p role="alert">{pinError}</p>{/if}
           <div class="pin-card-header">
             <span
               class="role-badge"
@@ -136,14 +151,20 @@
             <span class="pin-time">{formatRelativeTime(pin.created_at)}</span>
           </div>
 
+          {#if pin.unresolved}
+            <div class="pin-content-preview">{m.pinned_unresolved()}</div>
+          {/if}
           {#if preview}
             <div class="pin-content-wrap">
               {#if isExpanded && pin.content}
                 <div
                   class="pin-content-full markdown"
                   use:highlightCodeFences={{ content: pin.content }}
+                  use:loadAssetImages={pin.content}
                 >
-                  {@html renderMarkdown(pin.content)}
+                  {@html renderMarkdown(pin.content, {
+                    renderUnknownXmlBlocksAsPreformatted: ui.renderUnknownXmlBlocksAsPreformatted,
+                  })}
                 </div>
               {:else}
                 <div class="pin-content-preview">{preview}</div>
@@ -154,6 +175,7 @@
           <div class="pin-card-footer">
             <button
               class="pin-card-meta"
+              disabled={pin.unresolved}
               onclick={() => navigateToPin(pin.session_id, pin.ordinal)}
               title={m.pinned_go_to_message()}
             >
@@ -180,7 +202,7 @@
               <button
                 class="unpin-btn"
                 title={m.pinned_unpin()}
-                onclick={() => pins.unpin(pin.session_id, pin.message_id)}
+                onclick={() => unpin(pin)}
               >
                 <XIcon size="12" strokeWidth="2.4" aria-hidden="true" />
               </button>
@@ -348,7 +370,7 @@
     border-radius: 4px;
     padding: 0.15em 0.4em;
   }
-  .pin-content-full :global(pre) {
+  .pin-content-full :global(pre:not(.unknown-xml-block)) {
     background: var(--code-bg);
     color: var(--code-text);
     border-radius: var(--radius-md);

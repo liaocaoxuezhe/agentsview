@@ -1,6 +1,7 @@
 package main
 
 import (
+	"context"
 	"database/sql"
 	"errors"
 	"fmt"
@@ -36,6 +37,7 @@ type doctorDBInspection struct {
 	DBExists                 bool
 	DBReadable               bool
 	DBError                  error
+	ArchiveOnly              bool
 	UserVersion              *int
 	SessionCounts            []doctorDataVersionCount
 	SessionCountsErr         error
@@ -70,6 +72,7 @@ func newDoctorCommand() *cobra.Command {
 		},
 	}
 	cmd.AddCommand(newDoctorSyncCommand())
+	cmd.AddCommand(newDoctorMemoryCommand())
 	return cmd
 }
 
@@ -84,24 +87,26 @@ func newDoctorSyncCommand() *cobra.Command {
 			if err != nil {
 				return err
 			}
-			return runDoctorSync(cmd.OutOrStdout(), cfg)
+			return runDoctorSync(cmd.Context(), cmd.OutOrStdout(), cfg)
 		},
 	}
 }
 
-func runDoctorSync(w io.Writer, cfg config.Config) error {
-	report := collectDoctorSyncReport(cfg)
+func runDoctorSync(ctx context.Context, w io.Writer, cfg config.Config) error {
+	report := collectDoctorSyncReport(ctx, cfg)
 	writeDoctorSyncReport(w, report)
 	return nil
 }
 
-func collectDoctorSyncReport(cfg config.Config) doctorSyncReport {
-	report := doctorSyncReport{Config: cfg}
+func collectDoctorSyncReport(ctx context.Context, cfg config.Config) doctorSyncReport {
+	report := doctorSyncReport{
+		Config: cfg,
 
-	report.doctorDBInspection = inspectDoctorDB(cfg.DBPath)
-	report.TempFiles = listDoctorResyncTempFiles(cfg.DBPath)
-	report.AgentRoots = collectDoctorAgentRoots(cfg)
-	report.TraeEncryptedRoots = collectDoctorTraeEncryptedRoots(report.AgentRoots)
+		doctorDBInspection: inspectDoctorDB(ctx, cfg.DBPath),
+		TempFiles:          listDoctorResyncTempFiles(cfg.DBPath),
+		AgentRoots:         collectDoctorAgentRoots(cfg),
+	}
+	report.TraeEncryptedRoots = collectDoctorTraeEncryptedRoots(ctx, report.AgentRoots)
 	report.DebugLines, report.DebugLogErr = readDoctorDebugLines(
 		filepath.Join(cfg.DataDir, "debug.log"),
 	)
@@ -111,7 +116,7 @@ func collectDoctorSyncReport(cfg config.Config) doctorSyncReport {
 	return report
 }
 
-func inspectDoctorDB(path string) doctorDBInspection {
+func inspectDoctorDB(ctx context.Context, path string) doctorDBInspection {
 	var insp doctorDBInspection
 	info, err := os.Stat(path)
 	if err != nil {
@@ -122,7 +127,7 @@ func inspectDoctorDB(path string) doctorDBInspection {
 	}
 	insp.DBExists = true
 	if info.IsDir() {
-		insp.DBError = fmt.Errorf("database path is a directory")
+		insp.DBError = errors.New("database path is a directory")
 		return insp
 	}
 
@@ -134,15 +139,16 @@ func inspectDoctorDB(path string) doctorDBInspection {
 	defer conn.Close()
 
 	var version int
-	if err := conn.QueryRow("PRAGMA user_version").Scan(&version); err != nil {
+	if err := conn.QueryRowContext(ctx, "PRAGMA user_version").Scan(&version); err != nil {
 		insp.DBError = err
 		return insp
 	}
+	version, insp.ArchiveOnly = db.DecodeUserVersion(version)
 	insp.DBReadable = true
 	insp.UserVersion = &version
 
-	rows, err := conn.Query(
-		"SELECT data_version, COUNT(*) FROM sessions " +
+	rows, err := conn.QueryContext(ctx,
+		"SELECT data_version, COUNT(*) FROM sessions "+
 			"GROUP BY data_version ORDER BY data_version",
 	)
 	if err != nil {
@@ -167,13 +173,13 @@ func inspectDoctorDB(path string) doctorDBInspection {
 	// One scan collects both Antigravity operator counts: antigravity-cli
 	// summary-mode sessions (transcript fidelity) and sessions on an
 	// unrecognized schema across both Antigravity agents (decode confidence).
-	row := conn.QueryRow(
-		"SELECT " +
-			"COUNT(*) FILTER (WHERE agent = 'antigravity-cli'), " +
-			"COUNT(*) FILTER (WHERE agent = 'antigravity-cli' " +
-			"AND transcript_fidelity = 'summary'), " +
-			"COUNT(*) FILTER (WHERE agent IN ('antigravity', 'antigravity-cli') " +
-			"AND source_version LIKE 'agy-schema:%') " +
+	row := conn.QueryRowContext(ctx,
+		"SELECT "+
+			"COUNT(*) FILTER (WHERE agent = 'antigravity-cli'), "+
+			"COUNT(*) FILTER (WHERE agent = 'antigravity-cli' "+
+			"AND transcript_fidelity = 'summary'), "+
+			"COUNT(*) FILTER (WHERE agent IN ('antigravity', 'antigravity-cli') "+
+			"AND source_version LIKE 'agy-schema:%') "+
 			"FROM sessions",
 	)
 	var total, summary, unknownSchema int
@@ -190,7 +196,7 @@ func inspectDoctorDB(path string) doctorDBInspection {
 	// under a binary predating the findings-before-signals write
 	// ordering. The filtered signals backfill deliberately does not
 	// revisit them (see db.BackfillSignals), so surface them here.
-	if err := conn.QueryRow(
+	if err := conn.QueryRowContext(ctx,
 		`SELECT COUNT(*) FROM sessions
 		 WHERE quality_signal_version >= ?
 		   AND secrets_rules_version = ''
@@ -326,6 +332,9 @@ func writeDoctorSyncReport(w io.Writer, report doctorSyncReport) {
 	} else {
 		fmt.Fprintf(w, "SQLite user_version: %d\n", *report.UserVersion)
 	}
+	if report.ArchiveOnly {
+		fmt.Fprintln(w, "Archive mode: archive-only")
+	}
 	fmt.Fprintf(w, "Binary data version: %d\n", currentVersion)
 	fmt.Fprintf(w, "Startup sync decision: %s\n",
 		doctorStartupDecision(report, currentVersion))
@@ -349,10 +358,10 @@ func writeDoctorTraeEncryptedLayouts(w io.Writer, report doctorSyncReport) {
 	}
 }
 
-func collectDoctorTraeEncryptedRoots(roots []doctorAgentRoot) []string {
+func collectDoctorTraeEncryptedRoots(ctx context.Context, roots []doctorAgentRoot) []string {
 	var detected []string
 	for _, root := range roots {
-		if root.Agent == parser.AgentTrae && root.Exists && parser.TraeEncryptedLayoutDetected(root.Path) {
+		if root.Agent == parser.AgentTrae && root.Exists && parser.TraeEncryptedLayoutDetected(ctx, root.Path) {
 			detected = append(detected, root.Path)
 		}
 	}
@@ -376,6 +385,9 @@ func doctorStartupDecision(
 	}
 	if *report.UserVersion > currentVersion {
 		return "refuse startup (database requires newer agentsview)"
+	}
+	if report.ArchiveOnly {
+		return "archive-only; source sync is disabled"
 	}
 	return "normal initial sync (no data-version resync)"
 }
@@ -521,6 +533,9 @@ func doctorLikelyCause(
 			"SQLite user_version is newer than this binary. Use an AgentsView build with data version %d or newer, or restore an archive backup compatible with data version %d",
 			*report.UserVersion, currentVersion,
 		)
+	}
+	if report.ArchiveOnly {
+		return "archive-only; source sync is disabled"
 	}
 	return "data-version resync is not expected; Running initial sync... is normal incremental startup work"
 }

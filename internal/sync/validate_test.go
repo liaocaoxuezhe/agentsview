@@ -249,7 +249,7 @@ func TestSanitizeMessageContentLengthDelta(t *testing.T) {
 
 		stats := sanitizeMessage(&m)
 
-		assert.Equal(t, "", m.Content)
+		assert.Empty(t, m.Content)
 		assert.Equal(t, 0, stats.ControlCharsStripped, "nothing should be stripped")
 		assert.Equal(t, 4096, m.ContentLength,
 			"tool-only ContentLength must not be overwritten to len(Content)=0")
@@ -259,7 +259,7 @@ func TestSanitizeMessageContentLengthDelta(t *testing.T) {
 		raw := "before\x1b]0;title\x07after"
 		sanitized := "before]0;titleafter"
 		removed := len(raw) - len(sanitized)
-		require.Greater(t, removed, 0, "this case requires bytes to be stripped")
+		require.Positive(t, removed, "this case requires bytes to be stripped")
 		// Semantic length intentionally larger than len(Content).
 		semantic := len(raw) + 100
 		m := db.Message{
@@ -283,7 +283,7 @@ func TestSanitizeMessageContentLengthDelta(t *testing.T) {
 		rawThinking := "think\x1b]0;title\x07more"
 		sanitizedThinking := "think]0;titlemore"
 		removed := len(rawThinking) - len(sanitizedThinking)
-		require.Greater(t, removed, 0, "this case requires thinking bytes to be stripped")
+		require.Positive(t, removed, "this case requires thinking bytes to be stripped")
 		m := db.Message{
 			Role:          "assistant",
 			Content:       content,
@@ -364,7 +364,7 @@ func TestSanitizeUsageEvent(t *testing.T) {
 	assert.Equal(t, 10, ev.OutputTokens)
 	assert.Equal(t, 0, ev.CacheCreationInputTokens)
 	assert.Equal(t, maxPlausibleTokens, ev.ReasoningTokens)
-	assert.Equal(t, "", ev.OccurredAt)
+	assert.Empty(t, ev.OccurredAt)
 	assert.Equal(t, "ok", ev.CostStatus)
 
 	assert.Equal(t, 1, stats.ControlCharsStripped)
@@ -393,6 +393,7 @@ func TestSanitizeSession(t *testing.T) {
 	good := "2026-06-20T10:00:00Z"
 	s := db.Session{
 		Project:      "proj\x1bx",
+		GroupKey:     "job\x00-a",
 		Machine:      "host",
 		AgentLabel:   "tri\x07age",
 		Entrypoint:   "sdk\x00cli",
@@ -405,6 +406,7 @@ func TestSanitizeSession(t *testing.T) {
 	stats := sanitizeSession(&s)
 
 	assert.Equal(t, "projx", s.Project)
+	assert.Equal(t, "job-a", s.GroupKey)
 	assert.Equal(t, "host", s.Machine)
 	assert.Equal(t, "triage", s.AgentLabel)
 	assert.Equal(t, "sdkcli", s.Entrypoint)
@@ -416,8 +418,8 @@ func TestSanitizeSession(t *testing.T) {
 	require.NotNil(t, s.EndedAt)
 	assert.Equal(t, good, *s.EndedAt)
 
-	// project + agent label + entrypoint + first message
-	assert.Equal(t, 4, stats.ControlCharsStripped)
+	// project + group key + agent label + entrypoint + first message
+	assert.Equal(t, 5, stats.ControlCharsStripped)
 	assert.Equal(t, 1, stats.TimestampsBlanked)
 }
 
@@ -439,7 +441,7 @@ func TestValidateAndSanitizeAggregatesStats(t *testing.T) {
 	assert.Equal(t, 1, stats.ModelClamped)
 	assert.Equal(t, 1, stats.TokensClamped)
 
-	assert.Equal(t, "", msgs[0].Role)
+	assert.Empty(t, msgs[0].Role)
 	assert.Equal(t, "c", msgs[0].Content)
 	assert.Equal(t, strings.Repeat("z", maxModelLen), msgs[1].Model)
 	assert.Equal(t, 0, events[0].InputTokens)

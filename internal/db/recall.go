@@ -14,14 +14,12 @@ import (
 )
 
 const (
-	DefaultRecallEntryLimit          = 50
-	MaxRecallEntryLimit              = 500
-	MaxRecallSearchTerms             = corerecall.MaxScoringQueryTerms
-	recallFTS4PreselectLimit         = 50000
-	recallEvidenceFTS4PreselectLimit = 50000
-	RecallQueryModeLexical           = "lexical"
-	RecallQueryModeVector            = "vector"
-	RecallQueryModeHybrid            = "hybrid"
+	DefaultRecallEntryLimit = 50
+	MaxRecallEntryLimit     = 500
+	MaxRecallSearchTerms    = corerecall.MaxScoringQueryTerms
+	RecallQueryModeLexical  = "lexical"
+	RecallQueryModeVector   = "vector"
+	RecallQueryModeHybrid   = "hybrid"
 )
 
 type RecallEntry struct {
@@ -140,8 +138,6 @@ const recallBaseColsQualified = `recall_entries.id, recall_entries.type,
 // ErrInvalidRecallQuery identifies contradictory or unsupported recall filters.
 var ErrInvalidRecallQuery = errors.New("invalid recall query")
 
-var errRecallFTSCandidateQueryUnavailable = errors.New("recall fts candidate query unavailable")
-
 func scanRecallEntryRow(rs rowScanner) (RecallEntry, error) {
 	var m RecallEntry
 	var confidence sql.NullFloat64
@@ -171,7 +167,10 @@ func scanRecallEvidenceRow(rs rowScanner) (RecallEvidence, error) {
 	return e, err
 }
 
-func (db *DB) InsertRecallEntry(m RecallEntry) (string, error) {
+func (db *DB) InsertRecallEntry(ctx context.Context, m RecallEntry) (string, error) {
+	if err := db.requireDerivedTextStorage("recall entries"); err != nil {
+		return "", err
+	}
 	if err := normalizeRecallEntryReviewState(&m); err != nil {
 		return "", err
 	}
@@ -179,19 +178,19 @@ func (db *DB) InsertRecallEntry(m RecallEntry) (string, error) {
 	defer db.mu.Unlock()
 
 	if m.ID == "" {
-		return "", fmt.Errorf("recall entry id is required")
+		return "", errors.New("recall entry id is required")
 	}
 	if m.Status == "" {
 		m.Status = corerecall.StatusAccepted
 	}
 
-	tx, err := db.getWriter().Begin()
+	tx, err := db.getWriter().Begin(ctx)
 	if err != nil {
 		return "", fmt.Errorf("begin recall insert: %w", err)
 	}
 	defer func() { _ = tx.Rollback() }()
 
-	if err := insertRecallEntryTx(tx, m); err != nil {
+	if err := insertRecallEntryTx(ctx, tx, m); err != nil {
 		return "", err
 	}
 
@@ -213,6 +212,9 @@ func (db *DB) InsertRecallEntry(m RecallEntry) (string, error) {
 // covers every entry; parser-excluded sessions are the exception. Any skipped
 // entries are logged.
 func (db *DB) CopyRecallEntriesFrom(sourcePath string) error {
+	if err := db.requireDerivedTextStorage("recall entries"); err != nil {
+		return err
+	}
 	db.mu.Lock()
 	defer db.mu.Unlock()
 
@@ -233,6 +235,11 @@ func (db *DB) CopyRecallEntriesFrom(sourcePath string) error {
 	defer func() {
 		_, _ = conn.ExecContext(ctx, "DETACH DATABASE old_db")
 	}()
+
+	if _, err := prepareCodexSessionIDMap(ctx, conn, false); err != nil {
+		return err
+	}
+	defer func() { _, _ = conn.ExecContext(ctx, dropCodexSessionIDMapSQL) }()
 
 	tx, err := conn.BeginTx(ctx, nil)
 	if err != nil {
@@ -271,12 +278,13 @@ func (db *DB) CopyRecallEntriesFrom(sourcePath string) error {
 		SELECT
 			id, type, scope, status, review_state, title, body, trigger,
 			confidence, uncertainty, project, cwd, git_branch, agent,
-			source_session_id, source_episode_id, source_run_id,
+			COALESCE(mapped.target_id, source_session_id), source_episode_id, source_run_id,
 			extractor_method, model, transferable, provenance_ok,
 			supersedes_entry_id, superseded_by_entry_id,
 			created_at, updated_at
 		FROM old_db.recall_entries
-		WHERE source_session_id IN (SELECT id FROM main.sessions)`)
+		LEFT JOIN _codex_page_metadata mapped ON mapped.source_id = source_session_id
+		WHERE COALESCE(mapped.target_id, source_session_id) IN (SELECT id FROM main.sessions)`)
 	if err != nil {
 		return fmt.Errorf("copying entries: %w", err)
 	}
@@ -299,12 +307,13 @@ func (db *DB) CopyRecallEntriesFrom(sourcePath string) error {
 			message_end_source_uuid, content_digest, tool_use_id, snippet
 		)
 		SELECT
-			entry_id, session_id, message_start_ordinal,
+			entry_id, COALESCE(mapped.target_id, session_id), message_start_ordinal,
 			message_end_ordinal, message_start_source_uuid,
 			message_end_source_uuid, content_digest, tool_use_id, snippet
 		FROM old_db.recall_evidence
+		LEFT JOIN _codex_page_metadata mapped ON mapped.source_id = session_id
 		WHERE entry_id IN (SELECT id FROM main.recall_entries)
-		  AND session_id IN (SELECT id FROM main.sessions)`); err != nil {
+		  AND COALESCE(mapped.target_id, session_id) IN (SELECT id FROM main.sessions)`); err != nil {
 		return fmt.Errorf("copying recall evidence: %w", err)
 	}
 	if err := revokeRecallEntriesWithDroppedEvidenceTx(
@@ -466,6 +475,7 @@ func revokeRecallEntriesWithDroppedEvidenceTx(
 	if err != nil {
 		return fmt.Errorf("querying recall with dropped evidence: %w", err)
 	}
+	defer rows.Close()
 	type droppedEvidenceEntry struct {
 		id        string
 		sessionID string
@@ -505,15 +515,18 @@ func (db *DB) SupersedeRecallEntry(
 	oldID string,
 	replacement RecallEntry,
 ) (string, error) {
+	if err := db.requireDerivedTextStorage("recall entries"); err != nil {
+		return "", err
+	}
 	oldID = strings.TrimSpace(oldID)
 	if oldID == "" {
-		return "", fmt.Errorf("superseded entry id is required")
+		return "", errors.New("superseded entry id is required")
 	}
 	if replacement.ID == "" {
-		return "", fmt.Errorf("replacement entry id is required")
+		return "", errors.New("replacement entry id is required")
 	}
 	if replacement.ID == oldID {
-		return "", fmt.Errorf("replacement entry id must differ from superseded entry id")
+		return "", errors.New("replacement entry id must differ from superseded entry id")
 	}
 	if err := normalizeRecallEntryReviewState(&replacement); err != nil {
 		return "", err
@@ -558,7 +571,7 @@ func supersedeRecallEntryTx(
 		return err
 	}
 
-	if err := insertRecallEntryTx(tx, replacement); err != nil {
+	if err := insertRecallEntryTx(ctx, tx, replacement); err != nil {
 		return err
 	}
 	result, err := tx.ExecContext(ctx, `
@@ -606,14 +619,14 @@ func requireActiveRecallSupersessionTarget(
 	return nil
 }
 
-func insertRecallEntryTx(tx *sql.Tx, m RecallEntry) error {
+func insertRecallEntryTx(ctx context.Context, tx *sql.Tx, m RecallEntry) error {
 	if err := normalizeRecallEntryReviewState(&m); err != nil {
 		return err
 	}
 	if err := validateRecallEvidenceOwnership(m); err != nil {
 		return err
 	}
-	_, err := tx.Exec(`
+	_, err := tx.ExecContext(ctx, `
 		INSERT INTO recall_entries (
 			id, type, scope, status, review_state, title, body, trigger,
 			confidence, uncertainty, project, cwd, git_branch, agent,
@@ -632,7 +645,7 @@ func insertRecallEntryTx(tx *sql.Tx, m RecallEntry) error {
 	}
 
 	for _, e := range m.Evidence {
-		_, err = tx.Exec(`
+		_, err = tx.ExecContext(ctx, `
 			INSERT INTO recall_evidence (
 				entry_id, session_id, message_start_ordinal,
 				message_end_ordinal, message_start_source_uuid,
@@ -685,7 +698,7 @@ func (db *DB) GetRecallEntry(ctx context.Context, id string) (*RecallEntry, erro
 		id,
 	)
 	m, err := scanRecallEntryRow(row)
-	if err == sql.ErrNoRows {
+	if errors.Is(err, sql.ErrNoRows) {
 		return nil, nil
 	}
 	if err != nil {
@@ -832,20 +845,6 @@ func (db *DB) listRecallEntriesForTemporalRanking(
 func (db *DB) listRecallFTSCandidates(
 	ctx context.Context, q RecallQuery, terms []string,
 ) ([]RecallEntry, error) {
-	kind := db.recallFTSKind(ctx)
-	switch kind {
-	case "fts5":
-		return db.listRecallFTS5Candidates(ctx, q, terms)
-	case "fts4":
-		return db.listRecallFTS4RowIDCandidates(ctx, q, terms)
-	default:
-		return nil, errRecallFTSCandidateQueryUnavailable
-	}
-}
-
-func (db *DB) listRecallFTS5Candidates(
-	ctx context.Context, q RecallQuery, terms []string,
-) ([]RecallEntry, error) {
 	where, args := buildRecallEntryWhere(q, false)
 	limit := recallLimit(q.Limit)
 	query := "SELECT " + recallBaseColsQualified +
@@ -871,34 +870,6 @@ func (db *DB) listRecallFTS5Candidates(
 	return candidates, nil
 }
 
-func (db *DB) listRecallFTS4RowIDCandidates(
-	ctx context.Context, q RecallQuery, terms []string,
-) ([]RecallEntry, error) {
-	where, args := buildRecallEntryWhere(q, false)
-	limit := recallLimit(q.Limit)
-	query := "SELECT " + recallBaseCols +
-		" FROM recall_entries" +
-		" WHERE rowid IN (" +
-		"SELECT rowid FROM recall_entries_fts" +
-		" WHERE recall_entries_fts MATCH ? LIMIT ?" +
-		") AND " + where +
-		" ORDER BY " + recallStableSQLTieOrder("") +
-		", updated_at DESC, id ASC LIMIT ?"
-	args = append(
-		[]any{recallFTSQuery(terms), recallFTS4PreselectLimit},
-		args...,
-	)
-	args = append(args, limit)
-
-	rows, err := db.getReader().QueryContext(ctx, query, args...)
-	if err != nil {
-		return nil, fmt.Errorf("querying recall fts4 candidates: %w", err)
-	}
-	defer rows.Close()
-
-	return scanRecallEntryRowsWithEvidence(ctx, db, rows)
-}
-
 func (db *DB) listRecallEntryLikeCandidates(
 	ctx context.Context, q RecallQuery, terms []string,
 ) ([]RecallEntry, error) {
@@ -920,44 +891,6 @@ func (db *DB) listRecallEntryLikeCandidates(
 	defer rows.Close()
 
 	return scanRecallEntryRowsWithEvidence(ctx, db, rows)
-}
-
-func (db *DB) recallFTSKind(ctx context.Context) string {
-	var ddl string
-	err := db.getReader().QueryRowContext(
-		ctx,
-		`SELECT lower(sql) FROM sqlite_master
-		 WHERE type = 'table' AND name = 'recall_entries_fts'`,
-	).Scan(&ddl)
-	if err != nil {
-		return ""
-	}
-	if strings.Contains(ddl, "using fts5") {
-		return "fts5"
-	}
-	if strings.Contains(ddl, "using fts4") {
-		return "fts4"
-	}
-	return ""
-}
-
-func (db *DB) recallEvidenceFTSKind(ctx context.Context) string {
-	var ddl string
-	err := db.getReader().QueryRowContext(
-		ctx,
-		`SELECT lower(sql) FROM sqlite_master
-		 WHERE type = 'table' AND name = 'recall_evidence_fts'`,
-	).Scan(&ddl)
-	if err != nil {
-		return ""
-	}
-	if strings.Contains(ddl, "using fts5") {
-		return "fts5"
-	}
-	if strings.Contains(ddl, "using fts4") {
-		return "fts4"
-	}
-	return ""
 }
 
 func scanRecallEntryRowsWithEvidence(
@@ -1026,20 +959,6 @@ func (db *DB) listRecallEvidenceTextCandidates(
 func (db *DB) listRecallEvidenceFTSCandidates(
 	ctx context.Context, q RecallQuery, terms []string,
 ) ([]RecallEntry, error) {
-	kind := db.recallEvidenceFTSKind(ctx)
-	switch kind {
-	case "fts4":
-		return db.listRecallEvidenceFTS4PreselectedCandidates(ctx, q, terms)
-	case "fts5":
-		return db.listRecallEvidenceFTSScoredCandidates(ctx, q, terms)
-	default:
-		return nil, errRecallFTSCandidateQueryUnavailable
-	}
-}
-
-func (db *DB) listRecallEvidenceFTSScoredCandidates(
-	ctx context.Context, q RecallQuery, terms []string,
-) ([]RecallEntry, error) {
 	where, args := buildRecallEntryWhere(q, false)
 	scoreExpr, scoreArgs := buildRecallEvidenceMatchScoreExpr(terms)
 	limit := recallLimit(q.Limit)
@@ -1060,42 +979,6 @@ func (db *DB) listRecallEvidenceFTSScoredCandidates(
 	rows, err := db.getReader().QueryContext(ctx, query, args...)
 	if err != nil {
 		return nil, fmt.Errorf("querying recall evidence fts candidates: %w", err)
-	}
-	defer rows.Close()
-
-	return scanRecallEntryRowsWithEvidence(ctx, db, rows)
-}
-
-func (db *DB) listRecallEvidenceFTS4PreselectedCandidates(
-	ctx context.Context, q RecallQuery, terms []string,
-) ([]RecallEntry, error) {
-	where, args := buildRecallEntryWhere(q, false)
-	scoreExpr, scoreArgs := buildRecallEvidenceMatchScoreExpr(terms)
-	limit := recallLimit(q.Limit)
-	query := "WITH matched_evidence(rowid) AS (" +
-		"SELECT rowid FROM recall_evidence_fts" +
-		" WHERE recall_evidence_fts MATCH ? LIMIT ?" +
-		") SELECT " + recallBaseColsQualified +
-		" FROM matched_evidence" +
-		" JOIN recall_evidence ON recall_evidence.id = matched_evidence.rowid" +
-		" JOIN recall_entries ON recall_entries.id = recall_evidence.entry_id" +
-		" WHERE " + where +
-		" GROUP BY recall_entries.id" +
-		" ORDER BY " + scoreExpr + " DESC, " +
-		recallStableSQLTieOrder("recall_entries") +
-		", recall_entries.updated_at DESC, recall_entries.id ASC LIMIT ?"
-	args = append(
-		[]any{recallFTSQuery(terms), recallEvidenceFTS4PreselectLimit},
-		args...,
-	)
-	args = append(args, scoreArgs...)
-	args = append(args, limit)
-
-	rows, err := db.getReader().QueryContext(ctx, query, args...)
-	if err != nil {
-		return nil, fmt.Errorf(
-			"querying recall evidence fts4 candidates: %w", err,
-		)
 	}
 	defer rows.Close()
 
@@ -1225,7 +1108,10 @@ func (db *DB) queryRecallEntriesVector(
 		)
 	}
 	limit := recallLimit(q.Limit)
-	k := max(recallLimit(q.Limit)*4, SemanticOverfetchMin)
+	ceiling := searcher.MaxRecallSearchCandidates()
+	k := clampRecallVectorCandidates(
+		max(recallLimit(q.Limit)*4, SemanticOverfetchMin), ceiling,
+	)
 	for {
 		hits, exhausted, snapshot, err := searcher.SearchRecall(ctx, q.Text, k)
 		if err != nil {
@@ -1241,12 +1127,19 @@ func (db *DB) queryRecallEntriesVector(
 		if len(page.RecallEntries) >= limit || exhausted {
 			return page, nil
 		}
-		next := k * 2
+		next := clampRecallVectorCandidates(k*2, ceiling)
 		if next <= k {
 			return page, nil
 		}
 		k = next
 	}
+}
+
+func clampRecallVectorCandidates(k, ceiling int) int {
+	if ceiling <= 0 || k <= ceiling {
+		return k
+	}
+	return ceiling
 }
 
 func (db *DB) recallPageFromVectorHits(
@@ -1305,14 +1198,16 @@ func (db *DB) queryRecallEntriesHybrid(
 ) (RecallPage, error) {
 	limit := recallLimit(q.Limit)
 	candidateQuery := q
-	candidateQuery.Mode = RecallQueryModeLexical
 	candidateQuery.Limit = MaxRecallEntryLimit
-	lexical, err := db.queryRecallEntriesLexical(ctx, candidateQuery)
+	// The vector leg waits on query encoding, so the lexical leg reads after
+	// it and sees entries written meanwhile.
+	candidateQuery.Mode = RecallQueryModeVector
+	vector, err := db.queryRecallEntriesVector(ctx, candidateQuery)
 	if err != nil {
 		return RecallPage{}, err
 	}
-	candidateQuery.Mode = RecallQueryModeVector
-	vector, err := db.queryRecallEntriesVector(ctx, candidateQuery)
+	candidateQuery.Mode = RecallQueryModeLexical
+	lexical, err := db.queryRecallEntriesLexical(ctx, candidateQuery)
 	if err != nil {
 		return RecallPage{}, err
 	}
@@ -1320,7 +1215,7 @@ func (db *DB) queryRecallEntriesHybrid(
 		recallResultRankedUnits(lexical.RecallEntries),
 		recallResultRankedUnits(vector.RecallEntries),
 	}
-	merged := RRFMerge(legs, limit)
+	merged := RRFMerge(legs, 0)
 	byID := make(map[string]RecallResult,
 		len(lexical.RecallEntries)+len(vector.RecallEntries))
 	for _, result := range lexical.RecallEntries {
@@ -1336,11 +1231,34 @@ func (db *DB) queryRecallEntriesHybrid(
 		}
 		byID[result.ID] = result
 	}
-	page := RecallPage{RecallEntries: make([]RecallResult, 0, len(merged))}
-	for _, fused := range merged {
-		result := byID[fused.Unit.Key]
-		result.Score = fused.Score
-		page.RecallEntries = append(page.RecallEntries, result)
+	// The two legs read entries at different moments. Only this reread drops
+	// an entry that left the query's filters in between; the leg order can't.
+	page := RecallPage{RecallEntries: make([]RecallResult, 0, min(limit, len(merged)))}
+	for len(merged) > 0 && len(page.RecallEntries) < limit {
+		batch := merged[:min(limit-len(page.RecallEntries), len(merged))]
+		merged = merged[len(batch):]
+		ids := make([]string, 0, len(batch))
+		for _, fused := range batch {
+			ids = append(ids, fused.Unit.Key)
+		}
+		current, err := db.listRecallEntriesByIDs(ctx, candidateQuery, ids)
+		if err != nil {
+			return RecallPage{}, err
+		}
+		visible := make(map[string]RecallEntry, len(current))
+		for _, entry := range current {
+			visible[entry.ID] = entry
+		}
+		for _, fused := range batch {
+			entry, ok := visible[fused.Unit.Key]
+			if !ok {
+				continue
+			}
+			result := byID[fused.Unit.Key]
+			result.RecallEntry = entry
+			result.Score = fused.Score
+			page.RecallEntries = append(page.RecallEntries, result)
+		}
 	}
 	return page, nil
 }
@@ -1362,8 +1280,8 @@ func (db *DB) listRecallEntriesByIDs(
 	var entries []RecallEntry
 	err := queryChunked(ids, func(chunk []string) error {
 		where, filterArgs := buildRecallEntryWhere(q, false)
-		placeholders, idArgs := inPlaceholders(chunk)
-		args := append(idArgs, filterArgs...)
+		placeholders, idArgs := InPlaceholders(chunk)
+		args := slices.Concat(idArgs, filterArgs)
 		rows, err := db.getReader().QueryContext(ctx,
 			"SELECT "+recallBaseCols+" FROM recall_entries WHERE id IN "+
 				placeholders+" AND "+where,
@@ -1763,13 +1681,11 @@ func recallFTSUnavailable(err error) bool {
 	if err == nil {
 		return false
 	}
-	if errors.Is(err, errRecallFTSCandidateQueryUnavailable) {
-		return true
-	}
 	msg := err.Error()
 	return strings.Contains(msg, "no such table: recall_entries_fts") ||
 		strings.Contains(msg, "no such table: recall_evidence_fts") ||
 		strings.Contains(msg, "no such module") ||
+		strings.Contains(msg, "unable to use function bm25 in the requested context") ||
 		strings.Contains(msg, "unable to use function MATCH")
 }
 

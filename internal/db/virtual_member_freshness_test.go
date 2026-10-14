@@ -19,15 +19,15 @@ func seedVirtualMemberRow(
 	if hash != "" {
 		session.FileHash = &hash
 	}
-	require.NoError(t, d.UpsertSession(session))
-	require.NoError(t, d.SetSessionDataVersion(id, version))
+	require.NoError(t, d.UpsertSession(t.Context(), session))
+	require.NoError(t, d.SetSessionDataVersion(t.Context(), id, version))
 }
 
 // TestListVirtualContainerMemberFreshnessPagePagesCompleteFolds pins the
 // paged freshness read: pages arrive in ascending path order honoring the
 // limit, duplicate session rows for one member fold completely even when the
 // page boundary lands on that member (the MAX-mtime row carries its hash
-// while the MIN data version survives), source-missing tombstones and paths
+// while the MIN data version survives), source-missing rows and paths
 // outside the container never surface, and the done flag reports exhaustion.
 func TestListVirtualContainerMemberFreshnessPagePagesCompleteFolds(
 	t *testing.T,
@@ -41,16 +41,15 @@ func TestListVirtualContainerMemberFreshnessPagePagesCompleteFolds(
 	seedVirtualMemberRow(t, d, "b", container+"#b", 150, 5, "")
 	seedVirtualMemberRow(t, d, "c", container+"#c", 300, 5, "")
 	seedVirtualMemberRow(t, d, "outside", "/data/other.db#x", 400, 5, "")
-	_, err := d.getWriter().Exec(
+	_, err := d.getWriter().Exec(t.Context(),
 		`UPDATE sessions SET
-			deleted_at = strftime('%Y-%m-%dT%H:%M:%fZ','now'),
-			deletion_cause = 'source_missing'
+			source_missing_at = strftime('%Y-%m-%dT%H:%M:%fZ','now')
 		 WHERE id = 'b'`,
 	)
-	require.NoError(t, err, "tombstone member b")
+	require.NoError(t, err, "mark member b source-missing")
 
 	page, done, err := d.ListVirtualContainerMemberFreshnessPage(
-		t.Context(), container, "", 1,
+		t.Context(), container, "", "", 1,
 	)
 	require.NoError(t, err)
 	assert.False(t, done, "a full page must not report exhaustion")
@@ -58,29 +57,31 @@ func TestListVirtualContainerMemberFreshnessPagePagesCompleteFolds(
 	assert.Equal(t, container+"#a", page[0].Path)
 	assert.Equal(t, int64(200), page[0].MTimeNS,
 		"the fold surfaces the newest row's mtime")
+	assert.Equal(t, "opencode", page[0].Agent)
+	assert.Equal(t, "proj", page[0].Project)
 	assert.Equal(t, "new-hash", page[0].Hash,
 		"the hash rides the newest-mtime row")
 	assert.Equal(t, 2, page[0].DataVersion,
 		"the minimum stored data version survives the fold")
 
 	page, done, err = d.ListVirtualContainerMemberFreshnessPage(
-		t.Context(), container, page[0].Path, 1,
+		t.Context(), container, "", page[0].Path, 1,
 	)
 	require.NoError(t, err)
 	assert.False(t, done)
 	require.Len(t, page, 1)
 	assert.Equal(t, container+"#c", page[0].Path,
-		"the tombstoned member must never surface")
+		"the source-missing member must never surface")
 
 	page, done, err = d.ListVirtualContainerMemberFreshnessPage(
-		t.Context(), container, page[0].Path, 1,
+		t.Context(), container, "", page[0].Path, 1,
 	)
 	require.NoError(t, err)
 	assert.True(t, done, "an empty page reports exhaustion")
 	assert.Empty(t, page)
 
 	page, done, err = d.ListVirtualContainerMemberFreshnessPage(
-		t.Context(), container, "", 10,
+		t.Context(), container, "", "", 10,
 	)
 	require.NoError(t, err)
 	assert.True(t, done, "a short page reports exhaustion")
@@ -88,4 +89,66 @@ func TestListVirtualContainerMemberFreshnessPagePagesCompleteFolds(
 		"one call over a large limit folds the whole membership")
 	assert.Equal(t, container+"#a", page[0].Path)
 	assert.Equal(t, container+"#c", page[1].Path)
+}
+
+// TestListVirtualContainerMemberFreshnessPageMarksTrashedAndExcluded pins the
+// suppression rows: a trashed member carries Trashed, a permanently deleted
+// member surfaces from excluded_sessions at its virtual path marked Excluded,
+// both merge into ascending path order across page boundaries, and an empty
+// ID prefix leaves excluded IDs out.
+func TestListVirtualContainerMemberFreshnessPageMarksTrashedAndExcluded(
+	t *testing.T,
+) {
+	d := testDB(t)
+	const container = "/data/state.vscdb"
+	for _, id := range []string{"a", "b", "c", "d", "e"} {
+		seedVirtualMemberRow(t, d, "cursor-ide:"+id, container+"#"+id, 100, 5, "h-"+id)
+	}
+	seedVirtualMemberRow(t, d, "other:z", "/data/other.db#z", 100, 5, "")
+	require.NoError(t, d.SoftDeleteSession(t.Context(), "cursor-ide:c"))
+	require.NoError(t, d.DeleteSession(t.Context(), "cursor-ide:b"))
+	require.NoError(t, d.DeleteSession(t.Context(), "cursor-ide:d"))
+	require.NoError(t, d.DeleteSession(t.Context(), "other:z"))
+
+	type got struct {
+		path              string
+		trashed, excluded bool
+	}
+	var pages [][]got
+	var dones []bool
+	after := ""
+	for range 4 {
+		page, done, err := d.ListVirtualContainerMemberFreshnessPage(
+			t.Context(), container, "cursor-ide:", after, 2,
+		)
+		require.NoError(t, err)
+		var rows []got
+		for _, row := range page {
+			rows = append(rows, got{row.Path, row.Trashed, row.Excluded})
+		}
+		pages = append(pages, rows)
+		dones = append(dones, done)
+		if done {
+			break
+		}
+		after = page[len(page)-1].Path
+	}
+	assert.Equal(t, [][]got{
+		{{container + "#a", false, false}, {container + "#b", false, true}},
+		{{container + "#c", true, false}, {container + "#d", false, true}},
+		{{container + "#e", false, false}},
+	}, pages)
+	assert.Equal(t, []bool{false, false, true}, dones)
+
+	page, done, err := d.ListVirtualContainerMemberFreshnessPage(
+		t.Context(), container, "", "", 10,
+	)
+	require.NoError(t, err)
+	assert.True(t, done)
+	var paths []string
+	for _, row := range page {
+		paths = append(paths, row.Path)
+		assert.False(t, row.Excluded, row.Path)
+	}
+	assert.Equal(t, []string{container + "#a", container + "#c", container + "#e"}, paths)
 }

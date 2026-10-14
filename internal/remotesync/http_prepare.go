@@ -10,6 +10,7 @@ import (
 	"path/filepath"
 	"slices"
 	"sort"
+	"strings"
 	"sync"
 	"time"
 
@@ -50,10 +51,11 @@ func (e *HostError) Unwrap() error { return e.Err }
 // Source ownership stays internal so locks and temporary roots can only be
 // released as a group.
 type PreparedHTTPSyncs struct {
-	mu      sync.Mutex
-	sources []*PreparedHTTP
-	closing bool
-	borrows int
+	mu                    sync.Mutex
+	sources               []*PreparedHTTP
+	unavailableIDPrefixes []string
+	closing               bool
+	borrows               int
 }
 
 // PrepareHTTPSyncs prepares HTTP hosts in deterministic order, using canonical
@@ -64,11 +66,26 @@ type PreparedHTTPSyncs struct {
 func PrepareHTTPSyncs(
 	ctx context.Context, syncs []HTTPSync,
 ) (*PreparedHTTPSyncs, error) {
-	return prepareHTTPSyncs(ctx, syncs, func(
+	prepared, _, err := prepareHTTPSyncsWithUnavailable(ctx, syncs, false, func(
 		ctx context.Context, hs HTTPSync,
 	) (*PreparedHTTP, error) {
 		return hs.Prepare(ctx)
 	})
+	return prepared, err
+}
+
+// PrepareAvailableHTTPSyncs prepares every reachable HTTP host. Unavailable
+// hosts are omitted; other failures retain the all-or-nothing cleanup behavior
+// of PrepareHTTPSyncs.
+func PrepareAvailableHTTPSyncs(
+	ctx context.Context, syncs []HTTPSync,
+) (*PreparedHTTPSyncs, error) {
+	prepared, _, err := prepareHTTPSyncsWithUnavailable(ctx, syncs, true, func(
+		ctx context.Context, hs HTTPSync,
+	) (*PreparedHTTP, error) {
+		return hs.Prepare(ctx)
+	})
+	return prepared, err
 }
 
 func prepareHTTPSyncs(
@@ -76,6 +93,18 @@ func prepareHTTPSyncs(
 	syncs []HTTPSync,
 	prepare func(context.Context, HTTPSync) (*PreparedHTTP, error),
 ) (*PreparedHTTPSyncs, error) {
+	prepared, _, err := prepareHTTPSyncsWithUnavailable(
+		ctx, syncs, false, prepare,
+	)
+	return prepared, err
+}
+
+func prepareHTTPSyncsWithUnavailable(
+	ctx context.Context,
+	syncs []HTTPSync,
+	skipUnavailable bool,
+	prepare func(context.Context, HTTPSync) (*PreparedHTTP, error),
+) (*PreparedHTTPSyncs, []*HostError, error) {
 	type orderedSync struct {
 		sync    HTTPSync
 		sortKey string
@@ -94,7 +123,7 @@ func prepareHTTPSyncs(
 		}
 		lockPath, err := canonicalMirrorLockPath(MirrorDir(hs.DataDir, hs.Host))
 		if err != nil {
-			return nil, &HostError{
+			return nil, nil, &HostError{
 				Host: hs.Host, Operation: "resolve mirror lock", Err: err,
 			}
 		}
@@ -103,7 +132,7 @@ func prepareHTTPSyncs(
 				"%w: hosts %q and %q use %q",
 				ErrDuplicateMirrorLock, previous.Host, hs.Host, lockPath,
 			)
-			return nil, &HostError{
+			return nil, nil, &HostError{
 				Host: hs.Host, Operation: "resolve mirror lock", Err: cause,
 			}
 		}
@@ -119,6 +148,7 @@ func prepareHTTPSyncs(
 	prepared := &PreparedHTTPSyncs{
 		sources: make([]*PreparedHTTP, 0, len(ordered)),
 	}
+	var unavailable []*HostError
 	for _, input := range ordered {
 		hs := input.sync
 		if hs.Lifecycle != nil && hs.Lifecycle.PrepareStarted != nil {
@@ -129,50 +159,66 @@ func prepareHTTPSyncs(
 			hs.Lifecycle.PrepareFinished(err)
 		}
 		if err != nil {
+			primary := &HostError{Host: hs.Host, Operation: "prepare", Err: err}
+			if skipUnavailable && source == nil && ctx.Err() == nil &&
+				IsHostUnavailable(err) {
+				unavailable = append(unavailable, primary)
+				prepared.unavailableIDPrefixes = append(
+					prepared.unavailableIDPrefixes, rebuildIDPrefix(hs.Host),
+				)
+				hs.reportProgressDetail(
+					"Skipped offline remote host " + hs.Host,
+				)
+				continue
+			}
 			if source != nil {
 				prepared.sources = append(prepared.sources, source)
 			}
-			primary := &HostError{Host: hs.Host, Operation: "prepare", Err: err}
 			cleanupErr := prepared.Close()
 			if cleanupErr != nil {
-				return prepared, errors.Join(primary, cleanupErr)
+				return prepared, unavailable, errors.Join(primary, cleanupErr)
 			}
-			return nil, primary
+			return nil, unavailable, primary
 		}
 		prepared.sources = append(prepared.sources, source)
 	}
-	return prepared, nil
+	return prepared, unavailable, nil
 }
 
-// BorrowRebuildContributors borrows rebuild descriptions while the prepared
-// set retains cleanup ownership. Callers must invoke the idempotent release
-// function after the rebuild stops using every contributor. Close refuses to
-// release any source while a borrow remains active.
-func (p *PreparedHTTPSyncs) BorrowRebuildContributors() (
-	contributors []syncpkg.RebuildContributor,
+// BorrowRebuildOptions borrows rebuild descriptions and unavailable host
+// namespaces while the prepared set retains cleanup ownership. Callers must
+// invoke the idempotent release function after the rebuild stops using the
+// options. Close refuses to release any source while a borrow remains active.
+func (p *PreparedHTTPSyncs) BorrowRebuildOptions(ctx context.Context) (
+	options syncpkg.RebuildOptions,
 	release func(),
 	err error,
 ) {
 	if p == nil {
-		return nil, nil, ErrPreparedClosed
+		return syncpkg.RebuildOptions{}, nil, ErrPreparedClosed
 	}
 	p.mu.Lock()
 	defer p.mu.Unlock()
 	if p.closing {
-		return nil, nil, ErrPreparedClosed
+		return syncpkg.RebuildOptions{}, nil, ErrPreparedClosed
 	}
-	contributors = make([]syncpkg.RebuildContributor, 0, len(p.sources))
+	options.Contributors = make(
+		[]syncpkg.RebuildContributor, 0, len(p.sources),
+	)
+	options.UnavailableContributorIDPrefixes = slices.Clone(
+		p.unavailableIDPrefixes,
+	)
 	for _, source := range p.sources {
 		if source == nil {
 			continue
 		}
-		contributor, err := source.RebuildContributor()
+		contributor, err := source.RebuildContributor(ctx)
 		if err != nil {
-			return nil, nil, &HostError{
+			return syncpkg.RebuildOptions{}, nil, &HostError{
 				Host: source.sync.Host, Operation: "build rebuild contributor", Err: err,
 			}
 		}
-		contributors = append(contributors, contributor)
+		options.Contributors = append(options.Contributors, contributor)
 	}
 	p.borrows++
 	var once sync.Once
@@ -183,7 +229,7 @@ func (p *PreparedHTTPSyncs) BorrowRebuildContributors() (
 			p.mu.Unlock()
 		})
 	}
-	return contributors, release, nil
+	return options, release, nil
 }
 
 // Close releases prepared sources in reverse order. Successfully closed
@@ -251,8 +297,8 @@ type PreparedHTTP struct {
 	mirrorImport              *preparedMirrorImport
 	replaceJournal            func(string, MirrorChangeJournal) error
 	retireJournal             func(string) error
-	replaceRemoteSkippedFiles func(string, map[string]int64) error
-	applyRemoteSkippedChanges func(string, []string, map[string]int64) error
+	replaceRemoteSkippedFiles func(context.Context, string, map[string]int64) error
+	applyRemoteSkippedChanges func(context.Context, string, []string, map[string]int64) error
 	commitReady               bool
 	committed                 bool
 }
@@ -281,7 +327,8 @@ func (hs HTTPSync) prepare(
 ) (result *PreparedHTTP, err error) {
 	client := hs.Client
 	if client == nil {
-		client = http.DefaultClient
+		// Archive responses can stream for hours; ctx governs their lifetime.
+		client = &http.Client{Timeout: 0}
 	}
 	hs.reportProgressResolvingTargets()
 	targets, err := hs.fetchTargets(ctx, client)
@@ -333,9 +380,7 @@ func (hs HTTPSync) prepare(
 		return nil, err
 	}
 	dirScoped, fileScoped := targets.SplitFileScoped()
-	hs.reportProgressDetail(fmt.Sprintf(
-		"Fetching session manifest from %s", hs.Host,
-	))
+	hs.reportProgressDetail("Fetching session manifest from " + hs.Host)
 	manifest, supported, err := hs.fetchManifest(ctx, client, dirScoped)
 	if err != nil {
 		return nil, err
@@ -371,7 +416,7 @@ func (p *PreparedHTTP) Targets() TargetSet { return p.targets }
 // ImportActive imports the prepared source into the active database.
 func (p *PreparedHTTP) ImportActive(ctx context.Context) (SyncStats, error) {
 	if p == nil || p.closing || p.closed {
-		return SyncStats{}, fmt.Errorf("prepared HTTP source is closed")
+		return SyncStats{}, errors.New("prepared HTTP source is closed")
 	}
 	if p.mirrorImport == nil {
 		if p.legacy {
@@ -381,7 +426,7 @@ func (p *PreparedHTTP) ImportActive(ctx context.Context) (SyncStats, error) {
 	}
 	stats, err := p.mirrorImport.pending.Execute(ctx)
 	p.mirrorImport.outcome = stats.JournalOutcome
-	if err != nil || stats.Failed > 0 {
+	if err != nil || !stats.ProcessingComplete() {
 		p.reportDeltaImport(stats)
 		return stats, err
 	}
@@ -439,11 +484,9 @@ func (p *PreparedHTTP) reportDeltaImport(stats SyncStats) {
 // RebuildContributor converts this prepared source into an atomic rebuild
 // contributor. PreparedHTTP retains ownership of its root and mirror lock;
 // callers must Close it after the rebuild finishes.
-func (p *PreparedHTTP) RebuildContributor() (syncpkg.RebuildContributor, error) {
+func (p *PreparedHTTP) RebuildContributor(ctx context.Context) (syncpkg.RebuildContributor, error) {
 	if p == nil || p.closing || p.closed {
-		return syncpkg.RebuildContributor{}, fmt.Errorf(
-			"prepared HTTP source is closed",
-		)
+		return syncpkg.RebuildContributor{}, errors.New("prepared HTTP source is closed")
 	}
 	layout, config, err := newImportInputs(
 		p.sync.Host, p.sync.BlockedResultCategories, p.targets, p.root,
@@ -451,12 +494,14 @@ func (p *PreparedHTTP) RebuildContributor() (syncpkg.RebuildContributor, error) 
 	if err != nil {
 		return syncpkg.RebuildContributor{}, err
 	}
+	config.ArchiveContent = p.sync.DB.ArchiveContent()
+	config.CompleteSourceMirror = true
 	persistSkipCache := func(engine *syncpkg.Engine, database *db.DB) error {
 		var err error
 		if p.mirrorImport != nil {
-			err = p.mirrorImport.pending.persistSkipCache(database, engine)
+			err = p.mirrorImport.pending.persistSkipCache(ctx, database, engine)
 		} else {
-			err = saveEngineSkipCache(database, engine, layout.paths)
+			err = saveEngineSkipCache(ctx, database, engine, layout.paths)
 		}
 		if err != nil {
 			return &rebuildCachePersistError{err: err}
@@ -468,10 +513,10 @@ func (p *PreparedHTTP) RebuildContributor() (syncpkg.RebuildContributor, error) 
 	) error {
 		var err error
 		if p.mirrorImport != nil {
-			err = p.mirrorImport.pending.persistRetrySafeSkipCache(database, engine)
+			err = p.mirrorImport.pending.persistRetrySafeSkipCache(ctx, database, engine)
 		} else {
 			remoteCache := remoteRetrySafeEngineSkipCache(engine, layout.paths)
-			err = database.ReplaceRemoteSkippedFiles(layout.paths.host, remoteCache)
+			err = database.ReplaceRemoteSkippedFiles(ctx, layout.paths.host, remoteCache)
 		}
 		if err != nil {
 			return &rebuildCachePersistError{err: err}
@@ -509,15 +554,14 @@ func (p *PreparedHTTP) RebuildContributor() (syncpkg.RebuildContributor, error) 
 	}
 	if p.mirrorImport != nil {
 		contributor.ForceParse = p.mirrorImport.pending.forceParse
-		contributor.ForceFullParseAfterCache =
-			p.mirrorImport.pending.forceFullParse
+		contributor.ForceFullParseAfterCache = p.mirrorImport.pending.forceFullParse
 		contributor.Config.InitialSkipCache = p.mirrorImport.pending.cache
 	}
 	if p.sync.Lifecycle != nil {
 		contributor.Started = p.sync.Lifecycle.RebuildStarted
 	}
 	contributor.Finished = func(stats syncpkg.SyncStats, err error) {
-		p.commitReady = err == nil && !stats.Aborted && stats.Failed == 0
+		p.commitReady = err == nil && stats.ProcessingComplete()
 		if p.mirrorImport != nil {
 			pendingStats := &p.mirrorImport.pending.Stats
 			pendingStats.SessionsSynced = stats.Synced
@@ -532,11 +576,10 @@ func (p *PreparedHTTP) RebuildContributor() (syncpkg.RebuildContributor, error) 
 				p.mirrorImport.outcome = JournalCancelled
 				pendingStats.JournalOutcome = JournalCancelled
 			} else {
-				var cacheErr *rebuildCachePersistError
-				if errors.As(err, &cacheErr) {
+				if _, ok := errors.AsType[*rebuildCachePersistError](err); ok {
 					p.mirrorImport.outcome = JournalCachePersistFailed
 					pendingStats.JournalOutcome = JournalCachePersistFailed
-				} else if stats.Failed > 0 || stats.Aborted || err != nil {
+				} else if !stats.ProcessingComplete() || err != nil {
 					p.mirrorImport.outcome = JournalProcessingFailures
 					pendingStats.JournalOutcome = JournalProcessingFailures
 				}
@@ -555,7 +598,7 @@ func (p *PreparedHTTP) Commit() error {
 		return nil
 	}
 	if !p.commitReady {
-		return fmt.Errorf("prepared HTTP journal is not ready to commit")
+		return errors.New("prepared HTTP journal is not ready to commit")
 	}
 	start := time.Now()
 	if err := p.retireJournal(p.mirrorImport.journalPath); err != nil {
@@ -606,7 +649,7 @@ func (p *PreparedHTTP) Close() error {
 }
 
 func (hs HTTPSync) reportProgressResolvingTargets() {
-	hs.reportProgressDetail(fmt.Sprintf("Resolving agent directories on %s", hs.Host))
+	hs.reportProgressDetail("Resolving agent directories on " + hs.Host)
 }
 
 func (hs HTTPSync) reportLegacyFallback() {
@@ -829,6 +872,43 @@ func (hs HTTPSync) prepareMirror(
 			forceFullParseObserved = append(forceFullParseObserved, path)
 		}
 	}
+	// Capture the old index's sessions before replacement or deletion loses
+	// their association. Journal transcript paths so replay uses the current
+	// provider metadata, including titles from remaining homes.
+	indexChanges := append([]string(nil), delta.Deletions...)
+	for _, remotePath := range delta.Fetch {
+		localPath, err := safeRemappedRemotePath(mirrorRoot, remotePath)
+		if err != nil {
+			return nil, err
+		}
+		indexChanges = append(indexChanges, localPath)
+	}
+	for _, indexPath := range indexChanges {
+		if filepath.Base(indexPath) != parser.CodexSessionIndexFilename {
+			continue
+		}
+		parser.EvictCodexSessionIndex(indexPath)
+		for uuid := range parser.CodexSessionIndexTitles(indexPath) {
+			threadID := hs.Host + "~codex:" + uuid
+			// Revert pages (codex:<thread>_<rollout>) carry the thread's title.
+			pageIDs, err := hs.DB.CodexRevertPageSessionIDs(ctx, threadID)
+			if err != nil {
+				return nil, err
+			}
+			for _, id := range append([]string{threadID}, pageIDs...) {
+				storedPath := hs.DB.GetSessionFilePath(ctx, id)
+				remotePath, ok := strings.CutPrefix(storedPath, hs.Host+":")
+				if !ok {
+					continue
+				}
+				path, err := mirrorRelativeRemoteChangePath(mirrorRoot, remotePath)
+				if err != nil {
+					return nil, err
+				}
+				observed = append(observed, path)
+			}
+		}
+	}
 	journal, mergeStats, err := mergeMirrorChangesWithForce(
 		journal, observed, forceFullParseObserved,
 	)
@@ -856,17 +936,24 @@ func (hs HTTPSync) prepareMirror(
 		return nil, err
 	}
 	dataRebuildRequested := hs.forceFullParseAfterCacheRequested()
+	scopedProviders := db.ScopedDataVersionProviders(
+		importedDataVersion, currentDataVersion,
+	)
+	if bootstrap || hs.Full || fullReason != "" || journal.FullImport {
+		scopedProviders = nil
+	}
 	dataRebuildPending := importedDataVersion != currentDataVersion ||
 		dataRebuildRequested || journal.RequiredDataVersion != 0
 	if dataRebuildPending && journal.RequiredDataVersion != currentDataVersion {
-		if bootstrap && !dataRebuildRequested && !journal.FullImport {
+		if len(scopedProviders) > 0 ||
+			bootstrap && !dataRebuildRequested && !journal.FullImport {
 			journal.RequiredDataVersion = currentDataVersion
 			journal.DataRebuildCacheVersion = 0
 		} else {
 			journal = requireMirrorDataVersionImport(journal, currentDataVersion)
 		}
 	}
-	if journal.RequiredDataVersion != 0 && fullReason == "" {
+	if journal.RequiredDataVersion != 0 && fullReason == "" && len(scopedProviders) == 0 {
 		fullReason = FullImportDataRebuild
 		if bootstrap {
 			fullReason = FullImportBootstrap
@@ -891,8 +978,8 @@ func (hs HTTPSync) prepareMirror(
 	} else if fullReason == "" && bootstrap {
 		fullReason = FullImportBootstrap
 	}
-	hasPending := journal.FullImport || len(journal.Entries) > 0 ||
-		fullReason != "" || hs.Full
+	hasPending := journal.FullImport || journal.RequiredDataVersion != 0 ||
+		len(journal.Entries) > 0 || fullReason != "" || hs.Full
 	if !mutatesMirror && !hasPending {
 		return nil, nil
 	}
@@ -913,8 +1000,8 @@ func (hs HTTPSync) prepareMirror(
 		err := hs.downloadIntoMirror(
 			ctx, client, targets.dirScoped, delta.Fetch, full, mirrorRoot,
 		)
-		var statusErr *StatusError
-		if err != nil && !full && errors.As(err, &statusErr) {
+		_, hasStatusErr := errors.AsType[*StatusError](err)
+		if err != nil && !full && hasStatusErr {
 			err = hs.downloadIntoMirror(
 				ctx, client, targets.dirScoped, delta.Fetch, true, mirrorRoot,
 			)
@@ -940,12 +1027,14 @@ func (hs HTTPSync) prepareMirror(
 	}
 	pending, err := (Importer{
 		Host: hs.Host, Full: hs.Full, DB: hs.DB,
+		completeSourceMirror:    true,
 		BlockedResultCategories: hs.BlockedResultCategories,
 		Progress:                hs.Progress, Targets: prepared.targets, Root: mirrorRoot,
 		replaceRemoteSkippedFiles: prepared.replaceRemoteSkippedFiles,
 		applyRemoteSkippedChanges: prepared.applyRemoteSkippedChanges,
 	}).PreparePending(ctx, DeltaImportRequest{
 		Journal: journal, FullReason: fullReason,
+		ScopedProviders:          scopedProviders,
 		ForceParse:               hs.forceParseRequested(),
 		ForceFullParseAfterCache: dataRebuild,
 		ResetAttemptCache: dataRebuild &&

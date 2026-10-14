@@ -1,10 +1,4 @@
-import {
-  describe,
-  it,
-  expect,
-  vi,
-  beforeEach,
-} from "vite-plus/test";
+import { describe, it, expect, vi, beforeEach } from "vite-plus/test";
 import {
   createSessionsStore,
   buildSessionGroups,
@@ -13,12 +7,12 @@ import {
   filtersToParams,
   splitExcludeProjectParam,
 } from "./sessions.svelte.js";
-import { SessionsService } from "../api/generated/index";
+import { SessionsService, type DbSession } from "../api/generated/index";
 import { starred } from "./starred.svelte.js";
 import { yokedDates } from "./yokedDates.svelte.js";
 import type { Filters } from "./sessions.svelte.js";
 import type { Session } from "../api/types.js";
-import { callGenerated } from "../api/runtime.js";
+import { ApiError } from "../api/runtime.js";
 import { rollingRange } from "../utils/dates.js";
 
 const api = vi.hoisted(() => ({
@@ -49,9 +43,15 @@ const storageData = new Map<string, string>();
 Object.defineProperty(globalThis, "localStorage", {
   value: {
     getItem: (key: string) => storageData.get(key) ?? null,
-    setItem: (key: string, value: string) => { storageData.set(key, value); },
-    removeItem: (key: string) => { storageData.delete(key); },
-    clear: () => { storageData.clear(); },
+    setItem: (key: string, value: string) => {
+      storageData.set(key, value);
+    },
+    removeItem: (key: string) => {
+      storageData.delete(key);
+    },
+    clear: () => {
+      storageData.clear();
+    },
   },
   configurable: true,
   writable: true,
@@ -61,31 +61,24 @@ vi.mock("../api/client.js", () => ({
   watchEvents: api.watchEvents,
 }));
 
-vi.mock("../api/runtime.js", () => ({
-  configureGeneratedClient: vi.fn(),
-  callGenerated: vi.fn((request: () => Promise<unknown>) => request()),
+vi.mock("../api/runtime.js", async (importOriginal) => ({
+  ...(await importOriginal<typeof import("../api/runtime.js")>()),
+
   isAbortError: vi.fn(
-    (error: unknown) =>
-      error instanceof DOMException && error.name === "AbortError",
+    (error: unknown) => error instanceof DOMException && error.name === "AbortError",
   ),
 }));
 
 vi.mock("../api/generated/index", () => ({
   SessionsService: {
     getApiV1Sessions: vi.fn((params) => api.listSessions(params)),
-    getApiV1SessionsSidebarIndex: vi.fn((params) =>
-      api.getSidebarSessionIndex(params)
-    ),
-    getApiV1SessionsId: vi.fn(({ id }) => api.getSession(id)),
-    deleteApiV1SessionsId: vi.fn(({ id }) => api.deleteSession(id)),
-    postApiV1SessionsBatchDelete: vi.fn(({ requestBody }) =>
-      api.batchDeleteSessions(requestBody.session_ids)
-    ),
-    postApiV1SessionsIdRestore: vi.fn(({ id }) => api.restoreSession(id)),
-    patchApiV1SessionsIdRename: vi.fn(({ id, requestBody }) =>
-      api.renameSession(id, requestBody.display_name)
-    ),
-    getApiV1SessionsIdChildren: vi.fn().mockResolvedValue([]),
+    getApiV1SessionsSidebarIndex: vi.fn((params) => api.getSidebarSessionIndex(params)),
+    getApiV1SessionsById: vi.fn(({ id }) => api.getSession(id)),
+    deleteApiV1SessionsById: vi.fn(({ id }) => api.deleteSession(id)),
+    postApiV1SessionsBatchDelete: vi.fn((body) => api.batchDeleteSessions(body.session_ids)),
+    postApiV1SessionsByIdRestore: vi.fn(({ id }) => api.restoreSession(id)),
+    patchApiV1SessionsByIdRename: vi.fn(({ id }, body) => api.renameSession(id, body.display_name)),
+    getApiV1SessionsByIdChildren: vi.fn().mockResolvedValue([]),
   },
   MetadataService: {
     getApiV1Projects: vi.fn((params) => api.getProjects(params)),
@@ -95,9 +88,7 @@ vi.mock("../api/generated/index", () => ({
   },
 }));
 
-function mockSidebarPage(
-  overrides?: Partial<{ next_cursor: string }>,
-) {
+function mockSidebarPage(overrides?: Partial<{ next_cursor: string }>) {
   vi.mocked(api.getSidebarSessionIndex).mockResolvedValue({
     sessions: [],
     total: 0,
@@ -112,11 +103,9 @@ function rejectGeneratedRequestOnAbort(
   const result = request();
   if (!signal) return result;
   return new Promise((resolve, reject) => {
-    signal.addEventListener(
-      "abort",
-      () => reject(new DOMException("aborted", "AbortError")),
-      { once: true },
-    );
+    signal.addEventListener("abort", () => reject(new DOMException("aborted", "AbortError")), {
+      once: true,
+    });
     void result.then(resolve, reject);
   });
 }
@@ -126,6 +115,7 @@ type SkinnySessionRow = {
   parent_session_id?: string | null;
   relationship_type?: string | null;
   project: string;
+  project_assigned?: boolean;
   machine: string;
   agent: string;
   agent_label?: string | null;
@@ -141,9 +131,7 @@ type SkinnySessionRow = {
   is_teammate?: boolean;
 };
 
-function makeSkinnyRow(
-  overrides: Partial<SkinnySessionRow> & { id: string },
-): SkinnySessionRow {
+function makeSkinnyRow(overrides: Partial<SkinnySessionRow> & { id: string }): SkinnySessionRow {
   return {
     project: "proj",
     machine: "local",
@@ -177,44 +165,35 @@ function mockGetProjects() {
   });
 }
 
-function expectSidebarIndexCalledWith(
-  expected: Partial<SidebarIndexParams>,
-) {
+function expectSidebarIndexCalledWith(expected: Partial<SidebarIndexParams>) {
   expect(api.getSidebarSessionIndex).toHaveBeenLastCalledWith(
     expect.objectContaining(generatedParams(expected)),
   );
 }
 
-function expectPaginatedSidebarIndexCalledWith(
-  expected: Partial<SidebarIndexParams>,
-) {
+function expectPaginatedSidebarIndexCalledWith(expected: Partial<SidebarIndexParams>) {
   expect(api.getSidebarSessionIndex).toHaveBeenLastCalledWith(
     expect.objectContaining(generatedParams(expected)),
   );
 }
 
-function generatedParams(
-  params: Partial<Record<string, unknown>>,
-): Record<string, unknown> {
+function generatedParams(params: Partial<Record<string, unknown>>): Record<string, unknown> {
   const names: Record<string, string> = {
-    active_since: "activeSince",
-    date_from: "dateFrom",
-    date_to: "dateTo",
-    exclude_project: "excludeProject",
-    health_grade: "healthGrade",
-    include_automated: "includeAutomated",
-    include_children: "includeChildren",
-    include_one_shot: "includeOneShot",
-    max_messages: "maxMessages",
-    min_messages: "minMessages",
-    min_tool_failures: "minToolFailures",
-    min_user_messages: "minUserMessages",
+    activeSince: "active_since",
+    dateFrom: "date_from",
+    dateTo: "date_to",
+    excludeProject: "exclude_project",
+    healthGrade: "health_grade",
+    includeAutomated: "include_automated",
+    includeChildren: "include_children",
+    includeOneShot: "include_one_shot",
+    maxMessages: "max_messages",
+    minMessages: "min_messages",
+    minToolFailures: "min_tool_failures",
+    minUserMessages: "min_user_messages",
   };
   return Object.fromEntries(
-    Object.entries(params).map(([key, value]) => [
-      names[key] ?? key,
-      value,
-    ]),
+    Object.entries(params).map(([key, value]) => [names[key] ?? key, value]),
   );
 }
 
@@ -229,16 +208,33 @@ describe("SessionsStore", () => {
       ...resolvedOptions,
       timeZone: "America/New_York",
     });
-    vi.mocked(callGenerated).mockImplementation(
-      (request: () => Promise<unknown>) => request(),
-    );
+
     storageData.clear();
     mockSidebarPage();
     mockSidebarIndex();
+    vi.mocked(SessionsService.getApiV1SessionsSidebarIndex).mockImplementation((params) =>
+      api.getSidebarSessionIndex(params),
+    );
+    vi.mocked(SessionsService.getApiV1SessionsById).mockImplementation(({ id }) =>
+      api.getSession(id),
+    );
     starred.filterOnly = false;
     starred.ids = new Set();
     yokedDates.setEnabled(false);
     sessions = createSessionsStore();
+  });
+
+  it("preserves explicit automated exclusion for annotation requests", async () => {
+    sessions.initFromParams({ label: "nightly" });
+    await sessions.load();
+    expect(api.getSidebarSessionIndex.mock.calls.at(-1)?.[0].include_automated).toBeUndefined();
+    sessions.setIncludeAutomatedFilter(false);
+    await sessions.load();
+    expect(api.getSidebarSessionIndex.mock.calls.at(-1)?.[0].include_automated).toBe(false);
+    const detach = sessions.attachSidebar();
+    await sessions.load();
+    expect(api.getSidebarSessionIndex.mock.calls.at(-1)?.[0].include_automated).toBe(false);
+    detach();
   });
 
   describe("initFromParams", () => {
@@ -294,9 +290,7 @@ describe("SessionsStore", () => {
       sessions.filters.agent = "claude";
       await sessions.load();
 
-      const saved = JSON.parse(
-        localStorage.getItem("session-filters") ?? "{}",
-      );
+      const saved = JSON.parse(localStorage.getItem("session-filters") ?? "{}");
       expect(saved.project).toBe("myproj");
       expect(saved.agent).toBe("claude");
     });
@@ -353,9 +347,7 @@ describe("SessionsStore", () => {
 
       store.filters.project = "updated-project";
       await store.load();
-      const persisted = JSON.parse(
-        localStorage.getItem("session-filters") ?? "{}",
-      );
+      const persisted = JSON.parse(localStorage.getItem("session-filters") ?? "{}");
       expect(persisted).toMatchObject({
         project: "updated-project",
         agent: "codex",
@@ -376,9 +368,7 @@ describe("SessionsStore", () => {
 
       await store.load();
 
-      const persisted = JSON.parse(
-        localStorage.getItem("session-filters") ?? "{}",
-      );
+      const persisted = JSON.parse(localStorage.getItem("session-filters") ?? "{}");
       expect(persisted).toMatchObject({
         project: "new-project",
         agent: "",
@@ -428,9 +418,7 @@ describe("SessionsStore", () => {
       expect(store.filters.dateTo).toBe("");
       expect(store.filters.date).toBe("");
       // Migration is written back so it runs only once.
-      const saved = JSON.parse(
-        localStorage.getItem("session-filters") ?? "{}",
-      );
+      const saved = JSON.parse(localStorage.getItem("session-filters") ?? "{}");
       expect(saved.version).toBe(2);
       expect(saved.dateFrom).toBe("");
     });
@@ -452,23 +440,16 @@ describe("SessionsStore", () => {
     it("stamps the storage version when persisting", async () => {
       sessions.filters.project = "myproj";
       await sessions.load();
-      const saved = JSON.parse(
-        localStorage.getItem("session-filters") ?? "{}",
-      );
+      const saved = JSON.parse(localStorage.getItem("session-filters") ?? "{}");
       expect(saved.version).toBe(2);
     });
 
     it("persists rolling bounds as windowDays intent, not dates", async () => {
       sessions.filters.project = "myproj";
-      sessions.applyPanelDateFilters(
-        { date_from: "2025-07-07", date_to: "2026-07-06" },
-        365,
-      );
+      sessions.applyPanelDateFilters({ date_from: "2025-07-07", date_to: "2026-07-06" }, 365);
       await sessions.load();
 
-      const saved = JSON.parse(
-        localStorage.getItem("session-filters") ?? "{}",
-      );
+      const saved = JSON.parse(localStorage.getItem("session-filters") ?? "{}");
       expect(saved.dateFrom).toBe("");
       expect(saved.dateTo).toBe("");
       expect(saved.date).toBe("");
@@ -493,25 +474,17 @@ describe("SessionsStore", () => {
     });
 
     it("ignores an invalid persisted windowDays", () => {
-      localStorage.setItem(
-        "session-filters",
-        JSON.stringify({ version: 2, windowDays: -5 }),
-      );
+      localStorage.setItem("session-filters", JSON.stringify({ version: 2, windowDays: -5 }));
       const store = createSessionsStore();
       expect(store.filters.dateFrom).toBe("");
       expect(store.dateFiltersWindowDays).toBe(null);
     });
 
     it("persists explicitly chosen fixed date bounds", async () => {
-      sessions.applyPanelDateFilters(
-        { date_from: "2026-01-01", date_to: "2026-01-31" },
-        null,
-      );
+      sessions.applyPanelDateFilters({ date_from: "2026-01-01", date_to: "2026-01-31" }, null);
       await sessions.load();
 
-      const saved = JSON.parse(
-        localStorage.getItem("session-filters") ?? "{}",
-      );
+      const saved = JSON.parse(localStorage.getItem("session-filters") ?? "{}");
       expect(saved.dateFrom).toBe("2026-01-01");
       expect(saved.dateTo).toBe("2026-01-31");
       expect(saved.windowDays).toBeUndefined();
@@ -525,9 +498,7 @@ describe("SessionsStore", () => {
       });
       await sessions.load();
 
-      const saved = JSON.parse(
-        localStorage.getItem("session-filters") ?? "{}",
-      );
+      const saved = JSON.parse(localStorage.getItem("session-filters") ?? "{}");
       expect(saved.dateFrom).toBe("");
       expect(saved.dateTo).toBe("");
       expect(saved.windowDays).toBe(365);
@@ -543,27 +514,17 @@ describe("SessionsStore", () => {
       expect(sessions.dateFiltersWindowDays).toBe(null);
       await sessions.load();
 
-      const saved = JSON.parse(
-        localStorage.getItem("session-filters") ?? "{}",
-      );
+      const saved = JSON.parse(localStorage.getItem("session-filters") ?? "{}");
       expect(saved.dateFrom).toBe("2026-01-01");
     });
 
     it("resumes persisting dates when a rolling range is replaced by an explicit one", async () => {
-      sessions.applyPanelDateFilters(
-        { date_from: "2025-07-07", date_to: "2026-07-06" },
-        365,
-      );
+      sessions.applyPanelDateFilters({ date_from: "2025-07-07", date_to: "2026-07-06" }, 365);
       await sessions.load();
-      sessions.applyPanelDateFilters(
-        { date_from: "2026-01-01", date_to: "2026-01-31" },
-        null,
-      );
+      sessions.applyPanelDateFilters({ date_from: "2026-01-01", date_to: "2026-01-31" }, null);
       await sessions.load();
 
-      const saved = JSON.parse(
-        localStorage.getItem("session-filters") ?? "{}",
-      );
+      const saved = JSON.parse(localStorage.getItem("session-filters") ?? "{}");
       expect(saved.dateFrom).toBe("2026-01-01");
       expect(saved.dateTo).toBe("2026-01-31");
       expect(saved.windowDays).toBeUndefined();
@@ -573,36 +534,22 @@ describe("SessionsStore", () => {
       // Fixed range persisted, then a rolling preset materializes to the
       // exact same bounds. Callers that diff serialized filters see no
       // change and skip load(), so the store must persist on apply.
-      sessions.applyPanelDateFilters(
-        { date_from: "2025-07-07", date_to: "2026-07-06" },
-        null,
-      );
+      sessions.applyPanelDateFilters({ date_from: "2025-07-07", date_to: "2026-07-06" }, null);
       await sessions.load();
-      sessions.applyPanelDateFilters(
-        { date_from: "2025-07-07", date_to: "2026-07-06" },
-        365,
-      );
+      sessions.applyPanelDateFilters({ date_from: "2025-07-07", date_to: "2026-07-06" }, 365);
 
-      const saved = JSON.parse(
-        localStorage.getItem("session-filters") ?? "{}",
-      );
+      const saved = JSON.parse(localStorage.getItem("session-filters") ?? "{}");
       expect(saved.dateFrom).toBe("");
       expect(saved.dateTo).toBe("");
       expect(saved.windowDays).toBe(365);
     });
 
     it("clears the rolling intent on wholesale filter resets", async () => {
-      sessions.applyPanelDateFilters(
-        { date_from: "2025-07-07", date_to: "2026-07-06" },
-        365,
-      );
+      sessions.applyPanelDateFilters({ date_from: "2025-07-07", date_to: "2026-07-06" }, 365);
       sessions.clearSessionFilters();
       expect(sessions.dateFiltersWindowDays).toBe(null);
 
-      sessions.applyPanelDateFilters(
-        { date_from: "2025-07-07", date_to: "2026-07-06" },
-        365,
-      );
+      sessions.applyPanelDateFilters({ date_from: "2025-07-07", date_to: "2026-07-06" }, 365);
       sessions.setProjectFilter("myproj");
       expect(sessions.dateFiltersWindowDays).toBe(null);
     });
@@ -614,9 +561,7 @@ describe("SessionsStore", () => {
       });
       await sessions.load();
 
-      const saved = JSON.parse(
-        localStorage.getItem("session-filters") ?? "{}",
-      );
+      const saved = JSON.parse(localStorage.getItem("session-filters") ?? "{}");
       expect(saved.dateFrom).toBe("2026-01-01");
       expect(saved.dateTo).toBe("2026-01-31");
     });
@@ -632,9 +577,7 @@ describe("SessionsStore", () => {
     });
 
     it("loads a bounded first page when the sidebar is mounted", async () => {
-      const rows = Array.from({ length: 500 }, (_, i) =>
-        makeSkinnyRow({ id: `s${i}` })
-      );
+      const rows = Array.from({ length: 500 }, (_, i) => makeSkinnyRow({ id: `s${i}` }));
       vi.mocked(api.getSidebarSessionIndex).mockResolvedValue({
         sessions: rows,
         total: 86312,
@@ -656,11 +599,12 @@ describe("SessionsStore", () => {
       expect(sessions.nextCursor).toBe("next");
     });
 
-    it("keeps sidebar rows skinny and carries teammate classification", async () => {
+    it("keeps sidebar rows skinny and carries sidebar classifications", async () => {
       vi.mocked(api.getSidebarSessionIndex).mockResolvedValue({
         sessions: [
           makeSkinnyRow({
             id: "team",
+            project_assigned: true,
             is_teammate: true,
           }),
         ],
@@ -675,6 +619,7 @@ describe("SessionsStore", () => {
       expect(api.listSessions).not.toHaveBeenCalled();
       expect(sessions.sessions[0]).toMatchObject({
         id: "team",
+        project_assigned: true,
         is_teammate: true,
         is_index_only: true,
       });
@@ -706,14 +651,6 @@ describe("SessionsStore", () => {
     });
 
     it("aborts an in-flight sidebar load when the filter signature changes", async () => {
-      const signals: AbortSignal[] = [];
-      vi.mocked(callGenerated).mockImplementation(
-        (request: () => Promise<unknown>, signal?: AbortSignal) => {
-          if (signal) signals.push(signal);
-          return request();
-        },
-      );
-
       vi.mocked(api.getSidebarSessionIndex)
         .mockReturnValueOnce(new Promise(() => {}))
         .mockResolvedValueOnce({
@@ -725,12 +662,16 @@ describe("SessionsStore", () => {
       const detach = sessions.attachSidebar();
       void sessions.load();
       await Promise.resolve();
-      expect(signals[0]?.aborted).toBe(false);
+      expect(
+        vi.mocked(SessionsService.getApiV1SessionsSidebarIndex).mock.calls[0]?.[1]?.signal?.aborted,
+      ).toBe(false);
 
       sessions.filters.project = "changed";
       await sessions.load();
 
-      expect(signals[0]?.aborted).toBe(true);
+      expect(
+        vi.mocked(SessionsService.getApiV1SessionsSidebarIndex).mock.calls[0]?.[1]?.signal?.aborted,
+      ).toBe(true);
       expect(api.getSidebarSessionIndex).toHaveBeenCalledTimes(2);
       detach();
     });
@@ -754,24 +695,23 @@ describe("SessionsStore", () => {
       await sessions.load();
       detach();
 
-      const params = vi.mocked(api.getSidebarSessionIndex)
-        .mock.calls[0]![0];
+      const params = vi.mocked(api.getSidebarSessionIndex).mock.calls[0]![0];
       expect(params).toMatchObject({
         project: "proj",
-        excludeProject: "unknown",
+        exclude_project: "unknown",
         machine: "host-a",
         agent: "codex",
         date: "2026-05-23",
-        dateFrom: "2026-05-01",
-        dateTo: "2026-05-31",
-        minMessages: 2,
-        maxMessages: 20,
-        minUserMessages: 1,
-        includeOneShot: undefined,
-        includeAutomated: true,
+        date_from: "2026-05-01",
+        date_to: "2026-05-31",
+        min_messages: 2,
+        max_messages: 20,
+        min_user_messages: 1,
+        include_one_shot: false,
+        include_automated: true,
         limit: 500,
       });
-      expect(typeof params.activeSince).toBe("string");
+      expect(typeof params.active_since).toBe("string");
       expect(params.cursor).toBeUndefined();
       expect(params.health_grade).toBeUndefined();
       expect(params.outcome).toBeUndefined();
@@ -786,8 +726,7 @@ describe("SessionsStore", () => {
       await sessions.load();
       detach();
 
-      const params = vi.mocked(api.getSidebarSessionIndex)
-        .mock.calls[0]![0];
+      const params = vi.mocked(api.getSidebarSessionIndex).mock.calls[0]![0];
       expect(params.starred).toBe(true);
       expect(params.cursor).toBeUndefined();
       expect(params.limit).toBe(500);
@@ -803,9 +742,7 @@ describe("SessionsStore", () => {
 
       await sessions.load();
 
-      expect(sessions.sessions[0]!.display_name).toBe(
-        "Renamed sidebar title",
-      );
+      expect(sessions.sessions[0]!.display_name).toBe("Renamed sidebar title");
       expect(sessions.sessions[0]!.first_message).toBeNull();
     });
 
@@ -830,9 +767,7 @@ describe("SessionsStore", () => {
       await sessions.load();
       sessions.selectSession("active");
       await vi.waitFor(() => {
-        expect(sessions.activeSession?.first_message).toBe(
-          "hydrated active detail",
-        );
+        expect(sessions.activeSession?.first_message).toBe("hydrated active detail");
       });
 
       mockSidebarIndex([makeSkinnyRow({ id: "active", message_count: 9 })]);
@@ -841,9 +776,7 @@ describe("SessionsStore", () => {
       expect(sessions.sessions).toHaveLength(1);
       expect(sessions.sessions[0]!.is_index_only).toBe(false);
       expect(sessions.sessions[0]!.message_count).toBe(9);
-      expect(sessions.activeSession?.first_message).toBe(
-        "hydrated active detail",
-      );
+      expect(sessions.activeSession?.first_message).toBe("hydrated active detail");
     });
 
     it("keeps the active appended row when the reloaded index omits it", async () => {
@@ -857,19 +790,12 @@ describe("SessionsStore", () => {
 
       await sessions.load();
       await sessions.navigateToSession("offpage");
-      expect(sessions.activeSession?.first_message).toBe(
-        "hydrated offpage detail",
-      );
+      expect(sessions.activeSession?.first_message).toBe("hydrated offpage detail");
 
       await sessions.load();
 
-      expect(sessions.sessions.map((s) => s.id)).toEqual([
-        "listed",
-        "offpage",
-      ]);
-      expect(sessions.activeSession?.first_message).toBe(
-        "hydrated offpage detail",
-      );
+      expect(sessions.sessions.map((s) => s.id)).toEqual(["listed", "offpage"]);
+      expect(sessions.activeSession?.first_message).toBe("hydrated offpage detail");
     });
 
     it("moves the appended active row into place when pagination reaches it", async () => {
@@ -887,10 +813,7 @@ describe("SessionsStore", () => {
 
       await sessions.load();
       await sessions.navigateToSession("offpage");
-      expect(sessions.sessions.map((s) => s.id)).toEqual([
-        "listed",
-        "offpage",
-      ]);
+      expect(sessions.sessions.map((s) => s.id)).toEqual(["listed", "offpage"]);
 
       // A page that doesn't contain the appended row keeps it at the
       // tail, preserving index order for keyboard navigation.
@@ -900,31 +823,17 @@ describe("SessionsStore", () => {
         next_cursor: "page-3",
       });
       await sessions.loadMore();
-      expect(sessions.sessions.map((s) => s.id)).toEqual([
-        "listed",
-        "middle",
-        "offpage",
-      ]);
+      expect(sessions.sessions.map((s) => s.id)).toEqual(["listed", "middle", "offpage"]);
 
       vi.mocked(api.getSidebarSessionIndex).mockResolvedValueOnce({
-        sessions: [
-          makeSkinnyRow({ id: "offpage" }),
-          makeSkinnyRow({ id: "last" }),
-        ],
+        sessions: [makeSkinnyRow({ id: "offpage" }), makeSkinnyRow({ id: "last" })],
         total: 4,
         next_cursor: null,
       });
       await sessions.loadMore();
 
-      expect(sessions.sessions.map((s) => s.id)).toEqual([
-        "listed",
-        "middle",
-        "offpage",
-        "last",
-      ]);
-      expect(sessions.activeSession?.first_message).toBe(
-        "hydrated offpage detail",
-      );
+      expect(sessions.sessions.map((s) => s.id)).toEqual(["listed", "middle", "offpage", "last"]);
+      expect(sessions.activeSession?.first_message).toBe("hydrated offpage detail");
     });
 
     it("refreshes hydrated agent identity fields from the sidebar index", async () => {
@@ -989,16 +898,13 @@ describe("SessionsStore", () => {
       ]);
       await sessions.load();
 
-      expect(sessions.sessions[0]!.display_name).toBeNull();
+      expect(sessions.sessions[0]!.display_name).toBeUndefined();
       expect(sessions.sessions[0]!.first_message).toBe("hydrated detail");
       expect(sessions.sessions[0]!.is_index_only).toBe(false);
     });
 
     it("merges hydrated full rows without changing index order", async () => {
-      mockSidebarIndex([
-        makeSkinnyRow({ id: "second" }),
-        makeSkinnyRow({ id: "first" }),
-      ]);
+      mockSidebarIndex([makeSkinnyRow({ id: "second" }), makeSkinnyRow({ id: "first" })]);
       vi.mocked(api.getSession).mockResolvedValue(
         makeSession({ id: "first", first_message: "full detail" }),
       );
@@ -1006,10 +912,7 @@ describe("SessionsStore", () => {
       await sessions.load();
       await (sessions as any).hydrateVisibleSessions(["first"]);
 
-      expect(sessions.sessions.map((s) => s.id)).toEqual([
-        "second",
-        "first",
-      ]);
+      expect(sessions.sessions.map((s) => s.id)).toEqual(["second", "first"]);
       expect(sessions.sessions[1]!.first_message).toBe("full detail");
       expect(sessions.sessions[1]!.is_index_only).toBe(false);
     });
@@ -1025,17 +928,16 @@ describe("SessionsStore", () => {
           resolveDetail = resolve;
         }),
       );
-      const hydratePromise = (sessions as any).hydrateVisibleSessions(
-        ["stale"],
-        staleVersion,
-      );
+      const hydratePromise = (sessions as any).hydrateVisibleSessions(["stale"], staleVersion);
 
       mockSidebarIndex([makeSkinnyRow({ id: "fresh" })]);
       await sessions.load();
-      resolveDetail!(makeSession({
-        id: "stale",
-        first_message: "stale detail",
-      }));
+      resolveDetail!(
+        makeSession({
+          id: "stale",
+          first_message: "stale detail",
+        }),
+      );
       await hydratePromise;
 
       expect(sessions.sessions.map((s) => s.id)).toEqual(["fresh"]);
@@ -1051,32 +953,20 @@ describe("SessionsStore", () => {
       const oldVersion = (sessions as any).sidebarIndexVersion;
       await (sessions as any).hydrateVisibleSessions(["old"]);
 
-      expect((sessions as any).hydratedSessionsByVersion.has(oldVersion))
-        .toBe(true);
-      expect(
-        (sessions as any).sidebarHydrationInflightByVersion.has(oldVersion),
-      ).toBe(true);
-      expect(
-        (sessions as any).sidebarHydrationEpochByVersion.has(oldVersion),
-      ).toBe(true);
+      expect((sessions as any).hydratedSessionsByVersion.has(oldVersion)).toBe(true);
+      expect((sessions as any).sidebarHydrationInflightByVersion.has(oldVersion)).toBe(true);
+      expect((sessions as any).sidebarHydrationEpochByVersion.has(oldVersion)).toBe(true);
 
       mockSidebarIndex([makeSkinnyRow({ id: "new" })]);
       await sessions.load();
       const newVersion = (sessions as any).sidebarIndexVersion;
 
       expect(oldVersion).not.toBe(newVersion);
-      expect((sessions as any).hydratedSessionsByVersion.has(oldVersion))
-        .toBe(false);
-      expect(
-        (sessions as any).sidebarHydrationInflightByVersion.has(oldVersion),
-      ).toBe(false);
-      expect(
-        (sessions as any).sidebarHydrationEpochByVersion.has(oldVersion),
-      ).toBe(false);
-      expect([...((sessions as any).hydratedSessionsByVersion.keys())])
-        .toEqual([newVersion]);
-      expect([...((sessions as any).sidebarHydrationEpochByVersion.keys())])
-        .toEqual([newVersion]);
+      expect((sessions as any).hydratedSessionsByVersion.has(oldVersion)).toBe(false);
+      expect((sessions as any).sidebarHydrationInflightByVersion.has(oldVersion)).toBe(false);
+      expect((sessions as any).sidebarHydrationEpochByVersion.has(oldVersion)).toBe(false);
+      expect([...(sessions as any).hydratedSessionsByVersion.keys()]).toEqual([newVersion]);
+      expect([...(sessions as any).sidebarHydrationEpochByVersion.keys()]).toEqual([newVersion]);
     });
 
     it("dedupes overlapping visible hydration for the same session", async () => {
@@ -1103,9 +993,7 @@ describe("SessionsStore", () => {
     });
 
     it("bounds visible hydration concurrency", async () => {
-      const rows = Array.from({ length: 10 }, (_, i) =>
-        makeSkinnyRow({ id: `s${i}` })
-      );
+      const rows = Array.from({ length: 10 }, (_, i) => makeSkinnyRow({ id: `s${i}` }));
       mockSidebarIndex(rows);
       await sessions.load();
 
@@ -1123,9 +1011,7 @@ describe("SessionsStore", () => {
         });
       });
 
-      const hydrate = (sessions as any).hydrateVisibleSessions(
-        rows.map((row) => row.id),
-      );
+      const hydrate = (sessions as any).hydrateVisibleSessions(rows.map((row) => row.id));
 
       await vi.waitFor(() => {
         expect(resolvers.length).toBeGreaterThan(0);
@@ -1141,9 +1027,7 @@ describe("SessionsStore", () => {
     });
 
     it("refreshing the active session preserves teammate metadata", async () => {
-      mockSidebarIndex([
-        makeSkinnyRow({ id: "team", is_teammate: true }),
-      ]);
+      mockSidebarIndex([makeSkinnyRow({ id: "team", is_teammate: true })]);
       await sessions.load();
       sessions.selectSession("team");
       vi.mocked(api.getSession).mockResolvedValue(
@@ -1170,9 +1054,7 @@ describe("SessionsStore", () => {
       sessions.selectSession("select-me");
 
       await vi.waitFor(() => {
-        expect(sessions.sessions[0]!.first_message).toBe(
-          "hydrated on select",
-        );
+        expect(sessions.sessions[0]!.first_message).toBe("hydrated on select");
       });
       expect(sessions.sessions[0]!.is_index_only).toBe(false);
     });
@@ -1191,14 +1073,14 @@ describe("SessionsStore", () => {
 
       expect(sessions.activeSession).toBeUndefined();
 
-      resolveDetail(makeSession({
-        id: "active",
-        first_message: "ready for detail consumers",
-      }));
+      resolveDetail(
+        makeSession({
+          id: "active",
+          first_message: "ready for detail consumers",
+        }),
+      );
       await vi.waitFor(() => {
-        expect(sessions.activeSession?.first_message).toBe(
-          "ready for detail consumers",
-        );
+        expect(sessions.activeSession?.first_message).toBe("ready for detail consumers");
       });
     });
 
@@ -1293,17 +1175,11 @@ describe("SessionsStore", () => {
       await sessions.load();
       await sessions.batchDeleteSessions(["remove-a", "remove-b"]);
 
-      expect(api.batchDeleteSessions).toHaveBeenCalledWith([
-        "remove-a",
-        "remove-b",
-      ]);
+      expect(api.batchDeleteSessions).toHaveBeenCalledWith(["remove-a", "remove-b"]);
       expect(sessions.sessions.map((s) => s.id)).toEqual(["keep-me"]);
       expect(sessions.total).toBe(1);
       expect(sessions.recentlyDeleted).toHaveLength(1);
-      expect(sessions.recentlyDeleted[0]!.ids).toEqual([
-        "remove-a",
-        "remove-b",
-      ]);
+      expect(sessions.recentlyDeleted[0]!.ids).toEqual(["remove-a", "remove-b"]);
     });
 
     it("reloads sidebar totals after deleting child rows", async () => {
@@ -1345,9 +1221,11 @@ describe("SessionsStore", () => {
         next_cursor?: string | null;
       }) => void;
       vi.mocked(api.getSidebarSessionIndex)
-        .mockReturnValueOnce(new Promise((resolve) => {
-          resolveStaleLoad = resolve;
-        }))
+        .mockReturnValueOnce(
+          new Promise((resolve) => {
+            resolveStaleLoad = resolve;
+          }),
+        )
         .mockResolvedValueOnce({
           sessions: [makeSkinnyRow({ id: "keep-me" })],
           total: 1,
@@ -1368,10 +1246,7 @@ describe("SessionsStore", () => {
       });
 
       resolveStaleLoad({
-        sessions: [
-          makeSkinnyRow({ id: "remove-me" }),
-          makeSkinnyRow({ id: "keep-me" }),
-        ],
+        sessions: [makeSkinnyRow({ id: "remove-me" }), makeSkinnyRow({ id: "keep-me" })],
         total: 2,
         next_cursor: null,
       });
@@ -1396,9 +1271,7 @@ describe("SessionsStore", () => {
 
     it("removes only one id from a recently deleted batch", () => {
       const timer = setTimeout(() => {}, 10_000);
-      sessions.recentlyDeleted = [
-        { key: 1, ids: ["restore-a", "restore-b"], timer },
-      ];
+      sessions.recentlyDeleted = [{ key: 1, ids: ["restore-a", "restore-b"], timer }];
 
       sessions.clearRecentlyDeleted("restore-a");
 
@@ -1410,25 +1283,14 @@ describe("SessionsStore", () => {
 
     it("restores all sessions from one recently deleted batch", async () => {
       const timer = setTimeout(() => {}, 10_000);
-      sessions.recentlyDeleted = [
-        { key: 1, ids: ["restore-a", "restore-b"], timer },
-      ];
+      sessions.recentlyDeleted = [{ key: 1, ids: ["restore-a", "restore-b"], timer }];
       vi.mocked((api as any).restoreSession).mockResolvedValue(undefined);
-      mockSidebarIndex([
-        makeSkinnyRow({ id: "restore-a" }),
-        makeSkinnyRow({ id: "restore-b" }),
-      ]);
+      mockSidebarIndex([makeSkinnyRow({ id: "restore-a" }), makeSkinnyRow({ id: "restore-b" })]);
 
       await sessions.restoreRecentlyDeleted(sessions.recentlyDeleted[0]!);
 
-      expect((api as any).restoreSession).toHaveBeenNthCalledWith(
-        1,
-        "restore-a",
-      );
-      expect((api as any).restoreSession).toHaveBeenNthCalledWith(
-        2,
-        "restore-b",
-      );
+      expect((api as any).restoreSession).toHaveBeenNthCalledWith(1, "restore-a");
+      expect((api as any).restoreSession).toHaveBeenNthCalledWith(2, "restore-b");
       expect(sessions.recentlyDeleted).toEqual([]);
       expect(api.getSidebarSessionIndex).toHaveBeenCalledTimes(1);
     });
@@ -1440,9 +1302,11 @@ describe("SessionsStore", () => {
         next_cursor?: string | null;
       }) => void;
       vi.mocked(api.getSidebarSessionIndex)
-        .mockReturnValueOnce(new Promise((resolve) => {
-          resolveDeleteReload = resolve;
-        }))
+        .mockReturnValueOnce(
+          new Promise((resolve) => {
+            resolveDeleteReload = resolve;
+          }),
+        )
         .mockResolvedValueOnce({
           sessions: [makeSkinnyRow({ id: "restore-me" })],
           total: 1,
@@ -1460,9 +1324,7 @@ describe("SessionsStore", () => {
         expect(api.getSidebarSessionIndex).toHaveBeenCalledTimes(1);
       });
 
-      const restorePromise = sessions.restoreRecentlyDeleted(
-        sessions.recentlyDeleted[0]!,
-      );
+      const restorePromise = sessions.restoreRecentlyDeleted(sessions.recentlyDeleted[0]!);
 
       await vi.waitFor(() => {
         expect(api.getSidebarSessionIndex).toHaveBeenCalledTimes(2);
@@ -1494,22 +1356,13 @@ describe("SessionsStore", () => {
         .mockResolvedValueOnce(undefined);
       mockSidebarIndex([makeSkinnyRow({ id: "restore-b" })]);
 
-      await expect(
-        sessions.restoreRecentlyDeleted(sessions.recentlyDeleted[0]!),
-      ).rejects.toThrow("Failed to restore 1 session");
+      await expect(sessions.restoreRecentlyDeleted(sessions.recentlyDeleted[0]!)).rejects.toThrow(
+        "Failed to restore 1 session",
+      );
 
-      expect((api as any).restoreSession).toHaveBeenNthCalledWith(
-        1,
-        "restore-a",
-      );
-      expect((api as any).restoreSession).toHaveBeenNthCalledWith(
-        2,
-        "restore-b",
-      );
-      expect((api as any).restoreSession).toHaveBeenNthCalledWith(
-        3,
-        "restore-c",
-      );
+      expect((api as any).restoreSession).toHaveBeenNthCalledWith(1, "restore-a");
+      expect((api as any).restoreSession).toHaveBeenNthCalledWith(2, "restore-b");
+      expect((api as any).restoreSession).toHaveBeenNthCalledWith(3, "restore-c");
       expect(sessions.recentlyDeleted).toHaveLength(1);
       expect(sessions.recentlyDeleted[0]!.ids).toEqual(["restore-b"]);
       expect(api.getSidebarSessionIndex).toHaveBeenCalledTimes(1);
@@ -1521,24 +1374,18 @@ describe("SessionsStore", () => {
       vi.useFakeTimers();
       try {
         const timer = setTimeout(() => {
-          sessions.recentlyDeleted = sessions.recentlyDeleted.filter(
-            (d) => d.key !== 1,
-          );
+          sessions.recentlyDeleted = sessions.recentlyDeleted.filter((d) => d.key !== 1);
         }, 10_000);
-        sessions.recentlyDeleted = [
-          { key: 1, ids: ["restore-a"], timer },
-        ];
-        vi.mocked((api as any).restoreSession).mockImplementation(
-          async () => {
-            vi.advanceTimersByTime(10_000);
-            throw new Error("restore failed");
-          },
-        );
+        sessions.recentlyDeleted = [{ key: 1, ids: ["restore-a"], timer }];
+        vi.mocked((api as any).restoreSession).mockImplementation(async () => {
+          vi.advanceTimersByTime(10_000);
+          throw new Error("restore failed");
+        });
         mockSidebarIndex([makeSkinnyRow({ id: "restore-a" })]);
 
-        await expect(
-          sessions.restoreRecentlyDeleted(sessions.recentlyDeleted[0]!),
-        ).rejects.toThrow("Failed to restore 1 session");
+        await expect(sessions.restoreRecentlyDeleted(sessions.recentlyDeleted[0]!)).rejects.toThrow(
+          "Failed to restore 1 session",
+        );
 
         expect(sessions.recentlyDeleted).toHaveLength(1);
         expect(sessions.recentlyDeleted[0]!.ids).toEqual(["restore-a"]);
@@ -1611,6 +1458,13 @@ describe("SessionsStore", () => {
       expect(f.hideUnknownProject).toBe(true);
     });
 
+    it("should trim pull request filters and default labels and pull request to empty", () => {
+      const f = parseFiltersFromParams({});
+      expect(f.labels).toEqual([]);
+      expect(f.pr).toBe("");
+      expect(parseFiltersFromParams({ pr: "  acme/widgets#42 " }).pr).toBe("acme/widgets#42");
+    });
+
     it("should handle non-numeric min_messages", () => {
       const f = parseFiltersFromParams({ min_messages: "abc" });
       expect(f.minMessages).toBe(0);
@@ -1639,6 +1493,9 @@ describe("SessionsStore", () => {
         minUserMessages: 3,
         includeOneShot: false,
         includeAutomated: true,
+        automatedFilterSet: true,
+        labels: ["ticket=example", "role=reviewer, lead"],
+        pr: "acme/widgets#42",
       };
       expect(filtersToParams(f)).toEqual({
         project: "myproj",
@@ -1655,6 +1512,8 @@ describe("SessionsStore", () => {
         min_user_messages: "3",
         include_one_shot: "false",
         include_automated: "true",
+        label: "ticket=example\nrole=reviewer, lead",
+        pr: "acme/widgets#42",
       });
     });
 
@@ -1685,6 +1544,9 @@ describe("SessionsStore", () => {
         minUserMessages: 3,
         includeOneShot: false,
         includeAutomated: true,
+        automatedFilterSet: true,
+        labels: ["ticket=example", "role=reviewer, lead"],
+        pr: "acme/widgets#42",
       };
       const params = filtersToParams(original);
       const parsed = parseFiltersFromParams(params);
@@ -1818,6 +1680,75 @@ describe("SessionsStore", () => {
   });
 
   describe("loadMore serialization", () => {
+    it("reloads the first page when the pagination cursor expires", async () => {
+      sessions.sessions = [makeSession({ id: "old" })];
+      sessions.nextCursor = "expired";
+      api.getSidebarSessionIndex
+        .mockRejectedValueOnce(new ApiError(400, "invalid cursor"))
+        .mockResolvedValueOnce({
+          sessions: [makeSkinnyRow({ id: "current" })],
+          total: 2,
+          next_cursor: "fresh",
+        });
+
+      await sessions.loadMore();
+
+      expect(api.getSidebarSessionIndex).toHaveBeenCalledTimes(2);
+      expect(api.getSidebarSessionIndex.mock.calls.map(([params]) => params.cursor)).toEqual([
+        "expired",
+        undefined,
+      ]);
+      expect(sessions.sessions.map((session) => session.id)).toEqual(["current"]);
+      expect(sessions.nextCursor).toBe("fresh");
+      expect(sessions.loading).toBe(false);
+    });
+
+    it("discards an expired cursor even when the first-page reload fails", async () => {
+      sessions.sessions = [makeSession({ id: "old" })];
+      sessions.nextCursor = "expired";
+      api.getSidebarSessionIndex
+        .mockRejectedValueOnce(new ApiError(400, "invalid cursor"))
+        .mockRejectedValueOnce(new ApiError(503, "temporarily unavailable"));
+
+      await sessions.loadMore();
+      await sessions.loadMore();
+
+      expect(api.getSidebarSessionIndex).toHaveBeenCalledTimes(2);
+      expect(sessions.sessions.map((session) => session.id)).toEqual(["old"]);
+      expect(sessions.nextCursor).toBeNull();
+      expect(sessions.loading).toBe(false);
+    });
+
+    it("does not reload after an obsolete pagination request rejects its cursor", async () => {
+      let rejectPage!: (error: Error) => void;
+      sessions.nextCursor = "expired";
+      api.getSidebarSessionIndex.mockReturnValueOnce(
+        new Promise((_, reject) => {
+          rejectPage = reject;
+        }),
+      );
+
+      const page = sessions.loadMore();
+      mockSidebarPage({ next_cursor: "current" });
+      await sessions.load();
+      rejectPage(new ApiError(400, "invalid cursor"));
+      await page;
+
+      expect(api.getSidebarSessionIndex).toHaveBeenCalledTimes(2);
+      expect(sessions.nextCursor).toBe("current");
+    });
+
+    it("preserves unrelated pagination failures", async () => {
+      sessions.nextCursor = "valid";
+      const error = new ApiError(400, "invalid timezone");
+      api.getSidebarSessionIndex.mockRejectedValueOnce(error);
+
+      await expect(sessions.loadMore()).rejects.toBe(error);
+
+      expect(api.getSidebarSessionIndex).toHaveBeenCalledTimes(1);
+      expect(sessions.nextCursor).toBe("valid");
+    });
+
     it("should pass the browser timezone in loadMore", async () => {
       sessions.nextCursor = "cur-timezone";
 
@@ -1830,21 +1761,17 @@ describe("SessionsStore", () => {
     });
 
     it("should load the sidebar index once with consistent filters", async () => {
-      mockSidebarIndex([
-        makeSkinnyRow({ id: "s1" }),
-        makeSkinnyRow({ id: "s2" }),
-      ]);
+      mockSidebarIndex([makeSkinnyRow({ id: "s1" }), makeSkinnyRow({ id: "s2" })]);
 
       sessions.filters.minMessages = 10;
       sessions.filters.maxMessages = 50;
       await sessions.load();
 
       expect(api.getSidebarSessionIndex).toHaveBeenCalledTimes(1);
-      const first = vi.mocked(api.getSidebarSessionIndex)
-        .mock.calls[0]?.[0];
+      const first = vi.mocked(api.getSidebarSessionIndex).mock.calls[0]?.[0];
 
-      expect(first?.minMessages).toBe(10);
-      expect(first?.maxMessages).toBe(50);
+      expect(first?.min_messages).toBe(10);
+      expect(first?.max_messages).toBe(50);
       expect(first?.cursor).toBeUndefined();
 
       expect(sessions.sessions).toHaveLength(2);
@@ -1863,10 +1790,8 @@ describe("SessionsStore", () => {
       ];
       sessions.total = 3;
 
-      let resolveIndex: ((v: {
-        sessions: SkinnySessionRow[];
-        total: number;
-      }) => void) | null = null;
+      let resolveIndex: ((v: { sessions: SkinnySessionRow[]; total: number }) => void) | null =
+        null;
       const indexPromise = new Promise<{
         sessions: SkinnySessionRow[];
         total: number;
@@ -1874,8 +1799,7 @@ describe("SessionsStore", () => {
         resolveIndex = resolve;
       });
 
-      vi.mocked(api.getSidebarSessionIndex)
-        .mockReturnValueOnce(indexPromise);
+      vi.mocked(api.getSidebarSessionIndex).mockReturnValueOnce(indexPromise);
 
       const loadPromise = sessions.load();
 
@@ -1883,27 +1807,17 @@ describe("SessionsStore", () => {
       await Promise.resolve();
       await Promise.resolve();
 
-      expect(sessions.sessions.map((s) => s.id)).toEqual([
-        "old-a",
-        "old-b",
-        "old-c",
-      ]);
+      expect(sessions.sessions.map((s) => s.id)).toEqual(["old-a", "old-b", "old-c"]);
       expect(sessions.total).toBe(3);
       expect(sessions.loading).toBe(true);
 
       resolveIndex!({
-        sessions: [
-          makeSkinnyRow({ id: "new-1" }),
-          makeSkinnyRow({ id: "new-2" }),
-        ],
+        sessions: [makeSkinnyRow({ id: "new-1" }), makeSkinnyRow({ id: "new-2" })],
         total: 2,
       });
       await loadPromise;
 
-      expect(sessions.sessions.map((s) => s.id)).toEqual([
-        "new-1",
-        "new-2",
-      ]);
+      expect(sessions.sessions.map((s) => s.id)).toEqual(["new-1", "new-2"]);
       expect(sessions.total).toBe(2);
       expect(sessions.nextCursor).toBeNull();
     });
@@ -2091,9 +2005,7 @@ describe("SessionsStore", () => {
     });
 
     it("should split hide-unknown from usage project exclusions", () => {
-      expect(
-        splitExcludeProjectParam("alpha,unknown,beta"),
-      ).toEqual({
+      expect(splitExcludeProjectParam("alpha,unknown,beta")).toEqual({
         hideUnknownProject: true,
         usageExcludedProjects: "alpha,beta",
       });
@@ -2194,12 +2106,10 @@ describe("SessionsStore", () => {
         setActiveSession: (id: string | null) => void;
       };
       const setActiveSession = store.setActiveSession.bind(sessions);
-      const spy = vi
-        .spyOn(store, "setActiveSession")
-        .mockImplementation((id) => {
-          expect(yokedDates.range).toBeNull();
-          setActiveSession(id);
-        });
+      const spy = vi.spyOn(store, "setActiveSession").mockImplementation((id) => {
+        expect(yokedDates.range).toBeNull();
+        setActiveSession(id);
+      });
 
       sessions.clearSessionFilters();
 
@@ -2224,12 +2134,10 @@ describe("SessionsStore", () => {
         setActiveSession: (id: string | null) => void;
       };
       const setActiveSession = store.setActiveSession.bind(sessions);
-      const spy = vi
-        .spyOn(store, "setActiveSession")
-        .mockImplementation((id) => {
-          expect(yokedDates.range).toBeNull();
-          setActiveSession(id);
-        });
+      const spy = vi.spyOn(store, "setActiveSession").mockImplementation((id) => {
+        expect(yokedDates.range).toBeNull();
+        setActiveSession(id);
+      });
 
       sessions.clearSessionFilters({ clearDateYoke: true });
 
@@ -2282,10 +2190,7 @@ describe("SessionsStore", () => {
       });
 
       expect(sessions.filters.machine).toBe("host-a,host-b");
-      expect(sessions.selectedMachines).toEqual([
-        "host-a",
-        "host-b",
-      ]);
+      expect(sessions.selectedMachines).toEqual(["host-a", "host-b"]);
       expect(sessions.isMachineSelected("host-b")).toBe(true);
       expectSidebarIndexCalledWith({
         machine: "host-a,host-b",
@@ -2317,6 +2222,120 @@ describe("SessionsStore", () => {
       expect(sessions.filters.machine).toBe("");
       expect(sessions.selectedMachines).toEqual([]);
       expectSidebarIndexCalledWith({ machine: undefined });
+    });
+  });
+
+  describe("label and pull request filters", () => {
+    it("sends selected labels and omits them after the last is removed", async () => {
+      sessions.addLabelFilter(" ticket=example ");
+      await vi.waitFor(() => {
+        expect(api.getSidebarSessionIndex).toHaveBeenCalledTimes(1);
+      });
+      sessions.addLabelFilter("ticket=example");
+      sessions.addLabelFilter("   ");
+      expect(sessions.filters.labels).toEqual(["ticket=example"]);
+      expect(api.getSidebarSessionIndex).toHaveBeenCalledTimes(1);
+      sessions.addLabelFilter("role=reviewer");
+      await vi.waitFor(() => {
+        expect(api.getSidebarSessionIndex).toHaveBeenCalledTimes(2);
+      });
+      expect(sessions.filters.labels).toEqual(["ticket=example", "role=reviewer"]);
+      expectSidebarIndexCalledWith({ label: ["ticket=example", "role=reviewer"] });
+      sessions.removeLabelFilter("role=reviewer");
+      await vi.waitFor(() => {
+        expect(api.getSidebarSessionIndex).toHaveBeenCalledTimes(3);
+      });
+      sessions.removeLabelFilter("ticket=example");
+      await vi.waitFor(() => {
+        expect(api.getSidebarSessionIndex).toHaveBeenCalledTimes(4);
+      });
+      expect(sessions.filters.labels).toEqual([]);
+      expectSidebarIndexCalledWith({ label: undefined });
+    });
+
+    it("sends and clears the pull request filter", async () => {
+      sessions.setPRFilter(" acme/widgets#42 ");
+      await vi.waitFor(() => {
+        expect(api.getSidebarSessionIndex).toHaveBeenCalledTimes(1);
+      });
+      expectSidebarIndexCalledWith({ pr: "acme/widgets#42" });
+
+      sessions.setPRFilter("");
+      await vi.waitFor(() => {
+        expect(api.getSidebarSessionIndex).toHaveBeenCalledTimes(2);
+      });
+      expectSidebarIndexCalledWith({ pr: undefined });
+    });
+
+    it("shows a rejected pull request filter instead of the previous rows", async () => {
+      mockSidebarIndex([makeSkinnyRow({ id: "before-filter" })]);
+      await sessions.load();
+      expect(sessions.sessions).toHaveLength(1);
+
+      const rejected = 'pr filter "acme/widgets#zero": invalid pull request number';
+      vi.mocked(api.getSidebarSessionIndex).mockRejectedValueOnce(new ApiError(400, rejected));
+      sessions.setPRFilter("acme/widgets#zero");
+      await vi.waitFor(() => {
+        expect(sessions.sidebarLoadError).toBe(rejected);
+      });
+      expect(sessions.sessions).toEqual([]);
+      expect(sessions.total).toBe(0);
+
+      mockSidebarIndex([makeSkinnyRow({ id: "after-fix" })]);
+      sessions.setPRFilter("");
+      await vi.waitFor(() => {
+        expect(sessions.sidebarLoadError).toBeNull();
+      });
+      expect(sessions.sessions.map((s) => s.id)).toEqual(["after-fix"]);
+    });
+
+    it("passes label and pull request filters to later pages", async () => {
+      sessions.filters.labels = ["ticket=example"];
+      sessions.filters.pr = "acme/widgets";
+      sessions.nextCursor = "page-2";
+
+      await sessions.loadMore();
+
+      expectPaginatedSidebarIndexCalledWith({
+        cursor: "page-2",
+        label: ["ticket=example"],
+        pr: "acme/widgets",
+      });
+    });
+
+    it("counts as session-list filters but not shared filters", () => {
+      sessions.filters.labels = ["ticket=example"];
+      expect(sessions.hasActiveFilters).toBe(true);
+      expect(sessions.hasSharedFilters).toBe(false);
+
+      sessions.filters.labels = [];
+      sessions.filters.pr = "acme/widgets";
+      expect(sessions.hasActiveFilters).toBe(true);
+      expect(sessions.hasSharedFilters).toBe(false);
+    });
+
+    it("clears label and pull request filters with the other filters", () => {
+      sessions.filters.labels = ["ticket=example"];
+      sessions.filters.pr = "acme/widgets";
+
+      sessions.clearSessionFilters();
+
+      expect(sessions.filters.labels).toEqual([]);
+      expect(sessions.filters.pr).toBe("");
+    });
+
+    it("restores saved label filters and drops malformed ones", () => {
+      storageData.set(
+        "session-filters",
+        JSON.stringify({ labels: ["ticket=example", 7, " "], pr: " acme/widgets ", version: 2 }),
+      );
+      expect(createSessionsStore().filters.labels).toEqual(["ticket=example"]);
+      expect(createSessionsStore().filters.pr).toBe("acme/widgets");
+
+      storageData.set("session-filters", JSON.stringify({ labels: "oops", pr: 3, version: 2 }));
+      const restored = createSessionsStore().filters;
+      expect(restored.labels).toEqual([]);
+      expect(restored.pr).toBe("");
     });
   });
 
@@ -2456,9 +2475,7 @@ describe("SessionsStore", () => {
       expect(sessions.activeSessionId).toBe("skinny");
       expect(sessions.activeSession).toBeUndefined();
       await vi.waitFor(() => {
-        expect(sessions.activeSession?.first_message).toBe(
-          "hydrated from navigation",
-        );
+        expect(sessions.activeSession?.first_message).toBe("hydrated from navigation");
       });
       expect(api.getSession).toHaveBeenCalledWith("skinny");
       expect(sessions.sessions[1]!.is_index_only).toBe(false);
@@ -2468,27 +2485,21 @@ describe("SessionsStore", () => {
   describe("renameSession", () => {
     it("clears display_name in store when rename is cleared and response omits the field", async () => {
       // Session starts with a custom user rename.
-      mockSidebarIndex([
-        makeSkinnyRow({ id: "s1", display_name: "custom-name" }),
-      ]);
+      mockSidebarIndex([makeSkinnyRow({ id: "s1", display_name: "custom-name" })]);
       await sessions.load();
       expect(sessions.sessions[0]!.display_name).toBe("custom-name");
 
       // Backend clears the name but finds no agent name to restore, so
       // display_name is absent from the JSON response (omitempty on nil).
-      vi.mocked(api.renameSession).mockResolvedValue(
-        makeSession({ id: "s1" }),
-      );
+      vi.mocked(api.renameSession).mockResolvedValue(makeSession({ id: "s1" }));
 
       await sessions.renameSession("s1", null);
 
-      expect(sessions.sessions[0]!.display_name).toBeNull();
+      expect(sessions.sessions[0]!.display_name).toBeUndefined();
     });
 
     it("keeps agent name restored by backend when rename is cleared", async () => {
-      mockSidebarIndex([
-        makeSkinnyRow({ id: "s1", display_name: "custom-name" }),
-      ]);
+      mockSidebarIndex([makeSkinnyRow({ id: "s1", display_name: "custom-name" })]);
       await sessions.load();
 
       // Backend re-parsed the file and restored the agent name.
@@ -2500,6 +2511,38 @@ describe("SessionsStore", () => {
 
       expect(sessions.sessions[0]!.display_name).toBe("agent-name");
     });
+  });
+
+  it("uses machine keys as labels when an older daemon omits machine_labels", async () => {
+    api.getMachines.mockResolvedValue({ machines: ["host-a.example"] });
+
+    await sessions.loadMachines();
+
+    expect(sessions.machines).toEqual(["host-a.example"]);
+    expect(sessions.machineLabel("host-a.example")).toBe("host-a.example");
+  });
+
+  it("upgrades saved and URL machine selections using recorded aliases only", async () => {
+    localStorage.setItem(
+      "session-filters",
+      JSON.stringify({ version: 2, machine: "old-owner,installation-a,source-a" }),
+    );
+    sessions = createSessionsStore();
+    api.getMachines.mockResolvedValue({
+      machines: ["installation-a", "source-a"],
+      machine_labels: { "installation-a": "Laptop" },
+      machine_aliases: { "old-owner": "installation-a" },
+    });
+
+    await sessions.loadMachines();
+
+    expect(sessions.selectedMachines).toEqual(["installation-a", "source-a"]);
+    expect(filtersToParams(sessions.filters).machine).toBe("installation-a,source-a");
+    expect(JSON.parse(localStorage.getItem("session-filters")!).machine).toBe(
+      "installation-a,source-a",
+    );
+    sessions.initFromParams({ machine: "old-owner,Laptop,constructor" });
+    expect(sessions.selectedMachines).toEqual(["installation-a", "Laptop", "constructor"]);
   });
 
   describe("loadProjects dedup", () => {
@@ -2533,21 +2576,15 @@ describe("SessionsStore", () => {
     });
 
     it("should resolve without throwing when API rejects", async () => {
-      vi.mocked(api.getProjects).mockRejectedValueOnce(
-        new Error("network"),
-      );
+      vi.mocked(api.getProjects).mockRejectedValueOnce(new Error("network"));
 
-      await expect(
-        sessions.loadProjects(),
-      ).resolves.toBeUndefined();
+      await expect(sessions.loadProjects()).resolves.toBeUndefined();
       // Projects stay at default (empty).
       expect(sessions.projects).toHaveLength(0);
     });
 
     it("should allow retry after a failed load", async () => {
-      vi.mocked(api.getProjects).mockRejectedValueOnce(
-        new Error("network"),
-      );
+      vi.mocked(api.getProjects).mockRejectedValueOnce(new Error("network"));
       await sessions.loadProjects();
 
       // Second attempt should succeed.
@@ -2563,9 +2600,7 @@ describe("SessionsStore", () => {
       sessions.sessions = existing;
       sessions.total = 1;
 
-      vi.mocked(api.getSidebarSessionIndex).mockRejectedValueOnce(
-        new Error("network"),
-      );
+      vi.mocked(api.getSidebarSessionIndex).mockRejectedValueOnce(new Error("network"));
       await sessions.load();
 
       expect(sessions.loading).toBe(false);
@@ -2579,9 +2614,7 @@ describe("SessionsStore", () => {
       sessions.sessions = existing;
       sessions.total = 1;
 
-      vi.mocked(api.getSidebarSessionIndex).mockRejectedValueOnce(
-        new Error("network"),
-      );
+      vi.mocked(api.getSidebarSessionIndex).mockRejectedValueOnce(new Error("network"));
       sessions.initFromParams({ project: "other" });
       await sessions.load();
 
@@ -2596,9 +2629,7 @@ describe("SessionsStore", () => {
       sessions.sessions = existing;
       sessions.total = 1;
 
-      vi.mocked(api.getSidebarSessionIndex).mockRejectedValueOnce(
-        new Error("network"),
-      );
+      vi.mocked(api.getSidebarSessionIndex).mockRejectedValueOnce(new Error("network"));
       sessions.setAgentFilter("claude");
       await vi.waitFor(() => {
         expect(sessions.loading).toBe(false);
@@ -2610,22 +2641,14 @@ describe("SessionsStore", () => {
     });
 
     it("loadProjects resolves when API rejects", async () => {
-      vi.mocked(api.getProjects).mockRejectedValueOnce(
-        new Error("network"),
-      );
-      await expect(
-        sessions.loadProjects(),
-      ).resolves.toBeUndefined();
+      vi.mocked(api.getProjects).mockRejectedValueOnce(new Error("network"));
+      await expect(sessions.loadProjects()).resolves.toBeUndefined();
       expect(sessions.projects).toHaveLength(0);
     });
 
     it("loadAgents resolves when API rejects", async () => {
-      vi.mocked(api.getAgents).mockRejectedValueOnce(
-        new Error("network"),
-      );
-      await expect(
-        sessions.loadAgents(),
-      ).resolves.toBeUndefined();
+      vi.mocked(api.getAgents).mockRejectedValueOnce(new Error("network"));
+      await expect(sessions.loadAgents()).resolves.toBeUndefined();
       expect(sessions.agents).toHaveLength(0);
     });
   });
@@ -2646,7 +2669,9 @@ describe("SessionsStore", () => {
     it("discards stale projects response after invalidation", async () => {
       let resolveStale!: (v: { projects: { name: string; session_count: number }[] }) => void;
       const stalePromise = new Promise<{ projects: { name: string; session_count: number }[] }>(
-        (r) => { resolveStale = r; },
+        (r) => {
+          resolveStale = r;
+        },
       );
       vi.mocked(api.getProjects)
         .mockReturnValueOnce(stalePromise)
@@ -2655,7 +2680,7 @@ describe("SessionsStore", () => {
         });
 
       // Start first load (will hang on stalePromise).
-      sessions.loadProjects();
+      void sessions.loadProjects();
 
       // Invalidate before stale resolves — bumps version,
       // clears promise, and starts a fresh load.
@@ -2676,16 +2701,16 @@ describe("SessionsStore", () => {
     it("discards stale agents response after invalidation", async () => {
       type AgentsRes = { agents: { name: string; session_count: number }[] };
       let resolveStale!: (v: AgentsRes) => void;
-      const stalePromise = new Promise<AgentsRes>(
-        (r) => { resolveStale = r; },
-      );
+      const stalePromise = new Promise<AgentsRes>((r) => {
+        resolveStale = r;
+      });
       vi.mocked(api.getAgents)
         .mockReturnValueOnce(stalePromise)
         .mockResolvedValueOnce({
           agents: [{ name: "fresh-agent", session_count: 3 }],
         });
 
-      sessions.loadAgents();
+      void sessions.loadAgents();
       sessions.invalidateFilterCaches();
 
       resolveStale({
@@ -2731,6 +2756,200 @@ describe("SessionsStore", () => {
       expect(api.getSession).not.toHaveBeenCalled();
     });
 
+    it("flags not-found when the metadata fetch 404s", async () => {
+      mockSidebarPage();
+      vi.mocked(api.getSession).mockRejectedValue(new ApiError(404, "session not found"));
+
+      await sessions.navigateToSession("missing");
+
+      expect(sessions.activeSessionId).toBe("missing");
+      expect(sessions.activeSessionNotFound).toBe(true);
+    });
+
+    it("does not flag not-found for non-404 failures", async () => {
+      mockSidebarPage();
+      vi.mocked(api.getSession).mockRejectedValue(new ApiError(500, "boom"));
+
+      await sessions.navigateToSession("missing");
+
+      expect(sessions.activeSessionNotFound).toBe(false);
+    });
+
+    it("clears the not-found flag when the selection changes", async () => {
+      mockSidebarPage();
+      vi.mocked(api.getSession).mockRejectedValue(new ApiError(404, "session not found"));
+      await sessions.navigateToSession("missing");
+      expect(sessions.activeSessionNotFound).toBe(true);
+
+      sessions.sessions = [makeSession({ id: "other" })];
+      sessions.selectSession("other");
+
+      expect(sessions.activeSessionNotFound).toBe(false);
+    });
+
+    it("retryActiveSession refetches and clears the flag on success", async () => {
+      mockSidebarPage();
+      vi.mocked(api.getSession).mockRejectedValueOnce(new ApiError(404, "session not found"));
+      await sessions.navigateToSession("late");
+      expect(sessions.activeSessionNotFound).toBe(true);
+
+      const loadVersion = sessions.activeSessionLoadVersion;
+      vi.mocked(api.getSession).mockResolvedValue(makeSession({ id: "late" }));
+      await sessions.retryActiveSession();
+
+      expect(sessions.activeSessionId).toBe("late");
+      expect(sessions.activeSessionNotFound).toBe(false);
+      expect(sessions.sessions.some((s) => s.id === "late")).toBe(true);
+      expect(sessions.activeSessionLoadVersion).toBe(loadVersion + 1);
+    });
+
+    it("retryActiveSession keeps the flag while the session is still missing", async () => {
+      mockSidebarPage();
+      vi.mocked(api.getSession).mockRejectedValue(new ApiError(404, "session not found"));
+      await sessions.navigateToSession("missing");
+      expect(sessions.activeSessionNotFound).toBe(true);
+
+      const loadVersion = sessions.activeSessionLoadVersion;
+      await sessions.retryActiveSession();
+
+      expect(sessions.activeSessionId).toBe("missing");
+      expect(sessions.activeSessionNotFound).toBe(true);
+      expect(sessions.activeSessionLoadVersion).toBe(loadVersion);
+    });
+
+    it("retryActiveSession keeps the flag when the retry fails without a 404", async () => {
+      sessions.sessions = [makeSession({ id: "gone" })];
+      sessions.selectSession("gone");
+      sessions.activeSessionNotFound = true;
+      vi.mocked(api.getSession).mockRejectedValue(new ApiError(500, "boom"));
+
+      await sessions.retryActiveSession();
+
+      expect(sessions.activeSessionNotFound).toBe(true);
+    });
+
+    it("retryActiveSession verifies a hydrated row and recovers", async () => {
+      sessions.sessions = [makeSession({ id: "gone", first_message: "cached" })];
+      sessions.selectSession("gone");
+      sessions.activeSessionNotFound = true;
+      const loadVersion = sessions.activeSessionLoadVersion;
+      vi.mocked(api.getSession).mockResolvedValue(
+        makeSession({ id: "gone", first_message: "restored" }),
+      );
+
+      await sessions.retryActiveSession();
+
+      expect(sessions.activeSessionNotFound).toBe(false);
+      expect(sessions.activeSessionLoadVersion).toBe(loadVersion + 1);
+      expect(sessions.sessions[0]!.first_message).toBe("restored");
+    });
+
+    it("retryActiveSession rehydrates an index-only row and recovers", async () => {
+      sessions.sessions = [
+        makeSession({
+          id: "late",
+          first_message: null,
+          is_index_only: true,
+        }),
+      ];
+      vi.mocked(api.getSession).mockRejectedValueOnce(new ApiError(404, "session not found"));
+      await sessions.navigateToSession("late");
+      expect(sessions.activeSessionNotFound).toBe(true);
+
+      const loadVersion = sessions.activeSessionLoadVersion;
+      vi.mocked(api.getSession).mockResolvedValue(
+        makeSession({ id: "late", first_message: "synced" }),
+      );
+      await sessions.retryActiveSession();
+
+      expect(sessions.activeSessionNotFound).toBe(false);
+      expect(sessions.activeSessionLoadVersion).toBe(loadVersion + 1);
+      expect(sessions.sessions[0]!.is_index_only).toBe(false);
+    });
+
+    it("does not bump the load version on a first successful load", async () => {
+      mockSidebarPage();
+      const loadVersion = sessions.activeSessionLoadVersion;
+      vi.mocked(api.getSession).mockResolvedValue(makeSession({ id: "fresh" }));
+
+      await sessions.navigateToSession("fresh");
+
+      expect(sessions.activeSessionNotFound).toBe(false);
+      expect(sessions.activeSessionLoadVersion).toBe(loadVersion);
+    });
+
+    it("ignores a stale hydration 404 after the sidebar index moved on", async () => {
+      sessions.sessions = [
+        makeSession({
+          id: "stale",
+          first_message: null,
+          is_index_only: true,
+        }),
+      ];
+      let rejectGet!: (err: unknown) => void;
+      vi.mocked(api.getSession).mockReturnValue(
+        new Promise((_resolve, reject) => {
+          rejectGet = reject;
+        }),
+      );
+
+      const promise = sessions.navigateToSession("stale");
+      sessions.sidebarIndexVersion += 1;
+      rejectGet(new ApiError(404, "session not found"));
+      await promise;
+
+      expect(sessions.activeSessionNotFound).toBe(false);
+    });
+
+    it("flags not-found when index-only hydration 404s", async () => {
+      sessions.sessions = [
+        makeSession({
+          id: "stale",
+          first_message: null,
+          is_index_only: true,
+        }),
+      ];
+      vi.mocked(api.getSession).mockRejectedValue(new ApiError(404, "session not found"));
+
+      await sessions.navigateToSession("stale");
+
+      expect(sessions.activeSessionId).toBe("stale");
+      expect(sessions.activeSessionNotFound).toBe(true);
+      expect(sessions.sessions[0]!.is_index_only).toBe(true);
+    });
+
+    it("does not flag not-found when index-only hydration fails without a 404", async () => {
+      sessions.sessions = [
+        makeSession({
+          id: "stale",
+          first_message: null,
+          is_index_only: true,
+        }),
+      ];
+      vi.mocked(api.getSession).mockRejectedValue(new ApiError(500, "boom"));
+
+      await sessions.navigateToSession("stale");
+
+      expect(sessions.activeSessionNotFound).toBe(false);
+    });
+
+    it("does not flag not-found when hydration 404s for an inactive row", async () => {
+      sessions.sessions = [
+        makeSession({ id: "active" }),
+        makeSession({
+          id: "stale",
+          first_message: null,
+          is_index_only: true,
+        }),
+      ];
+      sessions.selectSession("active");
+      vi.mocked(api.getSession).mockRejectedValue(new ApiError(404, "session not found"));
+
+      await sessions.hydrateVisibleSessions(["stale"]);
+
+      expect(sessions.activeSessionNotFound).toBe(false);
+    });
+
     it("hydrates an already-loaded index-only session", async () => {
       sessions.sessions = [
         makeSession({
@@ -2750,9 +2969,7 @@ describe("SessionsStore", () => {
 
       expect(api.getSession).toHaveBeenCalledWith("existing");
       expect(sessions.activeSessionId).toBe("existing");
-      expect(sessions.sessions[0]!.first_message).toBe(
-        "hydrated navigation",
-      );
+      expect(sessions.sessions[0]!.first_message).toBe("hydrated navigation");
       expect(sessions.sessions[0]!.is_index_only).toBe(false);
     });
 
@@ -2772,53 +2989,57 @@ describe("SessionsStore", () => {
           is_index_only: true,
         }),
       ];
-      resolveGet(makeSession({
-        id: "racy",
-        first_message: "fetched during navigation",
-      }));
+      resolveGet(
+        makeSession({
+          id: "racy",
+          first_message: "fetched during navigation",
+        }),
+      );
       await promise;
 
       expect(sessions.sessions).toHaveLength(1);
-      expect(sessions.sessions[0]!.first_message).toBe(
-        "fetched during navigation",
-      );
+      expect(sessions.sessions[0]!.first_message).toBe("fetched during navigation");
       expect(sessions.sessions[0]!.is_index_only).toBe(false);
-      expect(sessions.activeSession?.first_message).toBe(
-        "fetched during navigation",
-      );
+      expect(sessions.activeSession?.first_message).toBe("fetched during navigation");
     });
   });
 
   describe("route cancellation", () => {
     it("aborts pagination and treats cancellation as normal completion", async () => {
-      const signals: AbortSignal[] = [];
-      vi.mocked(callGenerated).mockImplementation(
-        (request: () => Promise<unknown>, signal?: AbortSignal) => {
-          if (signal) signals.push(signal);
-          return rejectGeneratedRequestOnAbort(request, signal);
-        },
+      vi.mocked(SessionsService.getApiV1SessionsSidebarIndex).mockImplementation(
+        (params, options) =>
+          rejectGeneratedRequestOnAbort(
+            () => api.getSidebarSessionIndex(params),
+            options?.signal ?? undefined,
+          ) as ReturnType<typeof SessionsService.getApiV1SessionsSidebarIndex>,
       );
-      vi.mocked(api.getSidebarSessionIndex).mockReturnValue(
-        new Promise(() => {}),
-      );
+      vi.mocked(api.getSidebarSessionIndex).mockReturnValue(new Promise(() => {}));
       sessions.nextCursor = "next";
 
       const load = sessions.loadMore();
       await Promise.resolve();
       sessions.cancelRouteReads();
 
-      expect(signals).toHaveLength(1);
-      expect(signals[0]?.aborted).toBe(true);
+      expect(
+        vi
+          .mocked(SessionsService.getApiV1SessionsSidebarIndex)
+          .mock.calls.map((call) => call[1]?.signal),
+      ).toHaveLength(1);
+      expect(
+        vi.mocked(SessionsService.getApiV1SessionsSidebarIndex).mock.calls[0]?.[1]?.signal?.aborted,
+      ).toBe(true);
       await expect(load).resolves.toBeUndefined();
     });
 
     it("keeps a replacement signal-detail request registered", async () => {
-      vi.mocked(callGenerated).mockImplementation(
-        rejectGeneratedRequestOnAbort,
+      vi.mocked(SessionsService.getApiV1SessionsById).mockImplementation(
+        ({ id }, options) =>
+          rejectGeneratedRequestOnAbort(
+            () => api.getSession(id),
+            options?.signal ?? undefined,
+          ) as ReturnType<typeof SessionsService.getApiV1SessionsById>,
       );
-      vi.mocked(api.getSession).mockReturnValue(
-        new Promise(() => {}),
-      );
+      vi.mocked(api.getSession).mockReturnValue(new Promise(() => {}));
 
       const obsolete = sessions.fetchSignalDetail("detail");
       await Promise.resolve();
@@ -2834,10 +3055,21 @@ describe("SessionsStore", () => {
   });
 });
 
-function makeSession(
-  overrides: Partial<Session> & { id: string },
-): Session {
+function makeSession(overrides: Partial<Session> & { id: string }): Session {
   return {
+    compaction_count: 0,
+    consecutive_failure_max: 0,
+    edit_churn_count: 0,
+    ended_with_role: "",
+    final_failure_streak: 0,
+    has_peak_context_tokens: false,
+    has_total_output_tokens: false,
+    mid_task_compaction_count: 0,
+    outcome: "",
+    outcome_confidence: "",
+    secret_leak_count: 0,
+    tool_failure_signal_count: 0,
+    tool_retry_count: 0,
     project: "proj",
     machine: "local",
     agent: "claude",
@@ -2942,6 +3174,25 @@ describe("buildSessionGroups", () => {
 
     expect(groups).toHaveLength(1);
     expect(groups[0]!.sessions.map((s) => s.id)).toContain("teammate");
+  });
+
+  it("includes a shared hosted child under both proven parent variants", () => {
+    const rows = [
+      makeSession({ id: "parent-a", project: "proj" }),
+      makeSession({ id: "parent-b", project: "proj" }),
+      {
+        ...makeSession({ id: "shared-child", project: "proj" }),
+        parent_session_ids: ["parent-a", "parent-b"],
+        relationship_type: "subagent",
+      },
+    ];
+    const groups = buildSessionGroups(rows);
+    expect(
+      groups.map((group) => ({ key: group.key, ids: group.sessions.map((session) => session.id) })),
+    ).toEqual([
+      { key: "parent-a", ids: ["parent-a", "shared-child"] },
+      { key: "parent-b", ids: ["parent-b", "shared-child"] },
+    ]);
   });
 
   it("groups two-session chain", () => {
@@ -3322,26 +3573,28 @@ describe("SessionsStore live refresh", () => {
   it("messages events invalidate hydrated detail without reloading the index", async () => {
     const { events } = await import("./events.svelte.js");
     let registered: ((e: { scope: string }) => void) | null = null;
-    const spy = vi
-      .spyOn(events, "subscribe")
-      .mockImplementation((fn) => {
-        registered = fn as (e: { scope: string }) => void;
-        return () => {};
-      });
+    const spy = vi.spyOn(events, "subscribe").mockImplementation((fn) => {
+      registered = fn as (e: { scope: string }) => void;
+      return () => {};
+    });
 
     mockSidebarIndex([makeSkinnyRow({ id: "row" })]);
     const sessions = createSessionsStore();
     const detach = sessions.attachSidebar();
     await sessions.load();
     vi.mocked(api.getSession)
-      .mockResolvedValueOnce(makeSession({
-        id: "row",
-        first_message: "first hydrate",
-      }))
-      .mockResolvedValueOnce(makeSession({
-        id: "row",
-        first_message: "second hydrate",
-      }));
+      .mockResolvedValueOnce(
+        makeSession({
+          id: "row",
+          first_message: "first hydrate",
+        }),
+      )
+      .mockResolvedValueOnce(
+        makeSession({
+          id: "row",
+          first_message: "second hydrate",
+        }),
+      );
     await sessions.hydrateVisibleSessions(["row"]);
 
     expect(api.getSidebarSessionIndex).toHaveBeenCalledTimes(1);
@@ -3363,28 +3616,26 @@ describe("SessionsStore live refresh", () => {
   it("messages events refresh active child sessions", async () => {
     const { events } = await import("./events.svelte.js");
     let registered: ((e: { scope: string }) => void) | null = null;
-    const spy = vi
-      .spyOn(events, "subscribe")
-      .mockImplementation((fn) => {
-        registered = fn as (e: { scope: string }) => void;
-        return () => {};
-      });
+    const spy = vi.spyOn(events, "subscribe").mockImplementation((fn) => {
+      registered = fn as (e: { scope: string }) => void;
+      return () => {};
+    });
 
-    vi.mocked(SessionsService.getApiV1SessionsIdChildren)
+    vi.mocked(SessionsService.getApiV1SessionsByIdChildren)
       .mockResolvedValueOnce([
         makeSession({
           id: "child",
           parent_session_id: "root",
           transcript_revision: "child-rev-1",
         }),
-      ] as Session[])
+      ] as unknown as DbSession[])
       .mockResolvedValueOnce([
         makeSession({
           id: "child",
           parent_session_id: "root",
           transcript_revision: "child-rev-2",
         }),
-      ] as Session[]);
+      ] as unknown as DbSession[]);
 
     const sessions = createSessionsStore();
     const detach = sessions.attachSidebar();
@@ -3398,7 +3649,7 @@ describe("SessionsStore live refresh", () => {
     await vi.waitFor(() => {
       expect(sessions.childSessions.get("child")?.transcript_revision).toBe("child-rev-2");
     });
-    expect(SessionsService.getApiV1SessionsIdChildren).toHaveBeenCalledTimes(2);
+    expect(SessionsService.getApiV1SessionsByIdChildren).toHaveBeenCalledTimes(2);
     expect(sessions.activeSessionUsageVersion).toBe(1);
 
     detach();
@@ -3409,12 +3660,10 @@ describe("SessionsStore live refresh", () => {
     vi.useFakeTimers();
     const { events } = await import("./events.svelte.js");
     let registered: ((e: { scope: string }) => void) | null = null;
-    const spy = vi
-      .spyOn(events, "subscribe")
-      .mockImplementation((fn) => {
-        registered = fn as (e: { scope: string }) => void;
-        return () => {};
-      });
+    const spy = vi.spyOn(events, "subscribe").mockImplementation((fn) => {
+      registered = fn as (e: { scope: string }) => void;
+      return () => {};
+    });
 
     const sessions = createSessionsStore();
     const detach = sessions.attachSidebar();
@@ -3434,15 +3683,52 @@ describe("SessionsStore live refresh", () => {
     vi.useRealTimers();
   });
 
+  it("sessions events refresh active session labels", async () => {
+    const { events } = await import("./events.svelte.js");
+    let registered: ((e: { scope: string }) => void) | null = null;
+    const spy = vi.spyOn(events, "subscribe").mockImplementation((fn) => {
+      registered = fn as (e: { scope: string }) => void;
+      return () => {};
+    });
+
+    const sessions = createSessionsStore();
+    const detach = sessions.attachSidebar();
+    sessions.activeSessionId = "worker";
+    sessions.sessions = [
+      makeSession({
+        id: "worker",
+        labels: ["role=reviewer"],
+        parent_session_id: "manager",
+        parent_session_ids: ["manager"],
+        relationship_type: "subagent",
+      }),
+    ];
+    vi.mocked(api.getSession).mockResolvedValue(makeSession({ id: "worker", labels: [] }));
+    expect(sessions.activeSession?.labels).toEqual(["role=reviewer"]);
+
+    registered!({ scope: "sessions" });
+    await vi.waitFor(() => {
+      expect(sessions.activeSession?.labels).toEqual([]);
+      expect(sessions.activeSession?.parent_session_id).toBeUndefined();
+      expect(sessions.activeSession?.parent_session_ids).toBeUndefined();
+      expect(sessions.activeSession?.relationship_type).toBeUndefined();
+    });
+    expect(SessionsService.getApiV1SessionsById).toHaveBeenCalledWith(
+      { id: "worker" },
+      expect.any(Object),
+    );
+
+    detach();
+    spy.mockRestore();
+  });
+
   it("sessions events replace cached project filter options", async () => {
     const { events } = await import("./events.svelte.js");
     let registered: ((e: { scope: string }) => void) | null = null;
-    const spy = vi
-      .spyOn(events, "subscribe")
-      .mockImplementation((fn) => {
-        registered = fn as (e: { scope: string }) => void;
-        return () => {};
-      });
+    const spy = vi.spyOn(events, "subscribe").mockImplementation((fn) => {
+      registered = fn as (e: { scope: string }) => void;
+      return () => {};
+    });
 
     vi.mocked(api.getProjects)
       .mockResolvedValueOnce({
@@ -3454,15 +3740,11 @@ describe("SessionsStore live refresh", () => {
     const sessions = createSessionsStore();
     const detach = sessions.attachSidebar();
     await sessions.loadProjects();
-    expect(sessions.projects).toEqual([
-      { name: "old-project", session_count: 1 },
-    ]);
+    expect(sessions.projects).toEqual([{ name: "old-project", session_count: 1 }]);
 
     registered!({ scope: "sessions" });
     await vi.waitFor(() => {
-      expect(sessions.projects).toEqual([
-        { name: "new-project", session_count: 1 },
-      ]);
+      expect(sessions.projects).toEqual([{ name: "new-project", session_count: 1 }]);
     });
     expect(api.getProjects).toHaveBeenCalledTimes(2);
 
@@ -3473,9 +3755,7 @@ describe("SessionsStore live refresh", () => {
   it("refetches on the 5-minute safety-net interval", async () => {
     vi.useFakeTimers();
     const { events } = await import("./events.svelte.js");
-    const spy = vi
-      .spyOn(events, "subscribe")
-      .mockReturnValue(() => {});
+    const spy = vi.spyOn(events, "subscribe").mockReturnValue(() => {});
 
     const sessions = createSessionsStore();
     const detach = sessions.attachSidebar();
@@ -3496,25 +3776,23 @@ describe("SessionsStore live refresh", () => {
   it("refreshes active child sessions on the 5-minute safety-net interval", async () => {
     vi.useFakeTimers();
     const { events } = await import("./events.svelte.js");
-    const spy = vi
-      .spyOn(events, "subscribe")
-      .mockReturnValue(() => {});
+    const spy = vi.spyOn(events, "subscribe").mockReturnValue(() => {});
 
-    vi.mocked(SessionsService.getApiV1SessionsIdChildren)
+    vi.mocked(SessionsService.getApiV1SessionsByIdChildren)
       .mockResolvedValueOnce([
         makeSession({
           id: "child",
           parent_session_id: "root",
           total_output_tokens: 1,
         }),
-      ] as Session[])
+      ] as unknown as DbSession[])
       .mockResolvedValueOnce([
         makeSession({
           id: "child",
           parent_session_id: "root",
           total_output_tokens: 9,
         }),
-      ] as Session[]);
+      ] as unknown as DbSession[]);
 
     const sessions = createSessionsStore();
     const detach = sessions.attachSidebar();
@@ -3529,7 +3807,7 @@ describe("SessionsStore live refresh", () => {
     await vi.waitFor(() => {
       expect(sessions.childSessions.get("child")?.total_output_tokens).toBe(9);
     });
-    expect(SessionsService.getApiV1SessionsIdChildren).toHaveBeenCalledTimes(2);
+    expect(SessionsService.getApiV1SessionsByIdChildren).toHaveBeenCalledTimes(2);
     expect(sessions.activeSessionUsageVersion).toBe(1);
 
     detach();
@@ -3541,9 +3819,7 @@ describe("SessionsStore live refresh", () => {
     vi.useFakeTimers();
     const { events } = await import("./events.svelte.js");
     const unsub = vi.fn();
-    const spy = vi
-      .spyOn(events, "subscribe")
-      .mockReturnValue(unsub);
+    const spy = vi.spyOn(events, "subscribe").mockReturnValue(unsub);
 
     const sessions = createSessionsStore();
     sessions.attachSidebar();

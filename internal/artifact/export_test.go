@@ -3,7 +3,8 @@ package artifact
 import (
 	"context"
 	"database/sql"
-	"encoding/json"
+	"encoding/json/jsontext"
+	"encoding/json/v2"
 	"errors"
 	"fmt"
 	"io"
@@ -42,7 +43,7 @@ func assertNoPublishedArtifacts(t *testing.T, store ArtifactStore, origin string
 func testExportDB(t *testing.T) *db.DB {
 	t.Helper()
 	database := testDB(t)
-	require.NoError(t, database.SetSyncState(originStateKey, contractOrigin))
+	require.NoError(t, database.SetSyncState(t.Context(), originStateKey, contractOrigin))
 	return database
 }
 
@@ -59,7 +60,7 @@ func seedBareExportSessions(
 ) {
 	t.Helper()
 	ctx := t.Context()
-	require.NoError(t, database.Update(func(tx *sql.Tx) error {
+	require.NoError(t, database.Update(ctx, func(tx *sql.Tx) error {
 		stmt, err := tx.PrepareContext(ctx, `INSERT INTO sessions
 			(id, project, machine, agent, created_at)
 			VALUES (?, 'project', ?, 'claude', '2026-06-14T01:02:03Z')`)
@@ -85,6 +86,7 @@ func seedBareExportSessions(
 // peer.go.
 func latestStoreCheckpointForTest(t *testing.T, store ArtifactStore, origin string) *checkpoint {
 	t.Helper()
+
 	ctx := t.Context()
 	page, err := firstStoreEntryPage(ctx, store, origin, KindCheckpoints, maxArtifactListPageSize)
 	require.NoError(t, err)
@@ -353,7 +355,7 @@ func (s *staleClaimExportDB) ApplyArtifactPublicationChanges(
 	changes []db.ArtifactPublicationChange,
 ) (int64, bool, error) {
 	s.once.Do(func() {
-		_ = s.ReplaceSessionMessages("sess-1", []db.Message{{
+		_ = s.ReplaceSessionMessages(ctx, "sess-1", []db.Message{{
 			SessionID: "sess-1", Ordinal: 0, Role: "user", Content: "newer",
 		}})
 	})
@@ -381,7 +383,7 @@ func (s *mutateAfterCheckpointStore) Create(
 			if sessionID == "" {
 				sessionID = "sess-1"
 			}
-			_ = s.database.ReplaceSessionMessages(sessionID, []db.Message{{
+			_ = s.database.ReplaceSessionMessages(ctx, sessionID, []db.Message{{
 				SessionID: sessionID, Ordinal: 0, Role: "user", Content: "newest",
 			}})
 		})
@@ -393,6 +395,7 @@ func deterministicRejectionBatch(
 	t *testing.T,
 ) (*db.DB, ArtifactStore, artifactLimits) {
 	t.Helper()
+
 	database := testExportDB(t)
 	filesystem, err := newProtocolTestStore(t.TempDir())
 	require.NoError(t, err)
@@ -403,7 +406,7 @@ func deterministicRejectionBatch(
 		Origin: contractOrigin, SessionIDs: []string{"rejected"},
 	})
 	require.NoError(t, err)
-	require.NoError(t, database.ReplaceSessionMessages("rejected", []db.Message{
+	require.NoError(t, database.ReplaceSessionMessages(t.Context(), "rejected", []db.Message{
 		{SessionID: "rejected", Ordinal: 0, Role: "user", Content: "one"},
 		{SessionID: "rejected", Ordinal: 1, Role: "assistant", Content: "two"},
 		{SessionID: "rejected", Ordinal: 2, Role: "user", Content: "three"},
@@ -440,15 +443,24 @@ func TestExportContinuesPastDeterministicRejection(t *testing.T) {
 	assert.Contains(t, rejection.Error, "message count exceeds 2")
 }
 
-func TestExportContinuesPastInvalidTokenUsage(t *testing.T) {
+// Invalid token usage no longer costs a session its artifact export. The
+// db layer clears a malformed usage blob on read, in scanMessages, which
+// this export path loads through (artifact_export_load.go), so the value
+// can no longer reach the segment encoder.
+// Previously one truncated usage object -- the same corruption that
+// panicked GET /api/v1/sessions/{id}/messages -- rejected the whole
+// session here. Export continuing past a genuinely un-encodable session
+// stays covered by TestExportContinuesPastInvalidManifestValue and
+// TestExportContinuesPastDeterministicRejection.
+func TestExportSanitizesInvalidTokenUsage(t *testing.T) {
 	t.Parallel()
 
 	database := testExportDB(t)
 	store := newTestArtifactStore(t)
 	seedSession(t, database, "invalid", "alpha")
-	require.NoError(t, database.ReplaceSessionMessages("invalid", []db.Message{{
+	require.NoError(t, database.ReplaceSessionMessages(t.Context(), "invalid", []db.Message{{
 		SessionID: "invalid", Ordinal: 0, Role: "assistant",
-		Content: "bad usage", TokenUsage: json.RawMessage(`{"input_tokens":`),
+		Content: "bad usage", TokenUsage: jsontext.Value(`{"input_tokens":`),
 	}}))
 	seedSession(t, database, "valid", "alpha")
 
@@ -456,18 +468,24 @@ func TestExportContinuesPastInvalidTokenUsage(t *testing.T) {
 		t.Context(), database, store, ExportOptions{Origin: contractOrigin},
 	)
 	require.NoError(t, err)
-	assert.Equal(t, 1, result.ExportedSessions)
-	assert.Equal(t, 1, result.RejectedSessions)
+	assert.Equal(t, 2, result.ExportedSessions)
+	assert.Equal(t, 0, result.RejectedSessions)
 	checkpoint := latestStoreCheckpointForTest(t, store, contractOrigin)
-	assert.NotContains(t, checkpoint.Sessions, contractOrigin+"~invalid")
+	assert.Contains(t, checkpoint.Sessions, contractOrigin+"~invalid")
 	assert.Contains(t, checkpoint.Sessions, contractOrigin+"~valid")
 	pending, err := database.PendingArtifactExports(t.Context(), 10)
 	require.NoError(t, err)
 	assert.Empty(t, pending)
-	rejection, ok, err := database.GetArtifactExportRejection(t.Context(), "invalid")
+	_, ok, err := database.GetArtifactExportRejection(t.Context(), "invalid")
 	require.NoError(t, err)
-	require.True(t, ok)
-	assert.Contains(t, rejection.Error, "encoding message segment at ordinal 0")
+	assert.False(t, ok, "a sanitized usage blob must not reject the session")
+
+	// The message itself survives; only the unusable metadata is dropped.
+	msgs, err := database.GetAllMessages(t.Context(), "invalid")
+	require.NoError(t, err)
+	require.Len(t, msgs, 1)
+	assert.Equal(t, "bad usage", msgs[0].Content)
+	assert.Empty(t, string(msgs[0].TokenUsage))
 }
 
 func TestExportContinuesPastInvalidManifestValue(t *testing.T) {
@@ -476,7 +494,7 @@ func TestExportContinuesPastInvalidManifestValue(t *testing.T) {
 	database := testExportDB(t)
 	store := newTestArtifactStore(t)
 	seedSession(t, database, "invalid", "alpha")
-	require.NoError(t, database.UpdateSessionSignals(
+	require.NoError(t, database.UpdateSessionSignals(t.Context(),
 		"invalid", db.SessionSignalUpdate{
 			ContextPressureMax: new(math.Inf(1)),
 		},
@@ -538,9 +556,9 @@ func TestFullExportRemovesPublishedNativeSessionIDRejectedByCurrentWire(t *testi
 
 	ctx := t.Context()
 	databasePath := filepath.Join(t.TempDir(), "archive.db")
-	database, err := db.Open(databasePath)
+	database, err := db.Open(ctx, databasePath)
 	require.NoError(t, err)
-	require.NoError(t, database.SetSyncState(originStateKey, contractOrigin))
+	require.NoError(t, database.SetSyncState(ctx, originStateKey, contractOrigin))
 	store := newTestArtifactStore(t)
 	seedSession(t, database, "legacy~native", "alpha")
 
@@ -590,7 +608,7 @@ func TestFullExportRemovesPublishedNativeSessionIDRejectedByCurrentWire(t *testi
 	))
 	require.NoError(t, database.Close())
 
-	database, err = db.Open(databasePath)
+	database, err = db.Open(ctx, databasePath)
 	require.NoError(t, err)
 	t.Cleanup(func() { require.NoError(t, database.Close()) })
 	result, err := ExportToStore(ctx, database, store, ExportOptions{
@@ -737,6 +755,30 @@ func TestExportToStorePublishesDependenciesBeforeCheckpointAndSkipsUnchanged(t *
 	assert.False(t, store.creates[1].Created)
 }
 
+func TestExportManifestVersionTracksPRLinks(t *testing.T) {
+	for _, links := range [][]db.PRLink{nil, {{URL: "https://github.com/owner/repo/pull/7", Host: "github.com", Repository: "owner/repo", Number: 7}}} {
+		database := testExportDB(t)
+		store := newTestArtifactStore(t)
+		seedSession(t, database, "sess-1", "alpha", func(sess *db.Session) { sess.PRLinks = links })
+		result, err := ExportToStore(t.Context(), database, store, ExportOptions{Origin: contractOrigin})
+		require.NoError(t, err)
+		require.Equal(t, 1, result.ExportedSessions)
+		checkpoint := latestStoreCheckpointForTest(t, store, contractOrigin)
+		ref, err := NewRef(contractOrigin, KindManifests, checkpoint.Sessions[contractOrigin+"~sess-1"]+".json")
+		require.NoError(t, err)
+		data := readContractArtifact(t, store, ref)
+		published, err := decodeManifestWithLimits(data, productionArtifactLimits())
+		require.NoError(t, err)
+		if len(links) == 0 {
+			assert.Equal(t, 5, published.Version)
+			assert.NotContains(t, string(data), `"pr_links"`)
+		} else {
+			assert.Equal(t, 6, published.Version)
+			assert.Equal(t, links, published.Session.PRLinks)
+		}
+	}
+}
+
 func TestExportKeepsAgentSessionNameSeparateFromUserDisplayName(t *testing.T) {
 	t.Parallel()
 
@@ -747,7 +789,7 @@ func TestExportKeepsAgentSessionNameSeparateFromUserDisplayName(t *testing.T) {
 		sess.SessionName = &agentName
 	})
 	var storedDisplayName, storedSessionName *string
-	require.NoError(t, database.Reader().QueryRow(
+	require.NoError(t, database.Reader().QueryRow(t.Context(),
 		`SELECT display_name, session_name FROM sessions WHERE id = ?`, "sess-1",
 	).Scan(&storedDisplayName, &storedSessionName))
 	assert.Nil(t, storedDisplayName)
@@ -778,7 +820,7 @@ func TestExportToStorePublishesConfiguredHostnameSession(t *testing.T) {
 	t.Parallel()
 
 	database := testExportDB(t)
-	require.NoError(t, database.SetSyncState(
+	require.NoError(t, database.SetSyncState(t.Context(),
 		"artifact_local_machine_name", "workstation.example",
 	))
 	seedSession(t, database, "sess-hostname", "alpha", func(sess *db.Session) {
@@ -794,6 +836,81 @@ func TestExportToStorePublishesConfiguredHostnameSession(t *testing.T) {
 	assert.Equal(t, 1, result.ExportedSessions)
 	checkpoint := latestStoreCheckpointForTest(t, store, contractOrigin)
 	assert.Contains(t, checkpoint.Sessions, contractOrigin+"~sess-hostname")
+}
+
+func TestExportPreservesSessionIDsAfterInstallationAdoption(t *testing.T) {
+	t.Parallel()
+
+	database := testExportDB(t)
+	store := newTestArtifactStore(t)
+	sourcePath := filepath.Join(t.TempDir(), "session.jsonl")
+	require.NoError(t, database.SetSyncState(t.Context(),
+		"artifact_local_machine_name", "workstation.example",
+	))
+	seedSession(t, database, "hostname-session", "alpha", func(sess *db.Session) {
+		sess.Machine = "workstation.example"
+		sess.FilePath = &sourcePath
+	})
+	seedSession(t, database, "legacy-session", "alpha")
+	_, err := ExportToStore(t.Context(), database, store, ExportOptions{Origin: contractOrigin})
+	require.NoError(t, err)
+	before := latestStoreCheckpointForTest(t, store, contractOrigin)
+	require.Len(t, before.Sessions, 2)
+
+	const installationID = "0123456789abcdef0123456789abcdef"
+	_, err = database.EnsureInstallationIdentity(t.Context(), installationID)
+	require.NoError(t, err)
+	for _, session := range []struct{ id, machine string }{
+		{"installation-session", installationID},
+		{"unrelated-alias", "renamed.example"},
+		{"foreign-source", "peer.example"},
+		{"retired-key-peer", "workstation.example"},
+	} {
+		seedSession(t, database, session.id, "alpha", func(sess *db.Session) {
+			sess.Machine = session.machine
+			sess.FilePath = &sourcePath
+		})
+		require.NoError(t, database.SetSyncState(t.Context(), "machine_label:"+session.machine, "workstation.example"))
+	}
+	foreignSource := []db.SessionSourcePath{{Agent: "claude", FilePath: sourcePath}}
+	require.NoError(t, database.ReplaceActiveSessionSourceBaselines(
+		t.Context(), "peer.example", foreignSource, foreignSource,
+	))
+	_, err = ExportToStore(t.Context(), database, store, ExportOptions{Origin: contractOrigin})
+	require.NoError(t, err)
+	incremental := latestStoreCheckpointForTest(t, store, contractOrigin)
+	assert.Len(t, incremental.Sessions, 3)
+	assert.Contains(t, incremental.Sessions, contractOrigin+"~hostname-session")
+	assert.Contains(t, incremental.Sessions, contractOrigin+"~legacy-session")
+	assert.Contains(t, incremental.Sessions, contractOrigin+"~installation-session")
+	assert.NotContains(t, incremental.Sessions, contractOrigin+"~unrelated-alias")
+	assert.NotContains(t, incremental.Sessions, contractOrigin+"~foreign-source")
+	assert.NotContains(t, incremental.Sessions, contractOrigin+"~retired-key-peer")
+
+	require.NoError(t, database.RequeueAllArtifactExports(t.Context()))
+	_, err = ExportToStore(t.Context(), database, store, ExportOptions{Origin: contractOrigin, Full: true})
+	require.NoError(t, err)
+	assert.Equal(t, incremental.Sessions, latestStoreCheckpointForTest(t, store, contractOrigin).Sessions)
+
+	// A clean queue must still let full export rebuild both generations' bodies.
+	rebuilt := newTestArtifactStore(t)
+	_, err = ExportToStore(t.Context(), database, rebuilt, ExportOptions{Origin: contractOrigin, Full: true})
+	require.NoError(t, err)
+	manifests, err := firstStoreEntryPage(t.Context(), rebuilt, contractOrigin, KindManifests, 10)
+	require.NoError(t, err)
+	var rebuiltIDs []string
+	for _, entry := range manifests.Items {
+		published, err := decodeManifestWithLimits(
+			readContractArtifact(t, rebuilt, entry.Ref), productionArtifactLimits(),
+		)
+		require.NoError(t, err)
+		rebuiltIDs = append(rebuiltIDs, published.NativeSessionID)
+	}
+	assert.ElementsMatch(t, []string{"hostname-session", "legacy-session", "installation-session"}, rebuiltIDs)
+	stored, err := database.GetSession(t.Context(), "hostname-session")
+	require.NoError(t, err)
+	require.NotNil(t, stored)
+	assert.Equal(t, installationID, stored.Machine)
 }
 
 func TestExportToStoreFullRepairsMissingDependencyWithoutNewCheckpoint(t *testing.T) {
@@ -881,7 +998,7 @@ func TestExportToStoreChangedBatchDoesNotScanCheckpointHistory(t *testing.T) {
 	require.NoError(t, err)
 	store.lists = 0
 	store.opens = 0
-	require.NoError(t, database.ReplaceSessionMessages("sess-1", []db.Message{{
+	require.NoError(t, database.ReplaceSessionMessages(t.Context(), "sess-1", []db.Message{{
 		SessionID: "sess-1", Ordinal: 0, Role: "user", Content: "changed",
 	}}))
 
@@ -935,7 +1052,7 @@ func TestExportToStoreDirtyBatchDefersRecordedFutureCheckpoint(t *testing.T) {
 			CheckpointSize:      futureIdentity.Size,
 		}, nil,
 	))
-	require.NoError(t, database.ReplaceSessionMessages("sess-1", []db.Message{{
+	require.NoError(t, database.ReplaceSessionMessages(t.Context(), "sess-1", []db.Message{{
 		SessionID: "sess-1", Ordinal: 0, Role: "user", Content: "changed",
 	}}))
 
@@ -965,6 +1082,8 @@ func TestExportToStoreUnchangedCheckpointUsesCatalogIdentityOnly(t *testing.T) {
 
 	for _, size := range []int64{128, 64 << 20} {
 		t.Run(fmt.Sprintf("size-%d", size), func(t *testing.T) {
+			t.Parallel()
+
 			database := testExportDB(t)
 			ref := requireContractRef(t, contractOrigin, KindCheckpoints, "cp-0000000001.json")
 			identity := Identity{SHA256: strings64("a"), Size: size}
@@ -1053,6 +1172,8 @@ func TestExportCheckpointBootstrapPropagatesOperationalOpenErrors(t *testing.T) 
 		{name: "unavailable", err: errors.New("checkpoint store unavailable")},
 	} {
 		t.Run(test.name, func(t *testing.T) {
+			t.Parallel()
+
 			database := testExportDB(t)
 			seedSession(t, database, "sess-1", "alpha")
 			filesystem, err := newProtocolTestStore(t.TempDir())
@@ -1126,7 +1247,7 @@ func TestExportSpoolConstructionJoinsCleanupFailures(t *testing.T) {
 	require.ErrorIs(t, err, chmodFailure)
 	require.ErrorIs(t, err, cleanupFailure)
 
-	mapSpool, err := os.CreateTemp("", "agentsview-artifact-test-map-*")
+	mapSpool, err := os.CreateTemp(t.TempDir(), "agentsview-artifact-test-map-*")
 	require.NoError(t, err)
 	t.Cleanup(func() { _ = closeAndRemoveExportSpool(mapSpool) })
 	_, err = io.WriteString(mapSpool, "{}\n")
@@ -1139,7 +1260,7 @@ func TestExportSpoolConstructionJoinsCleanupFailures(t *testing.T) {
 func TestSpoolArtifactCheckpointEnforcesDecodedSizeBoundary(t *testing.T) {
 	t.Parallel()
 
-	mapSpool, err := os.CreateTemp("", "agentsview-artifact-test-map-*")
+	mapSpool, err := os.CreateTemp(t.TempDir(), "agentsview-artifact-test-map-*")
 	require.NoError(t, err)
 	t.Cleanup(func() { _ = closeAndRemoveExportSpool(mapSpool) })
 	_, err = io.WriteString(mapSpool, "{}\n")
@@ -1178,7 +1299,7 @@ func TestExportToStorePropagatesCheckpointCloseErrorWithoutAcknowledging(t *test
 		Origin: contractOrigin,
 	})
 	require.NoError(t, err)
-	require.NoError(t, database.ReplaceSessionMessages("sess-1", []db.Message{{
+	require.NoError(t, database.ReplaceSessionMessages(t.Context(), "sess-1", []db.Message{{
 		SessionID: "sess-1", Ordinal: 0, Role: "user", Content: "changed",
 	}}))
 	closeFailure := errors.New("injected checkpoint close failure")
@@ -1222,15 +1343,23 @@ func TestExportToStoreFailureKeepsClaimAndCheckpointLast(t *testing.T) {
 		wantCalls    []Kind
 		wantRetrySeq int
 	}{
-		{name: "dependency", failKind: Kind(KindSegments),
-			wantCalls: []Kind{Kind(KindSegments)}, wantRetrySeq: 1},
-		{name: "manifest", failKind: Kind(KindManifests),
-			wantCalls: []Kind{Kind(KindSegments), Kind(KindManifests)}, wantRetrySeq: 1},
-		{name: "checkpoint", failKind: Kind(KindCheckpoints),
-			wantCalls: []Kind{Kind(KindSegments), Kind(KindManifests), Kind(KindCheckpoints)}, wantRetrySeq: 2},
+		{
+			name: "dependency", failKind: Kind(KindSegments),
+			wantCalls: []Kind{Kind(KindSegments)}, wantRetrySeq: 1,
+		},
+		{
+			name: "manifest", failKind: Kind(KindManifests),
+			wantCalls: []Kind{Kind(KindSegments), Kind(KindManifests)}, wantRetrySeq: 1,
+		},
+		{
+			name: "checkpoint", failKind: Kind(KindCheckpoints),
+			wantCalls: []Kind{Kind(KindSegments), Kind(KindManifests), Kind(KindCheckpoints)}, wantRetrySeq: 2,
+		},
 	}
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
+			t.Parallel()
+
 			database := testExportDB(t)
 			seedSession(t, database, "sess-1", "alpha")
 			filesystem, err := newProtocolTestStore(t.TempDir())
@@ -1335,11 +1464,11 @@ func TestExportToStorePublicationRevisionRejectsPhysicallyCreatedStaleCheckpoint
 	t.Parallel()
 
 	path := filepath.Join(t.TempDir(), "archive.db")
-	first, err := db.Open(path)
+	first, err := db.Open(t.Context(), path)
 	require.NoError(t, err)
 	t.Cleanup(func() { require.NoError(t, first.Close()) })
-	require.NoError(t, first.SetSyncState(originStateKey, contractOrigin))
-	second, err := db.Open(path)
+	require.NoError(t, first.SetSyncState(t.Context(), originStateKey, contractOrigin))
+	second, err := db.Open(t.Context(), path)
 	require.NoError(t, err)
 	t.Cleanup(func() { require.NoError(t, second.Close()) })
 	filesystem, err := newProtocolTestStore(t.TempDir())
@@ -1453,17 +1582,19 @@ func TestArtifactExportCardinalityLoadsOnlyDirtyBatch(t *testing.T) {
 
 	for _, archiveSize := range []int{20, 2000} {
 		t.Run(fmt.Sprintf("archive-%d", archiveSize), func(t *testing.T) {
+			t.Parallel()
+
 			database := testExportDB(t)
 			seedBareExportSessions(
 				t, database, archiveSize, "peer-%04d", "peer-a1b2c3",
 			)
-			require.NoError(t, database.UpsertSession(db.Session{
+			require.NoError(t, database.UpsertSession(t.Context(), db.Session{
 				ID: "dirty", Project: "project", Machine: "local", Agent: "claude",
 			}))
-			require.NoError(t, database.ReplaceSessionMessages("dirty", []db.Message{{
+			require.NoError(t, database.ReplaceSessionMessages(t.Context(), "dirty", []db.Message{{
 				SessionID: "dirty", Ordinal: 0, Role: "user", Content: "changed",
 			}}))
-			require.NoError(t, database.ReplaceSessionUsageEvents("dirty", []db.UsageEvent{{
+			require.NoError(t, database.ReplaceSessionUsageEvents(t.Context(), "dirty", []db.UsageEvent{{
 				SessionID: "dirty", Source: "event", Model: "model", DedupKey: "one",
 			}}))
 
@@ -1492,6 +1623,8 @@ func TestExportToStoreCardinalityIgnoresUnrelatedArchiveBodies(t *testing.T) {
 
 	for _, archiveSize := range []int{20, 2000} {
 		t.Run(fmt.Sprintf("archive-%d", archiveSize), func(t *testing.T) {
+			t.Parallel()
+
 			database := testExportDB(t)
 			seedBareExportSessions(
 				t, database, archiveSize, "peer-%04d", "peer-a1b2c3",
@@ -1627,6 +1760,8 @@ func TestExportToStorePublishesEmptyAndDeletionSets(t *testing.T) {
 	t.Parallel()
 
 	t.Run("empty", func(t *testing.T) {
+		t.Parallel()
+
 		database := testExportDB(t)
 		filesystem, err := newProtocolTestStore(t.TempDir())
 		require.NoError(t, err)
@@ -1645,6 +1780,8 @@ func TestExportToStorePublishesEmptyAndDeletionSets(t *testing.T) {
 	})
 
 	t.Run("deletion", func(t *testing.T) {
+		t.Parallel()
+
 		database := testExportDB(t)
 		seedSession(t, database, "sess-1", "project")
 		filesystem, err := newProtocolTestStore(t.TempDir())
@@ -1654,7 +1791,7 @@ func TestExportToStorePublishesEmptyAndDeletionSets(t *testing.T) {
 			Origin: contractOrigin,
 		})
 		require.NoError(t, err)
-		require.NoError(t, database.SoftDeleteSession("sess-1"))
+		require.NoError(t, database.SoftDeleteSession(t.Context(), "sess-1"))
 
 		result, err := ExportToStore(t.Context(), database, filesystem, ExportOptions{
 			Origin: contractOrigin,
@@ -1671,13 +1808,13 @@ func TestQueuedArtifactExportTreatsOwnershipLossAsDeletion(t *testing.T) {
 	t.Parallel()
 
 	database := testExportDB(t)
-	require.NoError(t, database.UpsertSession(db.Session{
+	require.NoError(t, database.UpsertSession(t.Context(), db.Session{
 		ID: "moved", Project: "project", Machine: "local", Agent: "claude",
 	}))
-	require.NoError(t, database.ReplaceSessionMessages("moved", []db.Message{{
+	require.NoError(t, database.ReplaceSessionMessages(t.Context(), "moved", []db.Message{{
 		SessionID: "moved", Ordinal: 0, Role: "user", Content: "local content",
 	}}))
-	require.NoError(t, database.UpsertSession(db.Session{
+	require.NoError(t, database.UpsertSession(t.Context(), db.Session{
 		ID: "moved", Project: "project", Machine: "peer-a1b2c3", Agent: "claude",
 	}))
 
@@ -1700,7 +1837,7 @@ func TestQueuedArtifactExportTreatsOwnershipLossAsDeletion(t *testing.T) {
 func TestExportEmitsNewManifestAfterDataVersionChange(t *testing.T) {
 	t.Parallel()
 
-	ctx := context.Background()
+	ctx := t.Context()
 	database := testExportDB(t)
 	store := newTestArtifactStore(t)
 	origin := contractOrigin
@@ -1713,7 +1850,7 @@ func TestExportEmitsNewManifestAfterDataVersionChange(t *testing.T) {
 	firstHash := cp.Sessions[origin+"~sess-1"]
 	require.NotEmpty(t, firstHash)
 
-	require.NoError(t, database.SetSessionDataVersion("sess-1", 42))
+	require.NoError(t, database.SetSessionDataVersion(ctx, "sess-1", 42))
 	result, err = ExportToStore(ctx, database, store, ExportOptions{Origin: origin, Full: true})
 	require.NoError(t, err)
 	assert.Equal(t, 1, result.ExportedSessions)
@@ -1732,7 +1869,7 @@ func TestExportEmitsNewManifestAfterDataVersionChange(t *testing.T) {
 func TestExportIncludesLocalOwnedSessionClasses(t *testing.T) {
 	t.Parallel()
 
-	ctx := context.Background()
+	ctx := t.Context()
 	database := testExportDB(t)
 	store := newTestArtifactStore(t)
 	origin := contractOrigin
@@ -1761,12 +1898,12 @@ func TestExportIncludesLocalOwnedSessionClasses(t *testing.T) {
 func TestExportScrubsUnstableArtifactIDs(t *testing.T) {
 	t.Parallel()
 
-	ctx := context.Background()
+	ctx := t.Context()
 	database := testExportDB(t)
 	store := newTestArtifactStore(t)
 	origin := contractOrigin
 	seedSession(t, database, "sess-1", "alpha")
-	require.NoError(t, database.ReplaceSessionUsageEvents("sess-1", []db.UsageEvent{
+	require.NoError(t, database.ReplaceSessionUsageEvents(ctx, "sess-1", []db.UsageEvent{
 		{
 			SessionID:   "sess-1",
 			Source:      "fixture",
@@ -1804,7 +1941,7 @@ func TestExportScrubsUnstableArtifactIDs(t *testing.T) {
 func TestExportRejectsInvalidOriginBeforeCreatingPaths(t *testing.T) {
 	t.Parallel()
 
-	ctx := context.Background()
+	ctx := t.Context()
 	database := testExportDB(t)
 	store := newTestArtifactStore(t)
 	seedSession(t, database, "sess-1", "alpha")
@@ -1819,7 +1956,7 @@ func TestExportRejectsInvalidOriginBeforeCreatingPaths(t *testing.T) {
 func TestExportSkipsDeletedAndForeignSessions(t *testing.T) {
 	t.Parallel()
 
-	ctx := context.Background()
+	ctx := t.Context()
 	store := newTestArtifactStore(t)
 	origin := contractOrigin
 	database := testExportDB(t)
@@ -1827,8 +1964,8 @@ func TestExportSkipsDeletedAndForeignSessions(t *testing.T) {
 	seedSession(t, database, "owned", "alpha")
 	// A soft-deleted owned session and a foreign-owned session are both excluded.
 	seedSession(t, database, "trashed", "alpha")
-	require.NoError(t, database.SoftDeleteSession("trashed"))
-	require.NoError(t, database.UpsertSession(db.Session{
+	require.NoError(t, database.SoftDeleteSession(ctx, "trashed"))
+	require.NoError(t, database.UpsertSession(ctx, db.Session{
 		ID:        "foreign",
 		Project:   "alpha",
 		Machine:   "desktop-d4e5f6",
@@ -1862,7 +1999,7 @@ func (s *reEnqueueOnBoundaryStore) PendingArtifactExports(
 ) ([]db.ArtifactExportQueueItem, error) {
 	if limit == 1 {
 		s.round++
-		if err := s.ReplaceSessionMessages("sess-1", []db.Message{{
+		if err := s.ReplaceSessionMessages(ctx, "sess-1", []db.Message{{
 			SessionID: "sess-1", Ordinal: 0, Role: "user",
 			Content: fmt.Sprintf("round %d", s.round),
 		}}); err != nil {
@@ -1894,7 +2031,7 @@ func TestExportFullDrainCapReturnsAccumulatedResultAfterUnsettledQueue(t *testin
 		ctx, store, filesystem, contractOrigin, drainRounds,
 	)
 	require.EqualError(t, err, "artifact export queue did not settle after 3 drain rounds")
-	assert.ErrorIs(t, err, ErrArtifactExportUnsettled)
+	require.ErrorIs(t, err, ErrArtifactExportUnsettled)
 	assert.Positive(t, result.ExportedSessions,
 		"the accumulated result must still be returned alongside the drain-cap error")
 }
@@ -1910,7 +2047,7 @@ func (s *reEnqueueAfterAcknowledgeStore) FinalizeArtifactExports(
 	if err := s.DB.FinalizeArtifactExports(ctx, outcomes); err != nil {
 		return err
 	}
-	return s.requeue(outcomes)
+	return s.requeue(ctx, outcomes)
 }
 
 func (s *reEnqueueAfterAcknowledgeStore) RecordArtifactCheckpointHeadOutcomes(
@@ -1921,17 +2058,17 @@ func (s *reEnqueueAfterAcknowledgeStore) RecordArtifactCheckpointHeadOutcomes(
 	if err := s.DB.RecordArtifactCheckpointHeadOutcomes(ctx, head, outcomes); err != nil {
 		return err
 	}
-	return s.requeue(outcomes)
+	return s.requeue(ctx, outcomes)
 }
 
-func (s *reEnqueueAfterAcknowledgeStore) requeue(
+func (s *reEnqueueAfterAcknowledgeStore) requeue(ctx context.Context,
 	outcomes []db.ArtifactExportOutcome,
 ) error {
 	if len(outcomes) == 0 {
 		return nil
 	}
 	s.requeues++
-	return s.ReplaceSessionMessages("sess-1", []db.Message{{
+	return s.ReplaceSessionMessages(ctx, "sess-1", []db.Message{{
 		SessionID: "sess-1", Ordinal: 0, Role: "user",
 		Content: fmt.Sprintf("concurrent write %d", s.requeues),
 	}})
@@ -1948,14 +2085,14 @@ func TestExportFullDrainCapAppliesToWritesArrivingDuringDrain(t *testing.T) {
 	t.Cleanup(func() { require.NoError(t, filesystem.Close()) })
 	concurrent := &reEnqueueAfterAcknowledgeStore{DB: database}
 
-	ctx, cancel := context.WithTimeout(t.Context(), 15*time.Second)
+	ctx, cancel := context.WithTimeout(t.Context(), 30*time.Second)
 	defer cancel()
 
 	result, err := exportFullToStoreWithDrainRounds(
 		ctx, concurrent, filesystem, contractOrigin, drainRounds,
 	)
 	require.EqualError(t, err, "artifact export queue did not settle after 3 drain rounds")
-	assert.ErrorIs(t, err, ErrArtifactExportUnsettled)
+	require.ErrorIs(t, err, ErrArtifactExportUnsettled)
 	assert.Positive(t, result.ExportedSessions)
 	assert.GreaterOrEqual(t, concurrent.requeues, drainRounds)
 }
@@ -1971,7 +2108,7 @@ func (s *finiteReEnqueueBoundaryStore) PendingArtifactExports(
 ) ([]db.ArtifactExportQueueItem, error) {
 	if limit == 1 && s.remaining > 0 {
 		s.remaining--
-		if err := s.ReplaceSessionMessages("sess-1", []db.Message{{
+		if err := s.ReplaceSessionMessages(ctx, "sess-1", []db.Message{{
 			SessionID: "sess-1", Ordinal: 0, Role: "user",
 			Content: "one final concurrent write",
 		}}); err != nil {
@@ -2016,7 +2153,7 @@ func TestExportFullDrainCapDoesNotReportMoreAfterFinalDrainSettles(
 func TestExportRoundTripsSessionQualitySignals(t *testing.T) {
 	t.Parallel()
 
-	ctx := context.Background()
+	ctx := t.Context()
 	database := testExportDB(t)
 	store := newTestArtifactStore(t)
 	origin := contractOrigin
@@ -2032,7 +2169,7 @@ func TestExportRoundTripsSessionQualitySignals(t *testing.T) {
 		NoCodeContextCount:          7,
 		RunawayToolLoopCount:        8,
 	}
-	require.NoError(t, database.UpdateSessionSignals("sess-1", db.SessionSignalUpdate{
+	require.NoError(t, database.UpdateSessionSignals(ctx, "sess-1", db.SessionSignalUpdate{
 		QualitySignals: want,
 	}))
 	seeded, err := database.GetSessionFull(ctx, "sess-1")

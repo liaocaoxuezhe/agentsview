@@ -6,10 +6,10 @@ import (
 	"crypto/sha256"
 	"database/sql"
 	"encoding/hex"
-	"encoding/json"
+	"encoding/json/v2"
+	"errors"
 	"fmt"
 	"slices"
-	"sort"
 	"strconv"
 	"strings"
 	"time"
@@ -20,6 +20,7 @@ import (
 	"go.kenn.io/agentsview/internal/export"
 	"go.kenn.io/agentsview/internal/money"
 	pricingpkg "go.kenn.io/agentsview/internal/pricing"
+	"go.kenn.io/agentsview/internal/storage"
 )
 
 func (s *Sync) syncModelPricing(ctx context.Context) error {
@@ -28,19 +29,25 @@ func (s *Sync) syncModelPricing(ctx context.Context) error {
 		return err
 	}
 	if len(prices) == 0 {
-		prices = duckFallbackPricingRows()
+		prices = db.FallbackMirrorPricingRows(time.Now().UTC().Format(time.RFC3339Nano))
 	}
 	if len(prices) == 0 {
-		return nil
+		return s.syncGenAIPricing(ctx)
 	}
 
 	existing, err := s.listDuckModelPricing(ctx)
 	if err != nil {
 		return err
 	}
-	_, prices = db.FilterChangedModelPricing(existing, prices)
-	if len(prices) == 0 {
-		return nil
+	prices, removePatterns, err := db.PlanModelPricingSync(existing, prices)
+	if err != nil {
+		return fmt.Errorf("planning duckdb pricing sync: %w", err)
+	}
+	if len(prices) == 0 && len(removePatterns) == 0 {
+		return s.syncGenAIPricing(ctx)
+	}
+	if err := s.removeDuckModelPricing(ctx, removePatterns); err != nil {
+		return err
 	}
 
 	tx, err := s.duck.BeginTx(ctx, nil)
@@ -95,17 +102,171 @@ func (s *Sync) syncModelPricing(ctx context.Context) error {
 	if err := tx.Commit(); err != nil {
 		return fmt.Errorf("committing duckdb pricing sync: %w", err)
 	}
+	return s.syncGenAIPricing(ctx)
+}
+
+type duckGenAIPricingQuerier interface {
+	QueryRowContext(context.Context, string, ...any) *sql.Row
+}
+
+type duckGenAIPricingRow interface {
+	Scan(...any) error
+}
+
+func loadDuckGenAIPricing(
+	ctx context.Context, q duckGenAIPricingQuerier,
+) (*db.GenAIPricingDocument, error) {
+	return scanDuckGenAIPricing(q.QueryRowContext(ctx, `
+		SELECT version, source_ref, source, data_json, updated_at
+		FROM genai_pricing WHERE singleton = 1`))
+}
+
+func scanDuckGenAIPricing(
+	row duckGenAIPricingRow,
+) (*db.GenAIPricingDocument, error) {
+	var document db.GenAIPricingDocument
+	err := row.Scan(
+		&document.Version, &document.SourceRef, &document.Source,
+		&document.Data, &document.UpdatedAt,
+	)
+	if errors.Is(err, sql.ErrNoRows) {
+		return nil, nil
+	}
+	if err != nil {
+		return nil, fmt.Errorf("reading duckdb GenAI pricing document: %w", err)
+	}
+	return &document, nil
+}
+
+func duckGenAIEffectivePricingRow(
+	document *db.GenAIPricingDocument,
+) (export.EffectivePricingRow, error) {
+	if document == nil {
+		embedded := pricingpkg.EmbeddedGenAIDocument()
+		return export.EffectivePricingRow{
+			GenAI: embedded.Prices, GenAIVersion: embedded.Version,
+			GenAISource: export.PricingRowSourceEmbedded,
+		}, nil
+	}
+	parsed, err := pricingpkg.ParseGenAIDocument(
+		document.Data, document.Version, document.SourceRef,
+	)
+	if err != nil {
+		return export.EffectivePricingRow{}, fmt.Errorf(
+			"parsing duckdb GenAI pricing document: %w", err,
+		)
+	}
+	var updatedAt *time.Time
+	if parsedTime, parseErr := time.Parse(
+		time.RFC3339Nano, document.UpdatedAt,
+	); parseErr == nil {
+		utc := parsedTime.UTC()
+		updatedAt = &utc
+	}
+	source := export.PricingRowSourceFetched
+	if document.Source == db.GenAIPricingSourceEmbedded {
+		source = export.PricingRowSourceEmbedded
+	}
+	return export.EffectivePricingRow{
+		GenAI: parsed.Prices, GenAIVersion: parsed.Version,
+		GenAISource: source, GenAIUpdatedAt: updatedAt,
+	}, nil
+}
+
+func (s *Sync) syncGenAIPricing(ctx context.Context) error {
+	document, err := s.local.GetGenAIPricing(ctx)
+	if err != nil {
+		return fmt.Errorf("reading local GenAI pricing document: %w", err)
+	}
+	if document == nil {
+		embedded := db.EmbeddedGenAIPricingDocument()
+		document = &embedded
+	}
+	tx, err := s.duck.BeginTx(ctx, nil)
+	if err != nil {
+		return fmt.Errorf("beginning duckdb GenAI pricing sync: %w", err)
+	}
+	defer func() { _ = tx.Rollback() }()
+	existing, err := loadDuckGenAIPricing(ctx, tx)
+	if err != nil {
+		return err
+	}
+	if db.GenAIPricingDocumentsEqual(existing, document) {
+		return nil
+	}
+	if err := s.execMutation(ctx, tx, `
+		INSERT INTO genai_pricing
+			(singleton, version, source_ref, source, data_json, updated_at)
+		VALUES (1, ?, ?, ?, ?, ?)
+		ON CONFLICT(singleton) DO UPDATE SET
+			version = excluded.version,
+			source_ref = excluded.source_ref,
+			source = excluded.source,
+			data_json = excluded.data_json,
+			updated_at = excluded.updated_at`,
+		document.Version, document.SourceRef, document.Source,
+		document.Data, document.UpdatedAt,
+	); err != nil {
+		return fmt.Errorf("upserting duckdb GenAI pricing document: %w", err)
+	}
+	if err := tx.Commit(); err != nil {
+		return fmt.Errorf("committing duckdb GenAI pricing sync: %w", err)
+	}
+	return nil
+}
+
+// removeDuckModelPricing deletes retired pricing rows, committing the
+// band rows before the parent rows: DuckDB rejects deleting a parent row
+// in the same transaction that deleted its children. The mirror is
+// disposable, so a crash between the two leaves nothing worse than a
+// band-less row the next push deletes again.
+func (s *Sync) removeDuckModelPricing(
+	ctx context.Context, patterns []string,
+) error {
+	if len(patterns) == 0 {
+		return nil
+	}
+	for _, table := range []string{"model_pricing_bands", "model_pricing"} {
+		tx, err := s.duck.BeginTx(ctx, nil)
+		if err != nil {
+			return fmt.Errorf("beginning duckdb %s delete: %w", table, err)
+		}
+		for i := 0; i < len(patterns); i += duckPricingUpsertBatch {
+			end := min(i+duckPricingUpsertBatch, len(patterns))
+			query, args := duckPricingDeleteStatement(table, patterns[i:end])
+			if err := s.execMutation(ctx, tx, query, args...); err != nil {
+				_ = tx.Rollback()
+				return fmt.Errorf(
+					"deleting duckdb %s rows starting at %d: %w",
+					table, i, err,
+				)
+			}
+		}
+		if err := tx.Commit(); err != nil {
+			return fmt.Errorf("committing duckdb %s delete: %w", table, err)
+		}
+	}
 	return nil
 }
 
 func duckPricingBandDeleteStatement(prices []db.ModelPricing) (string, []any) {
-	placeholders := make([]string, len(prices))
-	args := make([]any, len(prices))
+	patterns := make([]string, len(prices))
 	for i, price := range prices {
-		placeholders[i] = "?"
-		args[i] = price.ModelPattern
+		patterns[i] = price.ModelPattern
 	}
-	return `DELETE FROM model_pricing_bands WHERE model_pattern IN (` +
+	return duckPricingDeleteStatement("model_pricing_bands", patterns)
+}
+
+func duckPricingDeleteStatement(
+	table string, patterns []string,
+) (string, []any) {
+	placeholders := make([]string, len(patterns))
+	args := make([]any, len(patterns))
+	for i, pattern := range patterns {
+		placeholders[i] = "?"
+		args[i] = pattern
+	}
+	return `DELETE FROM ` + table + ` WHERE model_pattern IN (` +
 		strings.Join(placeholders, ", ") + `)`, args
 }
 
@@ -120,15 +281,16 @@ func duckPricingBandInsertStatement(bands []duckModelPricingBand) (string, []any
 	b.WriteString(`INSERT INTO model_pricing_bands (
 		model_pattern, above_input_tokens,
 		input_microdollars_per_mtok, output_microdollars_per_mtok,
-		cache_creation_microdollars_per_mtok, cache_read_microdollars_per_mtok,
-		updated_at
+		cache_creation_microdollars_per_mtok,
+		cache_creation_1h_microdollars_per_mtok,
+		cache_read_microdollars_per_mtok, updated_at
 	) VALUES `)
-	args := make([]any, 0, len(bands)*7)
+	args := make([]any, 0, len(bands)*8)
 	for i, item := range bands {
 		if i > 0 {
 			b.WriteString(", ")
 		}
-		b.WriteString("(?, ?, ?, ?, ?, ?, ?)")
+		b.WriteString("(?, ?, ?, ?, ?, ?, ?, ?)")
 		updatedAt := item.band.UpdatedAt
 		if updatedAt == "" {
 			updatedAt = item.updatedAt
@@ -139,6 +301,7 @@ func duckPricingBandInsertStatement(bands []duckModelPricingBand) (string, []any
 			item.band.InputPerMTok.Microdollars,
 			item.band.OutputPerMTok.Microdollars,
 			item.band.CacheCreationPerMTok.Microdollars,
+			item.band.CacheCreation1hPerMTok.Microdollars,
 			item.band.CacheReadPerMTok.Microdollars,
 			updatedAt,
 		)
@@ -152,19 +315,21 @@ func duckPricingUpsertStatement(prices []db.ModelPricing) (string, []any) {
 	var b strings.Builder
 	b.WriteString(`INSERT INTO model_pricing (
 		model_pattern, input_microdollars_per_mtok, output_microdollars_per_mtok,
-		cache_creation_microdollars_per_mtok, cache_read_microdollars_per_mtok, updated_at
+		cache_creation_microdollars_per_mtok, cache_creation_1h_microdollars_per_mtok,
+		cache_read_microdollars_per_mtok, updated_at
 	) VALUES `)
-	args := make([]any, 0, len(prices)*6)
+	args := make([]any, 0, len(prices)*7)
 	for i, p := range prices {
 		if i > 0 {
 			b.WriteString(", ")
 		}
-		b.WriteString("(?, ?, ?, ?, ?, ?)")
+		b.WriteString("(?, ?, ?, ?, ?, ?, ?)")
 		args = append(args,
 			p.ModelPattern,
 			p.InputPerMTok.Microdollars,
 			p.OutputPerMTok.Microdollars,
 			p.CacheCreationPerMTok.Microdollars,
+			p.CacheCreation1hPerMTok.Microdollars,
 			p.CacheReadPerMTok.Microdollars,
 			p.UpdatedAt,
 		)
@@ -174,6 +339,7 @@ func duckPricingUpsertStatement(prices []db.ModelPricing) (string, []any) {
 		input_microdollars_per_mtok = excluded.input_microdollars_per_mtok,
 		output_microdollars_per_mtok = excluded.output_microdollars_per_mtok,
 		cache_creation_microdollars_per_mtok = excluded.cache_creation_microdollars_per_mtok,
+		cache_creation_1h_microdollars_per_mtok = excluded.cache_creation_1h_microdollars_per_mtok,
 		cache_read_microdollars_per_mtok = excluded.cache_read_microdollars_per_mtok,
 		updated_at = excluded.updated_at`)
 	return b.String(), args
@@ -184,10 +350,12 @@ func (s *Sync) listDuckModelPricing(ctx context.Context) ([]db.ModelPricing, err
 		ctx,
 		`SELECT p.model_pattern, p.input_microdollars_per_mtok,
 			p.output_microdollars_per_mtok, p.cache_creation_microdollars_per_mtok,
+			p.cache_creation_1h_microdollars_per_mtok,
 			p.cache_read_microdollars_per_mtok, p.updated_at,
 			b.above_input_tokens, b.input_microdollars_per_mtok,
 			b.output_microdollars_per_mtok,
 			b.cache_creation_microdollars_per_mtok,
+			b.cache_creation_1h_microdollars_per_mtok,
 			b.cache_read_microdollars_per_mtok, b.updated_at
 		 FROM model_pricing p
 		 LEFT JOIN model_pricing_bands b ON b.model_pattern = p.model_pattern
@@ -202,19 +370,22 @@ func (s *Sync) listDuckModelPricing(ctx context.Context) ([]db.ModelPricing, err
 	byPattern := make(map[string]int)
 	for rows.Next() {
 		var p db.ModelPricing
-		var threshold, input, output, cacheCreation, cacheRead sql.NullInt64
+		var threshold, input, output, cacheCreation, cacheCreation1h,
+			cacheRead sql.NullInt64
 		var bandUpdatedAt sql.NullString
 		if err := rows.Scan(
 			&p.ModelPattern,
 			&p.InputPerMTok,
 			&p.OutputPerMTok,
 			&p.CacheCreationPerMTok,
+			&p.CacheCreation1hPerMTok,
 			&p.CacheReadPerMTok,
 			&p.UpdatedAt,
 			&threshold,
 			&input,
 			&output,
 			&cacheCreation,
+			&cacheCreation1h,
 			&cacheRead,
 			&bandUpdatedAt,
 		); err != nil {
@@ -235,12 +406,13 @@ func (s *Sync) listDuckModelPricing(ctx context.Context) ([]db.ModelPricing, err
 				)
 			}
 			out[i].Bands = append(out[i].Bands, db.PricingBand{
-				AboveInputTokens:     aboveInputTokens,
-				InputPerMTok:         money.Money{Microdollars: input.Int64},
-				OutputPerMTok:        money.Money{Microdollars: output.Int64},
-				CacheCreationPerMTok: money.Money{Microdollars: cacheCreation.Int64},
-				CacheReadPerMTok:     money.Money{Microdollars: cacheRead.Int64},
-				UpdatedAt:            bandUpdatedAt.String,
+				AboveInputTokens:       aboveInputTokens,
+				InputPerMTok:           money.Money{Microdollars: input.Int64},
+				OutputPerMTok:          money.Money{Microdollars: output.Int64},
+				CacheCreationPerMTok:   money.Money{Microdollars: cacheCreation.Int64},
+				CacheCreation1hPerMTok: money.Money{Microdollars: cacheCreation1h.Int64},
+				CacheReadPerMTok:       money.Money{Microdollars: cacheRead.Int64},
+				UpdatedAt:              bandUpdatedAt.String,
 			})
 		}
 	}
@@ -411,13 +583,12 @@ func (s *Sync) loadIdentityPublicationScope(
 				"loading project identity observations: %w", err,
 			)
 		}
-		observations = filterIdentityScope(
+		observations = db.FilterIdentityScope(
 			observations, s.projects, s.excludeProjects,
 		)
-		snapshots, err =
-			s.local.ListPublishableSessionProjectIdentitySnapshots(
-				ctx, nil, s.projects, s.excludeProjects,
-			)
+		snapshots, err = s.local.ListPublishableSessionProjectIdentitySnapshots(
+			ctx, nil, s.projects, s.excludeProjects,
+		)
 		if err != nil {
 			return nil, nil, delta, fmt.Errorf(
 				"loading session project identity snapshots: %w", err,
@@ -425,44 +596,18 @@ func (s *Sync) loadIdentityPublicationScope(
 		}
 	}
 	if len(refreshSessionIDs) > 0 {
-		refreshSnapshots, loadErr :=
-			s.local.ListPublishableSessionProjectIdentitySnapshots(
-				ctx, refreshSessionIDs, s.projects, s.excludeProjects,
-			)
+		refreshSnapshots, loadErr := s.local.ListPublishableSessionProjectIdentitySnapshots(
+			ctx, refreshSessionIDs, s.projects, s.excludeProjects,
+		)
 		if loadErr != nil {
 			return nil, nil, delta, fmt.Errorf(
 				"loading refreshed session project identity snapshots: %w",
 				loadErr,
 			)
 		}
-		snapshots = mergeProjectIdentitySnapshots(snapshots, refreshSnapshots)
+		snapshots = db.MergeProjectIdentitySnapshots(snapshots, refreshSnapshots)
 	}
 	return observations, snapshots, delta, nil
-}
-
-// filterIdentityScope restricts a full-publication listing to the push
-// scope. The delta path does not need this: LoadProjectIdentityPublicationDelta
-// applies projects/excludeProjects in SQL.
-func filterIdentityScope(
-	items []export.ProjectIdentityObservation, projects, excludeProjects []string,
-) []export.ProjectIdentityObservation {
-	if len(projects) == 0 && len(excludeProjects) == 0 {
-		return items
-	}
-	out := items[:0]
-	for _, item := range items {
-		if projectMatchesPushScope(item.Project, projects, excludeProjects) {
-			out = append(out, item)
-		}
-	}
-	return out
-}
-
-func projectMatchesPushScope(project string, projects, excludeProjects []string) bool {
-	if len(projects) > 0 && !slices.Contains(projects, project) {
-		return false
-	}
-	return !slices.Contains(excludeProjects, project)
 }
 
 func (s *Sync) writeIdentityPublication(
@@ -550,55 +695,6 @@ func (s *Sync) writeIdentityPublication(
 	return nil
 }
 
-func mergeProjectIdentitySnapshots(
-	base, refresh []export.ProjectIdentityObservation,
-) []export.ProjectIdentityObservation {
-	merged := make(map[string]export.ProjectIdentityObservation, len(base)+len(refresh))
-	for _, snapshot := range base {
-		merged[snapshot.SessionID] = snapshot
-	}
-	for _, snapshot := range refresh {
-		merged[snapshot.SessionID] = snapshot
-	}
-	out := make([]export.ProjectIdentityObservation, 0, len(merged))
-	for _, snapshot := range merged {
-		out = append(out, snapshot)
-	}
-	sort.Slice(out, func(i, j int) bool {
-		return out[i].SessionID < out[j].SessionID
-	})
-	return out
-}
-
-func duckFallbackPricingRows() []db.ModelPricing {
-	src := pricingpkg.FallbackPricing()
-	out := make([]db.ModelPricing, len(src))
-	now := time.Now().UTC().Format(time.RFC3339Nano)
-	for i, p := range src {
-		bands := make([]db.PricingBand, len(p.Bands))
-		for j, band := range p.Bands {
-			bands[j] = db.PricingBand{
-				AboveInputTokens:     band.AboveInputTokens,
-				InputPerMTok:         band.InputPerMTok,
-				OutputPerMTok:        band.OutputPerMTok,
-				CacheCreationPerMTok: band.CacheCreationPerMTok,
-				CacheReadPerMTok:     band.CacheReadPerMTok,
-				UpdatedAt:            now,
-			}
-		}
-		out[i] = db.ModelPricing{
-			ModelPattern:         p.ModelPattern,
-			InputPerMTok:         p.InputPerMTok,
-			OutputPerMTok:        p.OutputPerMTok,
-			CacheCreationPerMTok: p.CacheCreationPerMTok,
-			CacheReadPerMTok:     p.CacheReadPerMTok,
-			UpdatedAt:            now,
-			Bands:                bands,
-		}
-	}
-	return out
-}
-
 // applyDeletionDelta removes every mirror session tombstoned in the local
 // deletion journal within (after, through]. This is the mirror-resident
 // replacement for the old local-scan hard-delete reconciliation: the
@@ -616,7 +712,7 @@ func duckFallbackPricingRows() []db.ModelPricing {
 // so a never-mirrored out-of-scope deletion stays invisible to filtered
 // diagnostics. Work stays bounded by the delta either way.
 func (s *Sync) applyDeletionDelta(
-	ctx context.Context, after, through int64, result *PushResult,
+	ctx context.Context, after, through int64, result *storage.MirrorPushResult,
 ) error {
 	tombstones, err := s.local.LoadSessionDeletionDelta(
 		ctx, after, through, nil, nil,
@@ -660,7 +756,7 @@ func (s *Sync) selectTombstonesToApply(
 			continue
 		}
 		seen[tombstone.SessionID] = true
-		if projectMatchesPushScope(tombstone.Project, s.projects, s.excludeProjects) {
+		if db.ProjectMatchesPushScope(tombstone.Project, s.projects, s.excludeProjects) {
 			apply = append(apply, tombstone.SessionID)
 		} else {
 			outOfScope = append(outOfScope, tombstone.SessionID)
@@ -991,7 +1087,7 @@ func (s *Sync) upsertSession(
 ) error {
 	query := `
 		INSERT INTO sessions (
-			id, project, machine, agent,
+			id, project, project_assigned, machine, agent,
 			agent_label, entrypoint, session_kind,
 			first_message, display_name, session_name, started_at, ended_at,
 			message_count, user_message_count,
@@ -1010,19 +1106,21 @@ func (s *Sync) upsertSession(
 			missing_success_criteria_count, missing_verification_count,
 			duplicate_prompt_count, no_code_context_count,
 			runaway_tool_loop_count, data_version,
-			cwd, git_branch, source_session_id, source_version, transcript_fidelity,
+			cwd, git_branch, source_session_id, source_version, group_key, transcript_fidelity,
 			parser_malformed_lines, is_truncated, deleted_at, deletion_cause, created_at,
 			termination_status, secret_leak_count, secrets_rules_version,
+			pr_links, labels,
 			agentsview_push_fingerprint, source_archive_id
-		) VALUES (
-			?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?,
+		) VALUES (?, ?,
+			?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?,
 			?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?,
 			?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?,
-			?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?
+			?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?
 		)`
 	query += `
 		ON CONFLICT(id) DO UPDATE SET
 			project = excluded.project,
+			project_assigned = excluded.project_assigned,
 			machine = excluded.machine,
 			agent = excluded.agent,
 			agent_label = excluded.agent_label,
@@ -1079,6 +1177,7 @@ func (s *Sync) upsertSession(
 			git_branch = excluded.git_branch,
 			source_session_id = excluded.source_session_id,
 			source_version = excluded.source_version,
+			group_key = excluded.group_key,
 			transcript_fidelity = excluded.transcript_fidelity,
 			parser_malformed_lines = excluded.parser_malformed_lines,
 			is_truncated = excluded.is_truncated,
@@ -1088,6 +1187,8 @@ func (s *Sync) upsertSession(
 			termination_status = excluded.termination_status,
 			secret_leak_count = excluded.secret_leak_count,
 			secrets_rules_version = excluded.secrets_rules_version,
+			pr_links = excluded.pr_links,
+			labels = excluded.labels,
 			agentsview_push_fingerprint = excluded.agentsview_push_fingerprint,
 			source_archive_id = excluded.source_archive_id`
 
@@ -1107,8 +1208,8 @@ func sessionInsertArgs(
 	fingerprint string,
 ) []any {
 	return []any{
-		sess.ID, sess.Project,
-		mirroredSessionMachine(sess, fallbackMachine), sess.Agent,
+		sess.ID, sess.Project, sess.ProjectAssigned,
+		db.MirroredSessionMachine(sess, fallbackMachine), sess.Agent,
 		sess.AgentLabel, sess.Entrypoint, sess.SessionKind,
 		nilString(sess.FirstMessage), nilString(sess.DisplayName),
 		nilString(sess.SessionName),
@@ -1116,7 +1217,7 @@ func sessionInsertArgs(
 		sess.MessageCount, sess.UserMessageCount,
 		nilString(sess.FilePath), sess.FileSize, sess.FileMtime,
 		sess.FileInode, sess.FileDevice, nilString(sess.FileHash),
-		nilTime(sess.LocalModifiedAt), transcriptRevisionValue(sess.TranscriptRevision),
+		nilTime(sess.LocalModifiedAt), db.TranscriptRevisionValue(sess.TranscriptRevision),
 		nilString(sess.ParentSessionID),
 		sess.RelationshipType, sess.TotalOutputTokens,
 		sess.PeakContextTokens, sess.HasTotalOutputTokens,
@@ -1136,22 +1237,13 @@ func sessionInsertArgs(
 		sess.NoCodeContextCount, sess.RunawayToolLoopCount,
 		sess.DataVersion,
 		sess.Cwd, sess.GitBranch, sess.SourceSessionID,
-		sess.SourceVersion, sess.TranscriptFidelity, sess.ParserMalformedLines,
+		sess.SourceVersion, sess.GroupKey, sess.TranscriptFidelity, sess.ParserMalformedLines,
 		sess.IsTruncated, nilTime(sess.DeletedAt), nilString(sess.DeletionCause),
 		timeValue(sess.CreatedAt), nilString(sess.TerminationStatus),
 		sess.SecretLeakCount, sess.SecretsRulesVersion,
+		db.EncodePRLinks(sess.PRLinks), db.LabelsArg(sess.Labels),
 		nilEmpty(fingerprint), archiveID,
 	}
-}
-
-// mirroredSessionMachine preserves the source archive's machine identity.
-// "local" and empty are local-only sentinels, so only those use the machine
-// configured for this mirror push.
-func mirroredSessionMachine(sess db.Session, fallbackMachine string) string {
-	if sess.Machine != "" && sess.Machine != "local" {
-		return sess.Machine
-	}
-	return fallbackMachine
 }
 
 func insertMessages(
@@ -1162,16 +1254,17 @@ func insertMessages(
 			INSERT INTO messages (
 				id, session_id, ordinal, role, content, thinking_text,
 				timestamp, has_thinking, has_tool_use, content_length,
-				is_system, model, token_usage, context_tokens, output_tokens,
+				is_system, model, reasoning_effort, token_usage, context_tokens, output_tokens,
+				provider_id,
 				has_context_tokens, has_output_tokens, claude_message_id,
 				claude_request_id, source_type, source_subtype, prompt_source, source_uuid,
 				source_parent_uuid, is_sidechain, is_compact_boundary
-			) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+			) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
 			m.ID, m.SessionID, m.Ordinal, m.Role, m.Content,
 			m.ThinkingText, timeValue(m.Timestamp),
 			m.HasThinking, m.HasToolUse, m.ContentLength,
-			m.IsSystem, m.Model, string(m.TokenUsage),
-			m.ContextTokens, m.OutputTokens,
+			m.IsSystem, m.Model, m.ReasoningEffort, string(m.TokenUsage),
+			m.ContextTokens, m.OutputTokens, m.ProviderID,
 			m.HasContextTokens, m.HasOutputTokens,
 			m.ClaudeMessageID, m.ClaudeRequestID,
 			m.SourceType, m.SourceSubtype, m.PromptSource, m.SourceUUID,
@@ -1217,13 +1310,16 @@ func insertToolCalls(
 					message_id, session_id, tool_name, category,
 					call_index, tool_use_id, input_json, skill_name,
 					result_content_length, result_content,
-					subagent_session_id, file_path
-				) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+					subagent_session_id, file_path, observed_outcome, observed_repeat, sequence_ending
+				) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
 				m.ID, m.SessionID, tc.ToolName, tc.Category,
 				i, tc.ToolUseID, nilEmpty(tc.InputJSON),
 				nilEmpty(tc.SkillName), nilZero(tc.ResultContentLength),
-				nilEmpty(tc.ResultContent), nilEmpty(tc.SubagentSessionID),
-				nilEmpty(tc.FilePath),
+				nilEmpty(db.DedupToolCallResultSummary(
+					tc.ResultContent, tc.ResultEvents,
+				)),
+				nilEmpty(tc.SubagentSessionID),
+				nilEmpty(tc.FilePath), tc.ObservedOutcome, tc.ObservedRepeat, tc.SequenceEnding,
 			); err != nil {
 				return fmt.Errorf("inserting duckdb tool_call %s/%d/%d: %w",
 					m.SessionID, m.Ordinal, i, err)
@@ -1289,13 +1385,13 @@ func insertUsageEvent(
 	if _, err := exec.ExecContext(ctx, `
 		INSERT INTO usage_events (
 			id, session_id, message_ordinal, source, model,
-			input_tokens, output_tokens,
+			provider_id, input_tokens, output_tokens,
 			cache_creation_input_tokens, cache_read_input_tokens,
 			reasoning_tokens, cost_microdollars, cost_status, cost_source,
 			occurred_at, dedup_key
-		) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+		) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
 		ev.ID, ev.SessionID, ordinal, ev.Source, ev.Model,
-		ev.InputTokens, ev.OutputTokens,
+		ev.ProviderID, ev.InputTokens, ev.OutputTokens,
 		ev.CacheCreationInputTokens, ev.CacheReadInputTokens,
 		ev.ReasoningTokens, cost, ev.CostStatus,
 		ev.CostSource, occurredAt, ev.DedupKey,
@@ -1436,13 +1532,6 @@ func insertPinnedMessages(
 func nilString(value *string) any {
 	if value == nil || *value == "" {
 		return nil
-	}
-	return *value
-}
-
-func transcriptRevisionValue(value *string) string {
-	if value == nil || *value == "" {
-		return "0"
 	}
 	return *value
 }

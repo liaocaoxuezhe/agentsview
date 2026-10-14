@@ -1,7 +1,8 @@
 package server
 
 import (
-	"encoding/json"
+	"encoding/json/v2"
+	"errors"
 	"fmt"
 	"time"
 
@@ -10,7 +11,10 @@ import (
 	"go.kenn.io/agentsview/internal/export"
 )
 
-const activityReportTokenVersion = 1
+const (
+	activityReportTokenVersion   = 1
+	activitySessionCursorVersion = 2
+)
 
 type activityReportTokenQuery struct {
 	Timezone      string              `json:"tz"`
@@ -43,13 +47,21 @@ type activityReportTokenPayload struct {
 }
 
 type activitySessionCursorPayload struct {
-	Version   int                  `json:"v"`
-	Schema    int                  `json:"schema"`
-	Digest    string               `json:"digest"`
-	Offset    int                  `json:"offset"`
-	Sort      activity.SessionSort `json:"sort"`
-	Direction string               `json:"direction"`
-	Bucket    *int                 `json:"bucket,omitempty"`
+	Version     int                   `json:"v"`
+	Schema      int                   `json:"schema"`
+	Digest      string                `json:"digest"`
+	Offset      int                   `json:"offset"`
+	Sort        activity.SessionSort  `json:"sort"`
+	Direction   string                `json:"direction"`
+	BucketRange *activity.BucketRange `json:"bucket_range,omitempty"`
+}
+
+func validActivitySessionCursor(
+	cursor activitySessionCursorPayload, digest string,
+) bool {
+	return cursor.Version == activitySessionCursorVersion &&
+		cursor.Schema == export.ActivityReportSchemaVersion &&
+		cursor.Digest == digest && cursor.Offset >= 0
 }
 
 func newActivityReportTokenPayload(
@@ -85,7 +97,7 @@ func newActivityReportTokenPayload(
 func (payload activityReportTokenPayload) selection() (resolvedActivitySelection, error) {
 	if payload.Version != activityReportTokenVersion ||
 		payload.Schema != export.ActivityReportSchemaVersion {
-		return resolvedActivitySelection{}, fmt.Errorf("unsupported activity report token version")
+		return resolvedActivitySelection{}, errors.New("unsupported activity report token version")
 	}
 	location, err := time.LoadLocation(payload.Query.Timezone)
 	if err != nil {
@@ -114,10 +126,10 @@ func (payload activityReportTokenPayload) selection() (resolvedActivitySelection
 		return resolvedActivitySelection{}, fmt.Errorf("invalid activity report token query: %w", err)
 	}
 	if selection.filter.Timezone != selection.query.Timezone {
-		return resolvedActivitySelection{}, fmt.Errorf("activity report token timezone mismatch")
+		return resolvedActivitySelection{}, errors.New("activity report token timezone mismatch")
 	}
 	if selection.filter.ExcludeAutomated && selection.filter.ExcludeInteractive {
-		return resolvedActivitySelection{}, fmt.Errorf("activity report token excludes all sessions")
+		return resolvedActivitySelection{}, errors.New("activity report token excludes all sessions")
 	}
 	if err := validateActivitySelectionSize(activitySelectionInput{
 		Timezone: selection.query.Timezone,
